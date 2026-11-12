@@ -5,12 +5,12 @@ const MAX_ZOOM: f64 = 32.0;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Timeline {
-    pub duration: f64,
-    pub position: f64,
-    pub in_point: f64,
-    pub out_point: f64,
-    pub zoom: f64,
-    pub view_start: f64,
+    duration: f64,
+    position: f64,
+    in_point: f64,
+    out_point: f64,
+    zoom: f64,
+    view_start: f64,
 }
 
 impl Default for Timeline {
@@ -31,8 +31,32 @@ impl Timeline {
         }
     }
 
+    pub fn duration(&self) -> f64 {
+        self.duration
+    }
+
+    pub fn position(&self) -> f64 {
+        self.position
+    }
+
+    pub fn in_point(&self) -> f64 {
+        self.in_point
+    }
+
+    pub fn out_point(&self) -> f64 {
+        self.out_point
+    }
+
+    pub fn zoom(&self) -> f64 {
+        self.zoom
+    }
+
+    pub fn view_start(&self) -> f64 {
+        self.view_start
+    }
+
     pub fn set_duration(&mut self, duration: f64) {
-        if !duration.is_finite() || duration <= 0.0 {
+        if !duration.is_finite() || duration < MIN_FRAME {
             self.duration = 0.0;
             self.position = 0.0;
             self.in_point = 0.0;
@@ -68,16 +92,25 @@ impl Timeline {
     }
 
     pub fn set_position(&mut self, position: f64) {
+        if !position.is_finite() {
+            return;
+        }
         self.position = position.clamp(0.0, self.duration);
         self.follow();
     }
 
     pub fn set_in(&mut self, time: f64) {
+        if !time.is_finite() {
+            return;
+        }
         let limit = (self.out_point - MIN_FRAME).max(0.0);
         self.in_point = time.clamp(0.0, limit);
     }
 
     pub fn set_out(&mut self, time: f64) {
+        if !time.is_finite() {
+            return;
+        }
         let floor = (self.in_point + MIN_FRAME).min(self.duration);
         self.out_point = time.clamp(floor, self.duration);
     }
@@ -163,11 +196,61 @@ mod tests {
         timeline.set_out(8.0);
         assert_eq!(timeline.selection(), (3.0, 8.0));
         timeline.set_in(9.0);
-        assert!(timeline.in_point <= 8.0 - MIN_FRAME);
+        assert!(timeline.in_point() <= 8.0 - MIN_FRAME);
         timeline.set_out(1.0);
-        assert!(timeline.out_point >= timeline.in_point + MIN_FRAME);
+        assert!(timeline.out_point() >= timeline.in_point() + MIN_FRAME);
         timeline.set_in(-4.0);
-        assert_eq!(timeline.in_point, 0.0);
+        assert_eq!(timeline.in_point(), 0.0);
+    }
+
+    #[test]
+    fn a_sequence_keeps_the_selection_and_view_valid() {
+        let mut timeline = Timeline::new();
+        timeline.set_duration(100.0);
+        timeline.set_position(75.0);
+        timeline.set_zoom(4.0);
+        timeline.set_in(90.0);
+        timeline.set_out(95.0);
+        timeline.set_in(94.99);
+        timeline.set_out(1.0);
+        timeline.set_duration(50.0);
+        let (start, end) = timeline.selection();
+        assert!(start >= 0.0);
+        assert!(start <= end - MIN_FRAME + 1e-9);
+        assert!(end <= timeline.duration());
+        assert!(timeline.position() >= 0.0);
+        assert!(timeline.position() <= timeline.duration());
+        assert!(timeline.position() >= timeline.view_start());
+        assert!(timeline.position() <= timeline.view_end());
+        timeline.set_in(-10.0);
+        timeline.set_out(10_000.0);
+        let (start, end) = timeline.selection();
+        assert_eq!(start, 0.0);
+        assert_eq!(end, timeline.duration());
+    }
+
+    #[test]
+    fn non_finite_times_leave_the_selection_unchanged() {
+        let mut timeline = Timeline::new();
+        timeline.set_duration(10.0);
+        timeline.set_position(5.0);
+        timeline.set_in(2.0);
+        timeline.set_out(8.0);
+        let selection = timeline.selection();
+        let position = timeline.position();
+        timeline.set_in(f64::NAN);
+        timeline.set_out(f64::INFINITY);
+        timeline.set_position(f64::NAN);
+        assert_eq!(timeline.selection(), selection);
+        assert_eq!(timeline.position(), position);
+    }
+
+    #[test]
+    fn a_file_shorter_than_one_frame_has_no_timeline() {
+        let mut timeline = Timeline::new();
+        timeline.set_duration(MIN_FRAME / 2.0);
+        assert_eq!(timeline.duration(), 0.0);
+        assert_eq!(timeline.selection(), (0.0, 0.0));
     }
 
     #[test]
@@ -177,12 +260,12 @@ mod tests {
         timeline.set_position(50.0);
         timeline.zoom_in();
         assert!(timeline.visible_span() < 100.0);
-        assert!(timeline.position >= timeline.view_start);
-        assert!(timeline.position <= timeline.view_end());
+        assert!(timeline.position() >= timeline.view_start());
+        assert!(timeline.position() <= timeline.view_end());
         timeline.set_zoom(1000.0);
-        assert_eq!(timeline.zoom, MAX_ZOOM);
+        assert_eq!(timeline.zoom(), MAX_ZOOM);
         timeline.set_zoom(0.1);
-        assert_eq!(timeline.zoom, 1.0);
+        assert_eq!(timeline.zoom(), 1.0);
     }
 
     #[test]

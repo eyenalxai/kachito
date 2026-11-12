@@ -239,13 +239,13 @@ fn poll(app: &mut App, _: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
     if let Some(engine) = app.engine.as_ref() {
         if let Some(duration) = engine.duration()
-            && (app.timeline.duration - duration).abs() > 0.01
+            && (app.timeline.duration() - duration).abs() > 0.01
         {
             app.timeline.set_duration(duration);
             changed = true;
         }
         let position = engine.position();
-        if (app.timeline.position - position).abs() > 0.01 {
+        if (app.timeline.position() - position).abs() > 0.01 {
             app.timeline.set_position(position);
             changed = true;
         }
@@ -299,8 +299,8 @@ fn export_dialog(app: &mut App, tx: &mut Tx) {
         ..Default::default()
     }
     .filter("Matroska", &["mkv"]);
-    let start = app.timeline.in_point;
-    let end = app.timeline.out_point;
+    let start = app.timeline.in_point();
+    let end = app.timeline.out_point();
     let audio = app.selected_audio_index();
     tx.save_file(options, move |app: &mut App, result, _| match result {
         Ok(Some(path)) => app.start_export(path, start, end, audio),
@@ -395,16 +395,16 @@ fn track_bar(app: &App, theme: &tok::Theme) -> El {
 
 fn timeline_bar(app: &App, theme: &tok::Theme) -> El {
     let timeline = &app.timeline;
-    let start = timeline.fraction_of(timeline.in_point) as f32;
-    let end = timeline.fraction_of(timeline.out_point) as f32;
-    let position = timeline.fraction_of(timeline.position) as f32;
+    let start = timeline.fraction_of(timeline.in_point()) as f32;
+    let end = timeline.fraction_of(timeline.out_point()) as f32;
+    let position = timeline.fraction_of(timeline.position()) as f32;
     let selection = (end - start).max(0.0);
     let accent = tok::accent(0, true);
     let label = format!(
         "{:.1}s  {} - {}",
         timeline.selection_duration(),
-        format_clock(timeline.in_point),
-        format_clock(timeline.out_point)
+        format_clock(timeline.in_point()),
+        format_clock(timeline.out_point())
     );
 
     let mut bar = row()
@@ -424,8 +424,8 @@ fn timeline_bar(app: &App, theme: &tok::Theme) -> El {
                     }
                     let time = app.timeline.time_at_fraction(f64::from(drag.x / drag.w));
                     if matches!(drag.phase, Phase::Down) {
-                        let near_in = (time - app.timeline.in_point).abs() <= 0.75;
-                        let near_out = (time - app.timeline.out_point).abs() <= 0.75;
+                        let near_in = (time - app.timeline.in_point()).abs() <= 0.75;
+                        let near_out = (time - app.timeline.out_point()).abs() <= 0.75;
                         drag.data = if near_in {
                             1.0
                         } else if near_out {
