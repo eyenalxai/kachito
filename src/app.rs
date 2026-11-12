@@ -1,10 +1,11 @@
 //! The Kachito screen: one file, one fitted stage, one floating transport.
 
 use crate::engine::{MpvEngine, PlaybackState, Track, TrackKind, VIDEO_HEIGHT, VIDEO_WIDTH};
+use crate::export::{ExportMode, ExportState};
 use crate::session::{PlaybackSession, SUPPORTED, TracksState, tracks_of};
 use crate::ui::{self, Palette, icons};
 use rune::{
-    AppSpec, Color, Cx, Drag, El, FileDialogOptions, Key, KeyEvent, LiveRegion, ScrollSpec,
+    AppSpec, Color, Cx, Drag, El, FileDialogOptions, Key, KeyEvent, LiveRegion, Phase, ScrollSpec,
     SurfaceFit, Transition, Tx, Waker, col, el, icon, row, text,
 };
 use std::path::PathBuf;
@@ -27,7 +28,9 @@ struct App {
     last_volume: f32,
     speed: f32,
     last_dir: Option<PathBuf>,
+    export_mode: ExportMode,
     menu: Option<Menu>,
+    export_open: bool,
     transport_visible: bool,
     transport_hovered: bool,
     activity: bool,
@@ -60,7 +63,9 @@ impl App {
             last_volume: 1.0,
             speed: 1.0,
             last_dir: None,
+            export_mode: ExportMode::Precise,
             menu: None,
+            export_open: false,
             transport_visible: true,
             transport_hovered: false,
             activity: false,
@@ -81,6 +86,7 @@ impl App {
                 self.last_dir = parent;
                 self.error = None;
                 self.menu = None;
+                self.export_open = false;
                 self.touch();
             }
             Err(error) => self.error = Some(error),
@@ -115,6 +121,14 @@ impl App {
         let time = f64::from(fraction.clamp(0.0, 1.0)) * duration;
         session.seek(time);
         session.timeline_mut().set_position(time);
+        self.touch();
+    }
+
+    fn seek_to(&mut self, time: f64) {
+        if let Some(session) = &mut self.session {
+            session.seek(time);
+            session.timeline_mut().set_position(time);
+        }
         self.touch();
     }
 
@@ -190,10 +204,71 @@ impl App {
         self.touch();
     }
 
+    fn toggle_export(&mut self) {
+        let ready = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.source().is_some() && session.duration().is_some());
+        if !ready {
+            return;
+        }
+        self.export_open = !self.export_open;
+        self.menu = None;
+        self.touch();
+    }
+
+    fn set_in(&mut self, time: f64) {
+        if let Some(session) = &mut self.session {
+            session.timeline_mut().set_in(time);
+        }
+    }
+
+    fn set_out(&mut self, time: f64) {
+        if let Some(session) = &mut self.session {
+            session.timeline_mut().set_out(time);
+        }
+    }
+
+    fn zoom_in(&mut self) {
+        if let Some(session) = &mut self.session {
+            session.timeline_mut().zoom_in();
+        }
+    }
+
+    fn zoom_out(&mut self) {
+        if let Some(session) = &mut self.session {
+            session.timeline_mut().zoom_out();
+        }
+    }
+
+    fn start_export(&mut self, output: PathBuf) {
+        if let Some(session) = &mut self.session {
+            session.start_export(output, self.export_mode);
+        }
+    }
+
+    fn cancel_export(&self) {
+        if let Some(session) = &self.session {
+            session.cancel_export();
+        }
+    }
+
+    fn set_export_error(&mut self, error: String) {
+        if let Some(session) = &mut self.session {
+            session.set_export_error(error);
+        }
+    }
+
     fn error_text(&self) -> Option<String> {
         self.error
             .clone()
             .or_else(|| self.session.as_ref().and_then(|session| session.error()))
+    }
+
+    fn export_state(&self) -> Option<ExportState> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.export_state())
     }
 
     fn has_source(&self) -> bool {
@@ -258,7 +333,7 @@ fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
         app.last_activity = t;
         changed = true;
     }
-    if app.playing() && app.menu.is_none() && !app.transport_hovered {
+    if app.playing() && app.menu.is_none() && !app.export_open && !app.transport_hovered {
         if app.transport_visible && t - app.last_activity > HIDE_AFTER {
             app.transport_visible = false;
             changed = true;
@@ -298,6 +373,12 @@ fn on_key(app: &mut App, key: &KeyEvent, tx: &mut Tx) -> bool {
                 tx.toggle_full_screen();
                 true
             }
+            Key::Text(value)
+                if value.eq_ignore_ascii_case("e") && !key.mods.cmd && !key.mods.ctrl =>
+            {
+                app.toggle_export();
+                true
+            }
             Key::Left => {
                 app.skip(-SKIP);
                 true
@@ -312,6 +393,10 @@ fn on_key(app: &mut App, key: &KeyEvent, tx: &mut Tx) -> bool {
             }
             Key::Down => {
                 app.volume_delta(-0.05);
+                true
+            }
+            Key::Escape if app.export_open => {
+                app.toggle_export();
                 true
             }
             _ => false,
@@ -335,6 +420,31 @@ fn open_dialog(app: &mut App, tx: &mut Tx) {
     });
 }
 
+fn export_dialog(app: &mut App, tx: &mut Tx) {
+    let Some(session) = &app.session else {
+        return;
+    };
+    let Some(source) = session.source() else {
+        return;
+    };
+    let stem = source
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "clip".into());
+    let options = FileDialogOptions {
+        title: "Export clip".into(),
+        directory: app.last_dir.clone(),
+        file_name: Some(format!("{stem}-clip.mkv")),
+        ..Default::default()
+    }
+    .filter("Matroska", &["mkv"]);
+    tx.save_file(options, move |app: &mut App, result, _| match result {
+        Ok(Some(path)) => app.start_export(path),
+        Ok(None) => {}
+        Err(error) => app.set_export_error(error.to_string()),
+    });
+}
+
 fn view(app: &App, _: &mut Cx<App>) -> El {
     let theme = ui::palette();
     let error = app.error_text();
@@ -354,7 +464,9 @@ fn view(app: &App, _: &mut Cx<App>) -> El {
         && session.source().is_some()
     {
         let mut stage = video_stage(session, &theme);
-        if app.transport_visible {
+        if app.export_open {
+            stage = stage.child(export_tray(app, session, &theme));
+        } else if app.transport_visible {
             stage = stage.child(transport(app, session, &theme));
         }
         if let Some(error) = &error {
@@ -399,11 +511,11 @@ fn top_bar(app: &App, theme: &Palette) -> El {
                 .grow(1.0),
         );
     bar = bar
-        .child(export_status())
+        .child(export_status(app, theme))
         .child(open_button(theme))
         .child(audio_button(app, theme))
         .child(subtitle_button(app, theme))
-        .child(export_button(theme));
+        .child(export_button(app, theme));
     bar
 }
 
@@ -452,15 +564,40 @@ fn subtitle_button(app: &App, theme: &Palette) -> El {
     }
 }
 
-fn export_button(theme: &Palette) -> El {
-    ui::label_button(Some(&icons::EXPORT), "Export", false, theme)
+fn export_button(app: &App, theme: &Palette) -> El {
+    if !app.has_source() {
+        return ui::label_button(Some(&icons::EXPORT), "Export", false, theme)
+            .key("export-toggle")
+            .disabled(true)
+            .dim(0.35);
+    }
+    ui::label_button(Some(&icons::EXPORT), "Export", app.export_open, theme)
         .key("export-toggle")
-        .disabled(true)
-        .dim(0.35)
+        .expanded(app.export_open)
+        .checked(app.export_open)
+        .on_press(|app: &mut App| app.toggle_export())
 }
 
-fn export_status() -> El {
-    row().w(64.0).justify_end()
+fn export_status(app: &App, theme: &Palette) -> El {
+    let mut slot = row().w(64.0).justify_end();
+    if let Some(state) = app.export_state() {
+        let (label, color) = match state {
+            ExportState::Running { fraction } => {
+                (format!("{}%", (fraction * 100.0).round()), theme.text_muted)
+            }
+            ExportState::Finished => ("Exported".into(), theme.text_muted),
+            ExportState::Cancelled => ("Cancelled".into(), theme.text_muted),
+            ExportState::Failed(_) => ("Failed".into(), theme.danger),
+        };
+        slot = slot.child(
+            text(label)
+                .key("export-status")
+                .font(ui::TIME)
+                .color(color)
+                .truncate(),
+        );
+    }
+    slot
 }
 
 fn video_stage(session: &PlaybackSession, theme: &Palette) -> El {
@@ -954,6 +1091,245 @@ fn more_rows(app: &App, theme: &Palette) -> El {
         .child(content)
 }
 
+fn export_tray(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
+    let timeline = session.timeline();
+    let state = session.export_state();
+    let running = matches!(&state, Some(ExportState::Running { .. }));
+    let mut footer = row().w_full().gap(8.0).center_y().child(
+        row()
+            .gap(2.0)
+            .padding(2.0)
+            .radius(8.0)
+            .fill(theme.stage)
+            .child(
+                ui::segment("Precise", app.export_mode == ExportMode::Precise, theme)
+                    .key("mode-precise")
+                    .on_press(|app: &mut App| app.export_mode = ExportMode::Precise),
+            )
+            .child(
+                ui::segment("Fast", app.export_mode == ExportMode::Fast, theme)
+                    .key("mode-fast")
+                    .on_press(|app: &mut App| app.export_mode = ExportMode::Fast),
+            ),
+    );
+    footer = footer.child(el().grow(1.0));
+    match &state {
+        Some(ExportState::Running { fraction }) => {
+            footer = footer
+                .child(
+                    el().w(160.0).h(4.0).radius(2.0).fill(theme.track).child(
+                        el().w((160.0 * fraction.clamp(0.0, 1.0)).max(2.0))
+                            .h(4.0)
+                            .radius(2.0)
+                            .fill(theme.accent),
+                    ),
+                )
+                .child(
+                    text(format!("{}%", (fraction * 100.0).round()))
+                        .key("export-progress")
+                        .font(ui::TIME)
+                        .color(theme.text_muted),
+                )
+                .child(
+                    ui::ghost_button("Cancel", theme)
+                        .key("cancel-export")
+                        .on_press(|app: &mut App| app.cancel_export()),
+                );
+        }
+        Some(ExportState::Finished) => {
+            footer = footer.child(
+                text("Exported")
+                    .key("export-tray-status")
+                    .font(ui::LABEL)
+                    .color(theme.text_muted),
+            );
+        }
+        Some(ExportState::Cancelled) => {
+            footer = footer.child(
+                text("Cancelled")
+                    .key("export-tray-status")
+                    .font(ui::LABEL)
+                    .color(theme.text_muted),
+            );
+        }
+        Some(ExportState::Failed(error)) => {
+            footer = footer.child(
+                text(error.clone())
+                    .key("export-tray-status")
+                    .font(ui::LABEL)
+                    .color(theme.danger)
+                    .truncate(),
+            );
+        }
+        None => {}
+    }
+    if !running {
+        footer = footer.child(
+            ui::primary_button("Export clip", theme)
+                .key("export")
+                .on_press_tx(|app: &mut App, tx: &mut Tx| export_dialog(app, tx)),
+        );
+    }
+    let card = col()
+        .key("export-tray")
+        .w_full()
+        .max_w(ui::EXPORT_MAX_W)
+        .padding(14.0)
+        .gap(10.0)
+        .radius(ui::RADIUS_LG)
+        .fill(theme.surface)
+        .border(1.0, theme.border_strong)
+        .shadow(16.0, 36.0, theme.shadow)
+        .transition(Transition::offset(0.0, 8.0).combined(Transition::opacity()))
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(
+                    text("Export clip")
+                        .font(ui::BODY_STRONG)
+                        .color(theme.text)
+                        .grow(1.0),
+                )
+                .child(
+                    text(format!(
+                        "{} · {}s",
+                        format_clock(timeline.selection_duration()),
+                        timeline.selection_duration().round()
+                    ))
+                    .font(ui::TIME)
+                    .color(theme.text_muted),
+                )
+                .child(
+                    ui::small_icon_button(&icons::CLOSE, "Close export", theme)
+                        .key("export-close")
+                        .on_press(|app: &mut App| app.toggle_export()),
+                ),
+        )
+        .child(range_bar(&timeline, theme))
+        .child(footer);
+    row()
+        .key("export-wrap")
+        .pin(Some(0.0), None, Some(0.0), Some(16.0))
+        .w_full()
+        .justify_center()
+        .child(card)
+}
+
+fn range_bar(timeline: &crate::timeline::Timeline, theme: &Palette) -> El {
+    let start = timeline.fraction_of(timeline.in_point()) as f32;
+    let end = timeline.fraction_of(timeline.out_point()) as f32;
+    let position = timeline.fraction_of(timeline.position()) as f32;
+    let selection = (end - start).max(0.0);
+    let bar = el()
+        .key("range")
+        .w_full()
+        .h(40.0)
+        .on_drag(|app: &mut App, drag: &mut Drag, _: &mut Tx| {
+            if drag.w <= 0.0 {
+                return;
+            }
+            let Some(session) = &app.session else {
+                return;
+            };
+            let time = session
+                .timeline()
+                .time_at_fraction(f64::from(drag.x / drag.w));
+            if matches!(drag.phase, Phase::Down) {
+                let near_in = (time - session.timeline().in_point()).abs() <= 0.75;
+                let near_out = (time - session.timeline().out_point()).abs() <= 0.75;
+                drag.data = if near_in {
+                    1.0
+                } else if near_out {
+                    2.0
+                } else {
+                    0.0
+                };
+            }
+            match drag.data as i32 {
+                1 => app.set_in(time),
+                2 => app.set_out(time),
+                _ => app.seek_to(time),
+            }
+        })
+        .role("slider")
+        .label("Clip range")
+        .range_value(timeline.position(), 0.0, timeline.duration().max(0.001))
+        .child(
+            col()
+                .w_full()
+                .gap(2.0)
+                .child(
+                    row()
+                        .w_full()
+                        .h(16.0)
+                        .center_y()
+                        .child(
+                            el().grow(start.max(0.001))
+                                .h(10.0)
+                                .radius(5.0)
+                                .fill(theme.track),
+                        )
+                        .child(el().w(4.0).h(18.0).radius(2.0).fill(theme.accent))
+                        .child(
+                            el().grow(selection.max(0.001))
+                                .h(10.0)
+                                .fill(theme.accent_soft),
+                        )
+                        .child(el().w(4.0).h(18.0).radius(2.0).fill(theme.accent))
+                        .child(
+                            el().grow((1.0 - end).max(0.001))
+                                .h(10.0)
+                                .radius(5.0)
+                                .fill(theme.track),
+                        ),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .h(20.0)
+                        .center_y()
+                        .child(el().grow(position.max(0.001)))
+                        .child(el().w(2.0).h(20.0).fill(theme.text))
+                        .child(el().grow((1.0 - position).max(0.001))),
+                ),
+        );
+    col().w_full().gap(2.0).child(bar).child(
+        row()
+            .w_full()
+            .gap(8.0)
+            .center_y()
+            .child(
+                text(format_clock(timeline.in_point()))
+                    .font(ui::TIME)
+                    .color(theme.text_muted),
+            )
+            .child(el().grow(1.0))
+            .child(
+                text(format!("{}s", timeline.selection_duration().round()))
+                    .font(ui::TIME)
+                    .color(theme.text),
+            )
+            .child(el().grow(1.0))
+            .child(
+                text(format_clock(timeline.out_point()))
+                    .font(ui::TIME)
+                    .color(theme.text_muted),
+            )
+            .child(
+                ui::small_icon_button(&icons::MINUS, "Zoom out", theme)
+                    .key("zoom-out")
+                    .on_press(|app: &mut App| app.zoom_out()),
+            )
+            .child(
+                ui::small_icon_button(&icons::PLUS, "Zoom in", theme)
+                    .key("zoom-in")
+                    .on_press(|app: &mut App| app.zoom_in()),
+            ),
+    )
+}
+
 fn format_speed(speed: f32) -> String {
     if (speed - speed.round()).abs() < 0.01 {
         format!("{}×", speed.round() as i32)
@@ -994,7 +1370,7 @@ pub fn run() {
 mod tests {
     use super::*;
     use crate::engine::PlayerEngine;
-    use crate::export::{ExportJob, ExportState};
+    use crate::export::ExportJob;
     use crate::timeline::{DEFAULT_FRAME, Timeline};
     use rune::{Env, Mods, Runtime};
     use std::sync::{Arc, Mutex};
@@ -1535,6 +1911,34 @@ mod tests {
     }
 
     #[test]
+    fn the_export_tray_renders_each_export_state() {
+        let states = [
+            ExportState::Running { fraction: 0.5 },
+            ExportState::Finished,
+            ExportState::Cancelled,
+            ExportState::Failed("export failed".into()),
+        ];
+        for state in states {
+            let (mut app, _) = app_with_fake();
+            session_mut(&mut app).set_export(Some(ExportJob::with_state(state.clone())));
+            let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+            runtime.frame(0.0);
+            assert!(runtime.find("export-tray").is_none(), "{state:?}");
+            assert!(runtime.find("export-status").is_some(), "{state:?}");
+            click(&mut runtime, "export-toggle");
+            runtime.frame(0.2);
+            assert!(runtime.find("export-tray").is_some(), "{state:?}");
+            if matches!(state, ExportState::Running { .. }) {
+                assert!(runtime.find("cancel-export").is_some(), "{state:?}");
+                assert!(runtime.find("export").is_none(), "{state:?}");
+            } else {
+                assert!(runtime.find("cancel-export").is_none(), "{state:?}");
+                assert!(runtime.find("export").is_some(), "{state:?}");
+            }
+        }
+    }
+
+    #[test]
     fn the_shell_fits_both_window_sizes() {
         for size in [(1280.0, 800.0), (960.0, 600.0)] {
             let (app, log) = app_with_fake();
@@ -1629,6 +2033,22 @@ mod tests {
     }
 
     #[test]
+    fn escape_closes_the_export_tray() {
+        let (app, _) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.on_key = Some(on_key);
+        runtime.frame(0.0);
+        click(&mut runtime, "export-toggle");
+        assert!(runtime.find("export-tray").is_some());
+        runtime.key(KeyEvent {
+            key: Key::Escape,
+            mods: Default::default(),
+        });
+        runtime.frame(0.5);
+        assert!(runtime.find("export-tray").is_none());
+    }
+
+    #[test]
     fn keyboard_controls_playback_and_volume() {
         let (app, log) = app_with_fake();
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
@@ -1664,6 +2084,19 @@ mod tests {
         });
         runtime.frame(1.0 / 60.0);
         assert_eq!(log.lock().unwrap().volume, Some(0.0));
+
+        runtime.key(KeyEvent {
+            key: Key::Text("e".into()),
+            mods: Default::default(),
+        });
+        runtime.frame(1.0 / 60.0);
+        assert!(runtime.find("export-tray").is_some());
+        runtime.key(KeyEvent {
+            key: Key::Escape,
+            mods: Default::default(),
+        });
+        runtime.frame(0.5);
+        assert!(runtime.find("export-tray").is_none());
     }
 
     #[test]

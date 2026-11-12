@@ -123,6 +123,8 @@ pub mod icons {
         "alert",
         r#"<path d="M12 3 2.5 20h19z"/><path d="M12 9v5"/><path d="M12 17h.01"/>"#
     );
+    stroke_icon!(PLUS, "plus", r#"<path d="M12 5v14M5 12h14"/>"#);
+    stroke_icon!(MINUS, "minus", r#"<path d="M5 12h14"/>"#);
     stroke_icon!(
         VOLUME,
         "volume",
