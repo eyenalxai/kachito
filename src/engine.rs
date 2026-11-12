@@ -5,9 +5,9 @@ use rune::{NativeSurface, Waker};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -78,6 +78,7 @@ pub trait PlayerEngine: Send {
     fn tracks(&self) -> Result<Vec<Track>, String>;
     fn select_audio(&mut self, id: i64) -> Result<(), String>;
     fn select_subtitle(&mut self, id: Option<i64>) -> Result<(), String>;
+    /// Installs the app waker for playback state changes and surface pushes.
     fn set_waker(&self, waker: Waker);
 }
 
@@ -186,7 +187,8 @@ impl PlayerEngine for MpvEngine {
         self.core.select_subtitle(id)
     }
     fn set_waker(&self, waker: Waker) {
-        self.core.set_waker(waker);
+        self.core.set_waker(waker.clone());
+        self.surface.set_waker(waker);
     }
 }
 
@@ -872,16 +874,21 @@ mod tests {
             .join(name)
     }
 
-    fn wait_for_frame(engine: &MpvEngine) {
+    fn wait_for_frame_count(engine: &MpvEngine, target: u64) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while engine.frames() == 0 && Instant::now() < deadline {
+        while engine.frames() < target && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            engine.frames() > 0,
-            "libmpv pushed no frame: {:?}",
+            engine.frames() >= target,
+            "libmpv pushed {} frames, wanted {target}: {:?}",
+            engine.frames(),
             engine.state()
         );
+    }
+
+    fn wait_for_frame(engine: &MpvEngine) {
+        wait_for_frame_count(engine, 1);
     }
 
     fn wait_for_error(engine: &MpvEngine) {
@@ -957,6 +964,40 @@ mod tests {
         assert!(
             (frame_duration - 1.0 / 25.0).abs() < 1e-6,
             "{frame_duration}"
+        );
+    }
+
+    #[test]
+    fn a_seek_wakes_the_surface_without_a_state_change() {
+        let mut engine = MpvEngine::new(true).unwrap();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = wakes.clone();
+        engine.set_waker(Arc::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }));
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_frame(&engine);
+
+        // Pause so the next frame is the seek's, and let an in-flight frame land.
+        engine.toggle();
+        thread::sleep(Duration::from_millis(100));
+        // Consume the one-shot Ready so the comparison measures a real transition.
+        let _ = engine.state();
+        let state_before = engine.state();
+        let frames = engine.frames();
+        let wakes_before = wakes.load(Ordering::Relaxed);
+
+        engine.seek(0.5);
+        wait_for_frame_count(&engine, frames + 1);
+
+        assert_eq!(
+            engine.state(),
+            state_before,
+            "the seek must not change the core state"
+        );
+        assert!(
+            wakes.load(Ordering::Relaxed) > wakes_before,
+            "the surface push after a seek did not wake the app"
         );
     }
 
