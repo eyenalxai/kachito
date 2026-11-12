@@ -1,6 +1,6 @@
 //! The selection model under the timeline: in and out points, zoom and the visible window.
 
-pub const MIN_FRAME: f64 = 1.0 / 60.0;
+pub const DEFAULT_FRAME: f64 = 1.0 / 60.0;
 const MAX_ZOOM: f64 = 32.0;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -11,6 +11,7 @@ pub struct Timeline {
     out_point: f64,
     zoom: f64,
     view_start: f64,
+    frame_duration: f64,
 }
 
 impl Default for Timeline {
@@ -28,6 +29,7 @@ impl Timeline {
             out_point: 0.0,
             zoom: 1.0,
             view_start: 0.0,
+            frame_duration: DEFAULT_FRAME,
         }
     }
 
@@ -55,8 +57,15 @@ impl Timeline {
         self.view_start
     }
 
-    pub fn set_duration(&mut self, duration: f64) {
-        if !duration.is_finite() || duration < MIN_FRAME {
+    pub fn frame_duration(&self) -> f64 {
+        self.frame_duration
+    }
+
+    pub fn set_duration(&mut self, duration: f64, frame_duration: f64) {
+        if frame_duration.is_finite() && frame_duration > 0.0 {
+            self.frame_duration = frame_duration;
+        }
+        if !duration.is_finite() || duration < self.frame_duration {
             self.duration = 0.0;
             self.position = 0.0;
             self.in_point = 0.0;
@@ -70,8 +79,10 @@ impl Timeline {
             self.in_point = 0.0;
             self.out_point = duration;
         } else {
-            self.out_point = self.out_point.min(duration);
-            self.in_point = self.in_point.min((self.out_point - MIN_FRAME).max(0.0));
+            self.out_point = self.out_point.clamp(self.frame_duration, duration);
+            self.in_point = self
+                .in_point
+                .min((self.out_point - self.frame_duration).max(0.0));
         }
         self.position = self.position.clamp(0.0, duration);
         self.view_start = self
@@ -103,7 +114,7 @@ impl Timeline {
         if !time.is_finite() {
             return;
         }
-        let limit = (self.out_point - MIN_FRAME).max(0.0);
+        let limit = (self.out_point - self.frame_duration).max(0.0);
         self.in_point = time.clamp(0.0, limit);
     }
 
@@ -111,7 +122,7 @@ impl Timeline {
         if !time.is_finite() {
             return;
         }
-        let floor = (self.in_point + MIN_FRAME).min(self.duration);
+        let floor = (self.in_point + self.frame_duration).min(self.duration);
         self.out_point = time.clamp(floor, self.duration);
     }
 
@@ -183,7 +194,7 @@ mod tests {
     #[test]
     fn a_new_timeline_selects_the_whole_file() {
         let mut timeline = Timeline::new();
-        timeline.set_duration(100.0);
+        timeline.set_duration(100.0, DEFAULT_FRAME);
         assert_eq!(timeline.selection(), (0.0, 100.0));
         assert_eq!(timeline.selection_duration(), 100.0);
     }
@@ -191,14 +202,14 @@ mod tests {
     #[test]
     fn in_and_out_clamp_and_keep_one_frame() {
         let mut timeline = Timeline::new();
-        timeline.set_duration(10.0);
+        timeline.set_duration(10.0, DEFAULT_FRAME);
         timeline.set_in(3.0);
         timeline.set_out(8.0);
         assert_eq!(timeline.selection(), (3.0, 8.0));
         timeline.set_in(9.0);
-        assert!(timeline.in_point() <= 8.0 - MIN_FRAME);
+        assert!(timeline.in_point() <= 8.0 - DEFAULT_FRAME);
         timeline.set_out(1.0);
-        assert!(timeline.out_point() >= timeline.in_point() + MIN_FRAME);
+        assert!(timeline.out_point() >= timeline.in_point() + DEFAULT_FRAME);
         timeline.set_in(-4.0);
         assert_eq!(timeline.in_point(), 0.0);
     }
@@ -206,17 +217,17 @@ mod tests {
     #[test]
     fn a_sequence_keeps_the_selection_and_view_valid() {
         let mut timeline = Timeline::new();
-        timeline.set_duration(100.0);
+        timeline.set_duration(100.0, DEFAULT_FRAME);
         timeline.set_position(75.0);
         timeline.set_zoom(4.0);
         timeline.set_in(90.0);
         timeline.set_out(95.0);
         timeline.set_in(94.99);
         timeline.set_out(1.0);
-        timeline.set_duration(50.0);
+        timeline.set_duration(50.0, DEFAULT_FRAME);
         let (start, end) = timeline.selection();
         assert!(start >= 0.0);
-        assert!(start <= end - MIN_FRAME + 1e-9);
+        assert!(start <= end - DEFAULT_FRAME + 1e-9);
         assert!(end <= timeline.duration());
         assert!(timeline.position() >= 0.0);
         assert!(timeline.position() <= timeline.duration());
@@ -232,7 +243,7 @@ mod tests {
     #[test]
     fn non_finite_times_leave_the_selection_unchanged() {
         let mut timeline = Timeline::new();
-        timeline.set_duration(10.0);
+        timeline.set_duration(10.0, DEFAULT_FRAME);
         timeline.set_position(5.0);
         timeline.set_in(2.0);
         timeline.set_out(8.0);
@@ -248,15 +259,30 @@ mod tests {
     #[test]
     fn a_file_shorter_than_one_frame_has_no_timeline() {
         let mut timeline = Timeline::new();
-        timeline.set_duration(MIN_FRAME / 2.0);
+        timeline.set_duration(DEFAULT_FRAME / 2.0, DEFAULT_FRAME);
         assert_eq!(timeline.duration(), 0.0);
         assert_eq!(timeline.selection(), (0.0, 0.0));
     }
 
     #[test]
+    fn the_frame_minimum_follows_the_source() {
+        let mut timeline = Timeline::new();
+        timeline.set_duration(10.0, 1.0 / 24.0);
+        timeline.set_out(0.02);
+        assert!((timeline.frame_duration() - 1.0 / 24.0).abs() < 1e-9);
+        assert!(timeline.out_point() >= 1.0 / 24.0);
+        timeline.set_duration(10.0, 1.0 / 60.0);
+        timeline.set_out(0.01);
+        assert!((timeline.frame_duration() - 1.0 / 60.0).abs() < 1e-9);
+        assert!(timeline.out_point() >= 1.0 / 60.0);
+        timeline.set_duration(10.0, 1.0 / 24.0);
+        assert!(timeline.selection_duration() >= 1.0 / 24.0 - 1e-9);
+    }
+
+    #[test]
     fn zoom_keeps_the_position_in_view_and_respects_bounds() {
         let mut timeline = Timeline::new();
-        timeline.set_duration(100.0);
+        timeline.set_duration(100.0, DEFAULT_FRAME);
         timeline.set_position(50.0);
         timeline.zoom_in();
         assert!(timeline.visible_span() < 100.0);
@@ -271,7 +297,7 @@ mod tests {
     #[test]
     fn fractions_round_trip_inside_the_visible_window() {
         let mut timeline = Timeline::new();
-        timeline.set_duration(100.0);
+        timeline.set_duration(100.0, DEFAULT_FRAME);
         timeline.set_position(50.0);
         timeline.set_zoom(4.0);
         let time = timeline.time_at_fraction(0.25);

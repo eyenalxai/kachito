@@ -652,7 +652,7 @@ mod tests {
     use super::*;
     use crate::engine::PlayerEngine;
     use crate::export::ExportJob;
-    use crate::timeline::Timeline;
+    use crate::timeline::{DEFAULT_FRAME, Timeline};
     use rune::{Env, Runtime};
     use std::sync::{Arc, Mutex};
 
@@ -666,6 +666,7 @@ mod tests {
         opened: Option<PathBuf>,
         audio: Option<i64>,
         subtitle: Option<i64>,
+        frame_duration: f64,
     }
 
     impl Default for FakeLog {
@@ -680,6 +681,7 @@ mod tests {
                 opened: None,
                 audio: None,
                 subtitle: None,
+                frame_duration: 1.0 / 60.0,
             }
         }
     }
@@ -719,6 +721,9 @@ mod tests {
         }
         fn state(&self) -> PlaybackState {
             self.log.lock().unwrap().state.clone()
+        }
+        fn frame_duration(&self) -> Option<f64> {
+            Some(self.log.lock().unwrap().frame_duration)
         }
         fn current_path(&self) -> Option<PathBuf> {
             self.log.lock().unwrap().opened.clone()
@@ -872,7 +877,9 @@ mod tests {
     #[test]
     fn opening_a_missing_file_keeps_the_previous_session() {
         let (mut app, log) = app_with_fake();
-        session_mut(&mut app).timeline_mut().set_duration(12.0);
+        session_mut(&mut app)
+            .timeline_mut()
+            .set_duration(12.0, DEFAULT_FRAME);
         session_mut(&mut app).timeline_mut().set_in(3.0);
         session_mut(&mut app).timeline_mut().set_out(8.0);
         let old_path = session(&app).source().map(|path| path.to_path_buf());
@@ -894,7 +901,9 @@ mod tests {
         let corrupt = dir.join("corrupt.mkv");
         std::fs::write(&corrupt, b"not a video").unwrap();
         let (mut app, log) = app_with_fake();
-        session_mut(&mut app).timeline_mut().set_duration(12.0);
+        session_mut(&mut app)
+            .timeline_mut()
+            .set_duration(12.0, DEFAULT_FRAME);
         session_mut(&mut app).timeline_mut().set_in(3.0);
         session_mut(&mut app).timeline_mut().set_out(8.0);
         let old_path = session(&app).source().map(|path| path.to_path_buf());
@@ -925,7 +934,9 @@ mod tests {
         let next = dir.join("next.mkv");
         std::fs::write(&next, b"not a video").unwrap();
         let (mut app, log) = app_with_fake();
-        session_mut(&mut app).timeline_mut().set_duration(12.0);
+        session_mut(&mut app)
+            .timeline_mut()
+            .set_duration(12.0, DEFAULT_FRAME);
         session_mut(&mut app).timeline_mut().set_in(3.0);
         session_mut(&mut app).timeline_mut().set_out(8.0);
         let old_path = session(&app).source().map(|path| path.to_path_buf());
@@ -1016,7 +1027,9 @@ mod tests {
         let corrupt = dir.join("corrupt.mkv");
         std::fs::write(&corrupt, b"not a video").unwrap();
         let (mut app, log) = app_with_fake();
-        session_mut(&mut app).timeline_mut().set_duration(12.0);
+        session_mut(&mut app)
+            .timeline_mut()
+            .set_duration(12.0, DEFAULT_FRAME);
         session_mut(&mut app).timeline_mut().set_in(3.0);
         session_mut(&mut app).timeline_mut().set_out(8.0);
         let old_path = session(&app).source().map(|path| path.to_path_buf());
@@ -1106,6 +1119,19 @@ mod tests {
         ] {
             assert_eq!(play_label(&state), "Play");
         }
+    }
+
+    #[test]
+    fn the_session_uses_the_source_frame_duration() {
+        let (app, log) = app_with_fake();
+        log.lock().unwrap().frame_duration = 1.0 / 24.0;
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        let timeline = session(&runtime.state).timeline();
+        assert!((timeline.frame_duration() - 1.0 / 24.0).abs() < 1e-9);
+        session_mut(&mut runtime.state).timeline_mut().set_out(0.01);
+        assert!(session(&runtime.state).timeline().out_point() >= 1.0 / 24.0);
     }
 
     #[test]

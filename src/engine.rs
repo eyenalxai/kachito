@@ -71,6 +71,7 @@ pub trait PlayerEngine: Send {
     fn set_speed(&mut self, speed: f32);
     fn position(&self) -> f64;
     fn duration(&self) -> Option<f64>;
+    fn frame_duration(&self) -> Option<f64>;
     fn state(&self) -> PlaybackState;
     fn current_path(&self) -> Option<PathBuf>;
     fn surface(&self) -> NativeSurface;
@@ -162,6 +163,9 @@ impl PlayerEngine for MpvEngine {
     }
     fn duration(&self) -> Option<f64> {
         self.core.duration()
+    }
+    fn frame_duration(&self) -> Option<f64> {
+        self.core.frame_duration()
     }
     fn state(&self) -> PlaybackState {
         self.core.state()
@@ -357,6 +361,12 @@ impl Core {
     fn duration(&self) -> Option<f64> {
         self.get_double("duration")
             .filter(|duration| duration.is_finite() && *duration > 0.0)
+    }
+
+    fn frame_duration(&self) -> Option<f64> {
+        self.get_double("container-fps")
+            .filter(|fps| fps.is_finite() && *fps > 0.0)
+            .map(|fps| 1.0 / fps)
     }
 
     fn tracks(&self) -> Result<Vec<Track>, String> {
@@ -936,6 +946,18 @@ mod tests {
         engine.open(&fixture("rgbw.mkv")).unwrap();
         wait_for_frame(&engine);
         assert!(engine.state().is_loaded(), "{:?}", engine.state());
+    }
+
+    #[test]
+    fn the_engine_reports_the_frame_duration() {
+        let mut engine = MpvEngine::new(true).unwrap();
+        engine.open(&fixture("tracks.mkv")).unwrap();
+        wait_for_frame(&engine);
+        let frame_duration = engine.frame_duration().expect("a source frame duration");
+        assert!(
+            (frame_duration - 1.0 / 25.0).abs() < 1e-6,
+            "{frame_duration}"
+        );
     }
 
     #[test]
