@@ -114,8 +114,7 @@ impl PlaybackSession {
     }
 
     pub fn set_waker(&self, waker: rune::Waker) {
-        self.engine.set_waker(waker.clone());
-        self.engine.surface().set_waker(waker);
+        self.engine.set_waker(waker);
     }
 
     pub fn toggle(&mut self) {

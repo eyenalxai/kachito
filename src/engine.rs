@@ -5,9 +5,9 @@ use rune::{NativeSurface, Waker};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -186,7 +186,8 @@ impl PlayerEngine for MpvEngine {
         self.core.select_subtitle(id)
     }
     fn set_waker(&self, waker: Waker) {
-        self.core.set_waker(waker);
+        self.core.set_waker(waker.clone());
+        self.surface.set_waker(waker);
     }
 }
 
@@ -884,6 +885,18 @@ mod tests {
         );
     }
 
+    fn wait_for_next_frame(engine: &MpvEngine, after: u64) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while engine.frames() <= after && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            engine.frames() > after,
+            "the engine pushed no frame: {:?}",
+            engine.state()
+        );
+    }
+
     fn wait_for_error(engine: &MpvEngine) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !matches!(engine.state(), PlaybackState::Failed(_)) && Instant::now() < deadline {
@@ -957,6 +970,29 @@ mod tests {
         assert!(
             (frame_duration - 1.0 / 25.0).abs() < 1e-6,
             "{frame_duration}"
+        );
+    }
+
+    #[test]
+    fn a_seek_wakes_the_surface_without_a_state_change() {
+        let mut engine = MpvEngine::new(true).unwrap();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = wakes.clone();
+        engine.set_waker(Arc::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }));
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_frame(&engine);
+
+        // A seek stores no state transition, so only the surface waker can fire next.
+        let frames = engine.frames();
+        let wakes_before = wakes.load(Ordering::Relaxed);
+        engine.seek(0.5);
+        wait_for_next_frame(&engine, frames);
+
+        assert!(
+            wakes.load(Ordering::Relaxed) > wakes_before,
+            "the surface push after a seek did not wake the app"
         );
     }
 
