@@ -23,7 +23,8 @@ pub struct PlaybackSession {
     tracks: TracksState,
     timeline: Timeline,
     export: Option<ExportJob>,
-    export_error: Option<String>,
+    failure: Option<String>,
+    last_state: PlaybackState,
 }
 
 impl PlaybackSession {
@@ -35,7 +36,8 @@ impl PlaybackSession {
             tracks: TracksState::Unloaded,
             timeline: Timeline::new(),
             export: None,
-            export_error: None,
+            failure: None,
+            last_state: PlaybackState::Empty,
         }
     }
 
@@ -57,6 +59,8 @@ impl PlaybackSession {
         let awaiting = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
         self.engine.open(&path)?;
         self.awaiting_source = Some(awaiting);
+        self.failure = None;
+        self.last_state = PlaybackState::Loading;
         Ok(())
     }
 
@@ -99,18 +103,6 @@ impl PlaybackSession {
 
     pub fn export_state(&self) -> Option<ExportState> {
         self.export.as_ref().map(ExportJob::state)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn export_error(&self) -> Option<&str> {
-        self.export_error.as_deref()
-    }
-
-    pub fn error(&self) -> Option<String> {
-        match self.engine.state() {
-            PlaybackState::Failed(error) => Some(error),
-            _ => self.export_error.clone(),
-        }
     }
 
     pub fn set_waker(&self, waker: rune::Waker) {
@@ -170,9 +162,9 @@ impl PlaybackSession {
         }
     }
 
-    pub fn start_export(&mut self, output: PathBuf, mode: ExportMode) {
+    pub fn start_export(&mut self, output: PathBuf, mode: ExportMode) -> Result<(), String> {
         let Some(source) = self.source.clone() else {
-            return;
+            return Ok(());
         };
         let start = self.timeline.in_point();
         let end = self.timeline.out_point();
@@ -182,8 +174,7 @@ impl PlaybackSession {
             TracksState::Unloaded | TracksState::Failed(_) => 0,
         };
         self.export = None;
-        self.export_error = None;
-        let request = match ExportRequest::new(
+        let request = ExportRequest::new(
             source,
             start,
             end,
@@ -194,17 +185,10 @@ impl PlaybackSession {
             self.timeline.frame_duration(),
             mode,
             output,
-        ) {
-            Ok(request) => request,
-            Err(error) => {
-                self.export_error = Some(error.to_string());
-                return;
-            }
-        };
-        match ExportJob::start(request) {
-            Ok(job) => self.export = Some(job),
-            Err(error) => self.export_error = Some(error.to_string()),
-        }
+        )
+        .map_err(|error| error.to_string())?;
+        self.export = Some(ExportJob::start(request).map_err(|error| error.to_string())?);
+        Ok(())
     }
 
     pub fn cancel_export(&self) {
@@ -213,12 +197,14 @@ impl PlaybackSession {
         }
     }
 
-    pub fn set_export_error(&mut self, error: String) {
-        self.export_error = Some(error);
-    }
-
     pub fn poll(&mut self, tx: &mut Tx) -> bool {
         let state = self.engine.state();
+        if self.last_state != state
+            && let PlaybackState::Failed(error) = &state
+        {
+            self.failure = Some(error.clone());
+        }
+        self.last_state = state.clone();
         let mut changed = self.confirm_open(&state);
         let playback_ready = self.awaiting_source.is_none()
             && !matches!(&state, PlaybackState::Loading | PlaybackState::Failed(_));
@@ -249,6 +235,10 @@ impl PlaybackSession {
             changed = true;
         }
         changed
+    }
+
+    pub fn take_failure(&mut self) -> Option<String> {
+        self.failure.take()
     }
 
     pub(crate) fn confirm_open(&mut self, state: &PlaybackState) -> bool {
@@ -291,7 +281,6 @@ impl PlaybackSession {
             self.tracks = TracksState::Unloaded;
             self.timeline = Timeline::new();
             self.export = None;
-            self.export_error = None;
         }
     }
 
@@ -317,6 +306,7 @@ impl PlaybackSession {
         source: PathBuf,
         tracks: TracksState,
     ) -> Self {
+        let last_state = engine.state();
         Self {
             engine,
             source: Some(source),
@@ -324,7 +314,8 @@ impl PlaybackSession {
             tracks,
             timeline: Timeline::new(),
             export: None,
-            export_error: None,
+            failure: None,
+            last_state,
         }
     }
 
