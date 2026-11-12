@@ -17,8 +17,8 @@ Local MKV and MP4 files cannot be watched in a Rune desktop app on Linux because
 - [x] decisions: engine, formats, platform, subtitle scope and clip behaviour
 - [x] spec: `.scratch/kachito/spec.md`
 - [x] tickets: `.scratch/kachito/issues/`
-- [ ] implement: in progress, first ticket
-- [ ] code-review: pending
+- [x] implement: first ticket committed locally; no remote yet
+- [x] code-review: findings fixed (remote URLs, error placement, frame counting, test gaps)
 - [ ] merge: pending
 
 ## Gates
@@ -80,16 +80,18 @@ The concurrency cap is ten.
 ## Follow-ups
 
 - Multi-subtitle overlay and bitmap subtitle compositing, if the player needs them.
+- Frame-buffer pool for sustained playback; the first slice allocates a frame buffer per pushed frame.
+- Native-size and fullscreen video rendering; the first slice renders at 1280x720.
 - GPU interop for 4K60 and HDR, if the SDR byte path is not enough.
 - Bundled distribution with LGPL libmpv and ffmpeg, or a GPL distribution.
 - Remote playback from the Rails service, deferred.
 
 ## Next step
 
-- Skill to load: `implement`
+- Skill to load: `implement-spec`
 - Gate: PR
-- Method: implement the first ticket and open a reviewable change
-- Why: the ticket graph is approved and the first ticket has no blockers
-- Unlocks: playback with picture and sound, the base for track selection, timeline and export
+- Method: review the first ticket locally, then run track selection and timeline as the next frontier
+- Why: playback is implemented; the next two tickets are unblocked and own separate surfaces
+- Unlocks: audio and subtitle track menus, then the timeline
 - Command: `/mission continue`
-- Produce: the first ticket's implementation and a reviewable PR
+- Produce: the next frontier's implementation

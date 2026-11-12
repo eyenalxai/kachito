@@ -50,13 +50,17 @@ impl App {
     }
 
     fn open(&mut self, path: PathBuf) {
+        if path.to_string_lossy().contains("://") {
+            self.error = Some("Remote URLs are not supported yet.".into());
+            return;
+        }
         let extension = path
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
         if !SUPPORTED.contains(&extension.as_str()) {
-            self.error = Some(format!("{} is not an MKV or MP4 file.", path.display()));
+            self.error = Some(format!("{} is not a supported video file.", path.display()));
             return;
         }
         let Some(engine) = self.engine.as_mut() else {
@@ -148,7 +152,7 @@ fn open_dialog(app: &mut App, tx: &mut Tx) {
         directory: app.last_dir.clone(),
         ..Default::default()
     }
-    .filter("Video", &["mkv", "mp4", "m4v", "mov", "webm"]);
+    .filter("Video", SUPPORTED);
     tx.open_file(options, |app: &mut App, result, _| match result {
         Ok(Some(path)) => app.open(path),
         Ok(None) => {}
@@ -198,14 +202,21 @@ fn view(app: &App, cx: &mut Cx<App>) -> El {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Kachito".into());
 
-        let top = row()
+        let mut top = row()
             .w_full()
             .padding(10.0)
             .gap(10.0)
             .center_y()
             .fill(theme.card)
-            .child(text(title).font(type_::BODY).color(theme.text).grow(1.0))
-            .child(open_button(&theme));
+            .child(text(title).font(type_::BODY).color(theme.text).grow(1.0));
+        if let Some(error) = &error {
+            top = top.child(
+                text(error.clone())
+                    .font(type_::LABEL)
+                    .color(tok::accent(2, true)),
+            );
+        }
+        let top = top.child(open_button(&theme));
 
         let seek = el()
             .key("seek")
@@ -273,7 +284,7 @@ fn view(app: &App, cx: &mut Cx<App>) -> El {
             )
             .child(controls)
     } else {
-        col()
+        let mut screen = col()
             .w_full()
             .h_full()
             .center()
@@ -290,12 +301,14 @@ fn view(app: &App, cx: &mut Cx<App>) -> El {
                 text("or drop a file here")
                     .font(type_::LABEL)
                     .color(theme.text_secondary),
-            )
-    };
-
-    let screen = if let Some(error) = error {
-        screen.child(text(error).font(type_::LABEL).color(tok::accent(2, true)))
-    } else {
+            );
+        if let Some(error) = &error {
+            screen = screen.child(
+                text(error.clone())
+                    .font(type_::LABEL)
+                    .color(tok::accent(2, true)),
+            );
+        }
         screen
     };
 
@@ -332,37 +345,46 @@ pub fn run() {
 mod tests {
     use super::*;
     use rune::{Env, Runtime};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct FakeLog {
+        playing: bool,
+        last_seek: Option<f64>,
+        volume: Option<f32>,
+        speed: Option<f32>,
+        opened: Option<PathBuf>,
+    }
 
     struct Fake {
         surface: rune::NativeSurface,
-        playing: bool,
-    }
-
-    impl Default for Fake {
-        fn default() -> Self {
-            Self {
-                surface: rune::NativeSurface::new(),
-                playing: false,
-            }
-        }
+        log: Arc<Mutex<FakeLog>>,
     }
 
     impl PlayerEngine for Fake {
-        fn open(&mut self, _: &std::path::Path) -> Result<(), String> {
+        fn open(&mut self, path: &std::path::Path) -> Result<(), String> {
+            self.log.lock().unwrap().opened = Some(path.to_path_buf());
             Ok(())
         }
         fn play(&mut self) {
-            self.playing = true;
+            self.log.lock().unwrap().playing = true;
         }
         fn pause(&mut self) {
-            self.playing = false;
+            self.log.lock().unwrap().playing = false;
         }
         fn toggle(&mut self) {
-            self.playing = !self.playing;
+            let mut log = self.log.lock().unwrap();
+            log.playing = !log.playing;
         }
-        fn seek(&mut self, _: f64) {}
-        fn set_volume(&mut self, _: f32) {}
-        fn set_speed(&mut self, _: f32) {}
+        fn seek(&mut self, seconds: f64) {
+            self.log.lock().unwrap().last_seek = Some(seconds);
+        }
+        fn set_volume(&mut self, volume: f32) {
+            self.log.lock().unwrap().volume = Some(volume);
+        }
+        fn set_speed(&mut self, speed: f32) {
+            self.log.lock().unwrap().speed = Some(speed);
+        }
         fn position(&self) -> f64 {
             0.0
         }
@@ -370,7 +392,7 @@ mod tests {
             Some(10.0)
         }
         fn is_playing(&self) -> bool {
-            self.playing
+            self.log.lock().unwrap().playing
         }
         fn error(&self) -> Option<String> {
             None
@@ -384,66 +406,80 @@ mod tests {
         fn set_waker(&self, _: Waker) {}
     }
 
-    fn app_with_fake() -> App {
-        App {
-            engine: Some(Box::new(Fake::default())),
+    fn app_with_fake() -> (App, Arc<Mutex<FakeLog>>) {
+        let log = Arc::new(Mutex::new(FakeLog::default()));
+        let app = App {
+            engine: Some(Box::new(Fake {
+                surface: rune::NativeSurface::new(),
+                log: log.clone(),
+            })),
             path: Some(PathBuf::from("test.mkv")),
             error: None,
             volume: 1.0,
             speed: 1.0,
             last_dir: None,
-        }
+        };
+        (app, log)
+    }
+
+    fn window() -> (f32, f32) {
+        (VIDEO_WIDTH as f32, VIDEO_HEIGHT as f32 + 104.0)
     }
 
     #[test]
     fn the_play_button_toggles_playback() {
-        let mut runtime = Runtime::new(
-            app_with_fake(),
-            view,
-            (VIDEO_WIDTH as f32, VIDEO_HEIGHT as f32 + 104.0),
-            Env::new(true, 1.0),
-        );
+        let (app, log) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.frame(0.0);
         let (x, y) = runtime.find("play").expect("the play button");
         runtime.pointer_down(x, y);
         runtime.pointer_up(x, y);
         runtime.frame(1.0 / 60.0);
-        assert!(runtime.state.engine.as_ref().unwrap().is_playing());
+        assert!(log.lock().unwrap().playing);
     }
 
     #[test]
     fn dropping_a_file_opens_it() {
-        let mut app = app_with_fake();
+        let (mut app, log) = app_with_fake();
         app.path = None;
-        let mut runtime = Runtime::new(
-            app,
-            view,
-            (VIDEO_WIDTH as f32, VIDEO_HEIGHT as f32 + 104.0),
-            Env::new(true, 1.0),
-        );
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.frame(0.0);
         let at = runtime.find("video").unwrap_or((10.0, 10.0));
         runtime.drop_files(vec![PathBuf::from("dropped.mkv")], Some(at));
         runtime.frame(1.0 / 60.0);
         assert_eq!(runtime.state.path, Some(PathBuf::from("dropped.mkv")));
+        assert_eq!(
+            log.lock().unwrap().opened,
+            Some(PathBuf::from("dropped.mkv"))
+        );
     }
 
     #[test]
-    fn volume_and_speed_controls_clamp_and_cycle() {
-        let mut app = app_with_fake();
+    fn volume_speed_and_seek_reach_the_engine() {
+        let (mut app, log) = app_with_fake();
         app.volume_delta(-0.5);
-        assert_eq!(app.volume, 0.5);
+        assert_eq!(log.lock().unwrap().volume, Some(0.5));
         app.volume_delta(-5.0);
         assert_eq!(app.volume, 0.0);
         app.cycle_speed();
-        assert_eq!(app.speed, 1.25);
+        assert_eq!(log.lock().unwrap().speed, Some(1.25));
+        app.seek_fraction(0.5);
+        assert_eq!(log.lock().unwrap().last_seek, Some(5.0));
     }
 
     #[test]
     fn a_non_video_file_is_rejected() {
-        let mut app = app_with_fake();
+        let (mut app, _) = app_with_fake();
         app.open(PathBuf::from("notes.txt"));
         assert!(app.error.is_some());
         assert!(app.path.is_some(), "the previous file stays open");
+    }
+
+    #[test]
+    fn a_remote_url_is_rejected() {
+        let (mut app, log) = app_with_fake();
+        app.open(PathBuf::from("https://example.test/movie.mp4"));
+        assert!(app.error.is_some());
+        assert_eq!(log.lock().unwrap().opened, None);
     }
 }

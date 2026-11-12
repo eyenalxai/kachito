@@ -42,25 +42,48 @@ impl MpvEngine {
     /// `headless` keeps audio off so tests do not open a device.
     pub fn new(headless: bool) -> Result<Self, String> {
         let core = Arc::new(Core::new(headless)?);
-        let render = unsafe { create_render(core.handle)? };
         let surface = NativeSurface::new();
         let stop = Arc::new(AtomicBool::new(false));
+        let (ready, ready_rx) = std::sync::mpsc::sync_channel(1);
         let thread = {
             let core = core.clone();
             let surface = surface.clone();
             let stop = stop.clone();
-            let context = RenderContext(render);
             thread::Builder::new()
                 .name("kachito-mpv".into())
-                .spawn(move || context.run(core, surface, stop))
+                .spawn(move || {
+                    let render = match unsafe { create_render(core.handle) } {
+                        Ok(render) => {
+                            let _ = ready.send(Ok(()));
+                            render
+                        }
+                        Err(error) => {
+                            let _ = ready.send(Err(error));
+                            return;
+                        }
+                    };
+                    RenderContext(render).run(core, surface, stop);
+                })
                 .map_err(|error| format!("could not start the playback thread: {error}"))?
         };
-        Ok(Self {
-            core,
-            surface,
-            stop,
-            thread: Some(thread),
-        })
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                core,
+                surface,
+                stop,
+                thread: Some(thread),
+            }),
+            Ok(Err(error)) => {
+                stop.store(true, Ordering::Relaxed);
+                let _ = thread.join();
+                Err(error)
+            }
+            Err(_) => {
+                stop.store(true, Ordering::Relaxed);
+                let _ = thread.join();
+                Err("the playback thread stopped before it was ready".into())
+            }
+        }
     }
 }
 
@@ -131,6 +154,7 @@ unsafe impl Sync for Core {}
 
 struct Status {
     loaded: bool,
+    eof: bool,
     error: Option<String>,
 }
 
@@ -144,7 +168,7 @@ impl Core {
             let options: &[(&str, &str)] = &[
                 ("vo", "libmpv"),
                 ("idle", "yes"),
-                ("keep-open", "no"),
+                ("keep-open", "yes"),
                 ("video-sync", "audio"),
                 ("video-timing-offset", "0"),
                 ("osd-level", "0"),
@@ -175,6 +199,7 @@ impl Core {
                 handle,
                 status: Mutex::new(Status {
                     loaded: false,
+                    eof: false,
                     error: None,
                 }),
                 waker: Mutex::new(None),
@@ -194,10 +219,11 @@ impl Core {
         }
     }
 
-    fn set_status(&self, loaded: bool, error: Option<String>) {
+    fn set_status(&self, loaded: bool, eof: bool, error: Option<String>) {
         {
             let mut status = self.status.lock().unwrap();
             status.loaded = loaded;
+            status.eof = eof;
             status.error = error;
         }
         self.wake();
@@ -208,16 +234,24 @@ impl Core {
         {
             let mut status = self.status.lock().unwrap();
             status.loaded = false;
+            status.eof = false;
             status.error = None;
         }
         self.command(&["loadfile", path])
     }
 
     fn set_paused(&self, paused: bool) {
+        if !paused && self.status.lock().unwrap().eof {
+            self.seek(0.0);
+        }
         let _ = self.set_flag("pause", paused);
     }
 
     fn toggle(&self) {
+        if self.status.lock().unwrap().eof {
+            self.set_paused(false);
+            return;
+        }
         let paused = self.get_flag("pause").unwrap_or(false);
         self.set_paused(!paused);
     }
@@ -228,6 +262,7 @@ impl Core {
         }
         let seconds = seconds.max(0.0);
         let _ = self.command(&["seek", &format!("{seconds:.3}"), "absolute+exact"]);
+        self.status.lock().unwrap().eof = false;
     }
 
     fn set_volume(&self, volume: f32) {
@@ -248,11 +283,11 @@ impl Core {
     }
 
     fn is_playing(&self) -> bool {
-        let (loaded, failed) = {
+        let (loaded, eof, failed) = {
             let status = self.status.lock().unwrap();
-            (status.loaded, status.error.is_some())
+            (status.loaded, status.eof, status.error.is_some())
         };
-        loaded && !failed && !self.get_flag("pause").unwrap_or(true)
+        loaded && !eof && !failed && !self.get_flag("pause").unwrap_or(true)
     }
 
     fn error(&self) -> Option<String> {
@@ -270,17 +305,19 @@ impl Core {
                 break;
             }
             match id {
-                mpv::EVENT_FILE_LOADED => self.set_status(true, None),
+                mpv::EVENT_FILE_LOADED => self.set_status(true, false, None),
                 mpv::EVENT_END_FILE => {
                     let data = unsafe { (*event).data };
                     if data.is_null() {
-                        self.set_status(false, Some("the file ended unexpectedly".into()));
+                        self.set_status(false, false, Some("the file ended unexpectedly".into()));
                     } else {
                         let end = unsafe { &*(data as *const mpv::EventEndFile) };
                         if end.reason == mpv::END_FILE_REASON_ERROR {
-                            self.set_status(false, Some(error_string(end.error)));
+                            self.set_status(false, false, Some(error_string(end.error)));
+                        } else if end.reason == mpv::END_FILE_REASON_EOF {
+                            self.set_status(true, true, None);
                         } else {
-                            self.set_status(false, None);
+                            self.set_status(false, false, None);
                         }
                     }
                 }
@@ -290,7 +327,11 @@ impl Core {
     }
 
     fn command(&self, args: &[&str]) -> Result<(), String> {
-        let strings: Vec<CString> = args.iter().map(|arg| CString::new(*arg).unwrap()).collect();
+        let strings: Vec<CString> = args
+            .iter()
+            .map(|arg| CString::new(*arg))
+            .collect::<Result<_, _>>()
+            .map_err(|_| "an argument contains a NUL byte".to_string())?;
         let mut pointers: Vec<*const c_char> = strings.iter().map(|arg| arg.as_ptr()).collect();
         pointers.push(ptr::null());
         check(
@@ -388,9 +429,10 @@ impl RenderContext {
                 if self.render_frame(&mut buffer).is_ok() {
                     opaque(&mut buffer);
                     let bytes = std::mem::take(&mut buffer);
-                    let _ = surface.push_bytes(frame(bytes), id);
-                    id += 1;
-                    core.frames.fetch_add(1, Ordering::Relaxed);
+                    if surface.push_bytes(frame(bytes), id).is_ok() {
+                        id += 1;
+                        core.frames.fetch_add(1, Ordering::Relaxed);
+                    }
                     buffer = vec![0u8; size];
                 }
                 unsafe { mpv::mpv_render_context_report_swap(self.0) };
@@ -528,6 +570,7 @@ mod mpv {
     pub const EVENT_NONE: c_int = 0;
     pub const EVENT_END_FILE: c_int = 7;
     pub const EVENT_FILE_LOADED: c_int = 8;
+    pub const END_FILE_REASON_EOF: c_int = 0;
     pub const END_FILE_REASON_ERROR: c_int = 4;
 
     pub const FORMAT_FLAG: c_int = 3;
@@ -585,14 +628,13 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    fn fixture() -> std::path::PathBuf {
-        std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/test/rgbw.mp4"))
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/test")
+            .join(name)
     }
 
-    #[test]
-    fn opens_a_file_and_pushes_a_frame() {
-        let mut engine = MpvEngine::new(true).unwrap();
-        engine.open(&fixture()).unwrap();
+    fn wait_for_frame(engine: &MpvEngine) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while engine.frames() == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
@@ -602,6 +644,36 @@ mod tests {
             "libmpv pushed no frame: {:?}",
             engine.error()
         );
+    }
+
+    fn wait_for_error(engine: &MpvEngine) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.error().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            engine.error().is_some(),
+            "a missing file must report an error"
+        );
+    }
+
+    #[test]
+    fn opens_an_mp4_file_and_pushes_a_frame() {
+        let mut engine = MpvEngine::new(true).unwrap();
+        engine.open(&fixture("rgbw.mp4")).unwrap();
+        wait_for_frame(&engine);
+        assert!(
+            engine.surface().last_error().is_none(),
+            "{:?}",
+            engine.surface().last_error()
+        );
+    }
+
+    #[test]
+    fn opens_an_mkv_file_and_pushes_a_frame() {
+        let mut engine = MpvEngine::new(true).unwrap();
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_frame(&engine);
         assert!(
             engine.surface().last_error().is_none(),
             "{:?}",
@@ -613,13 +685,6 @@ mod tests {
     fn a_missing_file_sets_an_error() {
         let mut engine = MpvEngine::new(true).unwrap();
         let _ = engine.open(Path::new("/definitely/not/here.mkv"));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while engine.error().is_none() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            engine.error().is_some(),
-            "a missing file must report an error"
-        );
+        wait_for_error(&engine);
     }
 }
