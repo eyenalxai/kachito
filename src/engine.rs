@@ -46,7 +46,6 @@ impl Track {
 pub enum PlaybackState {
     Empty,
     Loading,
-    Ready,
     Playing,
     Paused,
     Ended,
@@ -55,10 +54,7 @@ pub enum PlaybackState {
 
 impl PlaybackState {
     pub fn is_loaded(&self) -> bool {
-        matches!(
-            self,
-            Self::Ready | Self::Playing | Self::Paused | Self::Ended
-        )
+        matches!(self, Self::Playing | Self::Paused | Self::Ended)
     }
 }
 
@@ -204,7 +200,6 @@ impl Drop for MpvEngine {
 struct Core {
     handle: *mut mpv::Handle,
     state: Mutex<PlaybackState>,
-    ready_reported: AtomicBool,
     waker: Mutex<Option<Waker>>,
     #[cfg(test)]
     frames: AtomicU64,
@@ -253,7 +248,6 @@ impl Core {
             Ok(Self {
                 handle,
                 state: Mutex::new(PlaybackState::Empty),
-                ready_reported: AtomicBool::new(false),
                 waker: Mutex::new(None),
                 #[cfg(test)]
                 frames: AtomicU64::new(0),
@@ -273,9 +267,6 @@ impl Core {
     }
 
     fn set_state(&self, state: PlaybackState) {
-        if matches!(&state, PlaybackState::Ready) {
-            self.ready_reported.store(false, Ordering::Relaxed);
-        }
         *self.state.lock().unwrap() = state;
         self.wake();
     }
@@ -297,43 +288,27 @@ impl Core {
     }
 
     fn state(&self) -> PlaybackState {
-        let state = self.state.lock().unwrap().clone();
-        match state {
-            PlaybackState::Ready => {
-                if !self.ready_reported.swap(true, Ordering::Relaxed) {
-                    PlaybackState::Ready
-                } else if self.get_flag("pause").unwrap_or(true) {
-                    PlaybackState::Paused
-                } else {
-                    PlaybackState::Playing
-                }
-            }
-            PlaybackState::Playing | PlaybackState::Paused => {
-                if self.get_flag("pause").unwrap_or(true) {
-                    PlaybackState::Paused
-                } else {
-                    PlaybackState::Playing
-                }
-            }
-            other => other,
-        }
+        self.state.lock().unwrap().clone()
     }
 
     fn set_paused(&self, paused: bool) {
-        let ended = matches!(*self.state.lock().unwrap(), PlaybackState::Ended);
-        if !paused && ended {
+        if !paused && matches!(*self.state.lock().unwrap(), PlaybackState::Ended) {
             self.seek(0.0);
         }
         let _ = self.set_flag("pause", paused);
+        self.set_state(if paused {
+            PlaybackState::Paused
+        } else {
+            PlaybackState::Playing
+        });
     }
 
     fn toggle(&self) {
-        if matches!(*self.state.lock().unwrap(), PlaybackState::Ended) {
-            self.set_paused(false);
-            return;
+        match self.state() {
+            PlaybackState::Playing => self.set_paused(true),
+            PlaybackState::Paused | PlaybackState::Ended => self.set_paused(false),
+            _ => {}
         }
-        let paused = self.get_flag("pause").unwrap_or(false);
-        self.set_paused(!paused);
     }
 
     fn seek(&self, seconds: f64) {
@@ -342,9 +317,8 @@ impl Core {
         }
         let seconds = seconds.max(0.0);
         let _ = self.command(&["seek", &format!("{seconds:.3}"), "absolute+exact"]);
-        let mut state = self.state.lock().unwrap();
-        if matches!(*state, PlaybackState::Ended) {
-            *state = PlaybackState::Paused;
+        if matches!(self.state(), PlaybackState::Ended) {
+            self.set_state(PlaybackState::Paused);
         }
     }
 
@@ -498,7 +472,14 @@ impl Core {
                 break;
             }
             match id {
-                mpv::EVENT_FILE_LOADED => self.set_state(PlaybackState::Ready),
+                mpv::EVENT_FILE_LOADED => {
+                    let paused = self.get_flag("pause").unwrap_or(false);
+                    self.set_state(if paused {
+                        PlaybackState::Paused
+                    } else {
+                        PlaybackState::Playing
+                    });
+                }
                 mpv::EVENT_END_FILE => {
                     let data = unsafe { (*event).data };
                     if data.is_null() {
@@ -956,6 +937,32 @@ mod tests {
     }
 
     #[test]
+    fn the_stored_playback_state_agrees_across_reads_and_toggles() {
+        let mut engine = MpvEngine::new(true).unwrap();
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_frame(&engine);
+        let first = engine.state();
+        let second = engine.state();
+        assert_eq!(first, second, "two reads of the playback state must agree");
+        assert!(
+            matches!(first, PlaybackState::Playing | PlaybackState::Paused),
+            "{first:?}"
+        );
+        engine.toggle();
+        assert_eq!(
+            engine.state(),
+            PlaybackState::Paused,
+            "a pause toggle stores Paused"
+        );
+        engine.toggle();
+        assert_eq!(
+            engine.state(),
+            PlaybackState::Playing,
+            "a play toggle stores Playing"
+        );
+    }
+
+    #[test]
     fn the_engine_reports_the_frame_duration() {
         let mut engine = MpvEngine::new(true).unwrap();
         engine.open(&fixture("tracks.mkv")).unwrap();
@@ -981,8 +988,6 @@ mod tests {
         // Pause so the next frame is the seek's, and let an in-flight frame land.
         engine.toggle();
         thread::sleep(Duration::from_millis(100));
-        // Consume the one-shot Ready so the comparison measures a real transition.
-        let _ = engine.state();
         let state_before = engine.state();
         let frames = engine.frames();
         let wakes_before = wakes.load(Ordering::Relaxed);
