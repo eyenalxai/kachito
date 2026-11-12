@@ -1,6 +1,6 @@
 //! The Kachito screen: one file, one video surface, one transport bar.
 
-use crate::engine::{MpvEngine, PlayerEngine, VIDEO_HEIGHT, VIDEO_WIDTH};
+use crate::engine::{MpvEngine, PlayerEngine, Track, TrackKind, VIDEO_HEIGHT, VIDEO_WIDTH};
 use rune::tok::{self, type_};
 use rune::{AppSpec, Cx, Drag, El, FileDialogOptions, SurfaceFit, Tx, Waker, col, el, row, text};
 use std::path::PathBuf;
@@ -16,6 +16,7 @@ struct App {
     volume: f32,
     speed: f32,
     last_dir: Option<PathBuf>,
+    tracks: Vec<Track>,
 }
 
 impl App {
@@ -27,6 +28,7 @@ impl App {
             volume: 1.0,
             speed: 1.0,
             last_dir: None,
+            tracks: Vec::new(),
         };
         match MpvEngine::new(rune::is_headless()) {
             Ok(engine) => app.engine = Some(Box::new(engine)),
@@ -72,6 +74,7 @@ impl App {
                 self.last_dir = path.parent().map(|parent| parent.to_path_buf());
                 self.path = Some(path);
                 self.error = None;
+                self.tracks.clear();
             }
             Err(error) => self.error = Some(error),
         }
@@ -115,6 +118,30 @@ impl App {
         }
     }
 
+    fn refresh_tracks(&mut self) {
+        if let Some(engine) = self.engine.as_ref() {
+            self.tracks = engine.tracks();
+        }
+    }
+
+    fn select_audio(&mut self, id: i64) {
+        if let Some(engine) = self.engine.as_mut() {
+            match engine.select_audio(id) {
+                Ok(()) => self.refresh_tracks(),
+                Err(error) => self.error = Some(error),
+            }
+        }
+    }
+
+    fn select_subtitle(&mut self, id: Option<i64>) {
+        if let Some(engine) = self.engine.as_mut() {
+            match engine.select_subtitle(id) {
+                Ok(()) => self.refresh_tracks(),
+                Err(error) => self.error = Some(error),
+            }
+        }
+    }
+
     fn error_text(&self) -> Option<String> {
         self.error
             .clone()
@@ -134,16 +161,21 @@ fn setup(app: &mut App, waker: Waker) {
 }
 
 fn poll(app: &mut App, _: f64, tx: &mut Tx) -> bool {
-    if app
-        .engine
-        .as_ref()
-        .is_some_and(|engine| engine.is_playing())
-    {
-        tx.wake_after(Duration::from_millis(100));
-        true
-    } else {
-        false
+    let mut changed = false;
+    if let Some(engine) = app.engine.as_ref() {
+        if app.tracks.is_empty() && app.path.is_some() {
+            let tracks = engine.tracks();
+            if !tracks.is_empty() {
+                app.tracks = tracks;
+                changed = true;
+            }
+        }
+        if engine.is_playing() {
+            tx.wake_after(Duration::from_millis(100));
+            changed = true;
+        }
     }
+    changed
 }
 
 fn open_dialog(app: &mut App, tx: &mut Tx) {
@@ -178,6 +210,70 @@ fn button(label: impl Into<String>, accent: bool, theme: &tok::Theme) -> El {
 
 fn open_button(theme: &tok::Theme) -> El {
     button("Open", false, theme).on_press_tx(|app: &mut App, tx: &mut Tx| open_dialog(app, tx))
+}
+
+fn track_bar(app: &App, theme: &tok::Theme) -> El {
+    let audio: Vec<&Track> = app
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect();
+    let subtitles: Vec<&Track> = app
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Subtitle)
+        .collect();
+    let any_subtitle = subtitles.iter().any(|track| track.selected);
+
+    let mut bar = row()
+        .w_full()
+        .padding(8.0)
+        .gap(6.0)
+        .center_y()
+        .fill(theme.bg)
+        .child(text("Audio").font(type_::LABEL).color(theme.text_secondary));
+    if audio.is_empty() {
+        bar = bar.child(
+            text("No audio tracks")
+                .font(type_::LABEL)
+                .color(theme.text_secondary),
+        );
+    }
+    for track in audio {
+        let id = track.id;
+        let label = track.label();
+        let selected = track.selected;
+        bar = bar.child(
+            button(label, selected, theme)
+                .key(format!("audio-{id}"))
+                .on_press(move |app: &mut App| app.select_audio(id)),
+        );
+    }
+    bar = bar
+        .child(text("Subs").font(type_::LABEL).color(theme.text_secondary))
+        .child(
+            button("Off", !any_subtitle, theme)
+                .key("subs-off")
+                .on_press(|app: &mut App| app.select_subtitle(None)),
+        );
+    if subtitles.is_empty() {
+        bar = bar.child(
+            text("No subtitles")
+                .font(type_::LABEL)
+                .color(theme.text_secondary),
+        );
+    }
+    for track in subtitles {
+        let id = track.id;
+        let label = track.label();
+        let selected = track.selected;
+        bar = bar.child(
+            button(label, selected, theme)
+                .key(format!("sub-{id}"))
+                .on_press(move |app: &mut App| app.select_subtitle(Some(id))),
+        );
+    }
+    bar
 }
 
 fn view(app: &App, cx: &mut Cx<App>) -> El {
@@ -276,6 +372,7 @@ fn view(app: &App, cx: &mut Cx<App>) -> El {
             .h_full()
             .fill(theme.bg)
             .child(top)
+            .child(track_bar(app, &theme))
             .child(
                 el().key("video")
                     .w(VIDEO_WIDTH as f32)
@@ -317,15 +414,12 @@ fn view(app: &App, cx: &mut Cx<App>) -> El {
 }
 
 fn format_time(position: f64, duration: f64) -> String {
-    let position = position.max(0.0).round() as u64;
-    let duration = duration.max(0.0).round() as u64;
-    format!(
-        "{}:{:02} / {}:{:02}",
-        position / 60,
-        position % 60,
-        duration / 60,
-        duration % 60
-    )
+    format!("{} / {}", format_clock(position), format_clock(duration))
+}
+
+fn format_clock(seconds: f64) -> String {
+    let seconds = seconds.max(0.0).round() as u64;
+    format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 pub fn run() {
@@ -334,7 +428,7 @@ pub fn run() {
         poll: Some(poll),
         ..AppSpec::new(
             "Kachito",
-            (VIDEO_WIDTH as f32, VIDEO_HEIGHT as f32 + 104.0),
+            (VIDEO_WIDTH as f32, VIDEO_HEIGHT as f32 + 152.0),
             state,
             view,
         )
@@ -354,6 +448,8 @@ mod tests {
         volume: Option<f32>,
         speed: Option<f32>,
         opened: Option<PathBuf>,
+        audio: Option<i64>,
+        subtitle: Option<i64>,
     }
 
     struct Fake {
@@ -403,12 +499,46 @@ mod tests {
         fn frames(&self) -> u64 {
             0
         }
+        fn tracks(&self) -> Vec<Track> {
+            let log = self.log.lock().unwrap();
+            vec![
+                Track {
+                    id: 1,
+                    kind: TrackKind::Audio,
+                    title: Some("Main".into()),
+                    language: Some("eng".into()),
+                    selected: log.audio.unwrap_or(1) == 1,
+                },
+                Track {
+                    id: 2,
+                    kind: TrackKind::Audio,
+                    title: Some("Commentary".into()),
+                    language: Some("eng".into()),
+                    selected: log.audio == Some(2),
+                },
+                Track {
+                    id: 10,
+                    kind: TrackKind::Subtitle,
+                    title: Some("English".into()),
+                    language: Some("eng".into()),
+                    selected: log.subtitle == Some(10),
+                },
+            ]
+        }
+        fn select_audio(&mut self, id: i64) -> Result<(), String> {
+            self.log.lock().unwrap().audio = Some(id);
+            Ok(())
+        }
+        fn select_subtitle(&mut self, id: Option<i64>) -> Result<(), String> {
+            self.log.lock().unwrap().subtitle = id;
+            Ok(())
+        }
         fn set_waker(&self, _: Waker) {}
     }
 
     fn app_with_fake() -> (App, Arc<Mutex<FakeLog>>) {
         let log = Arc::new(Mutex::new(FakeLog::default()));
-        let app = App {
+        let mut app = App {
             engine: Some(Box::new(Fake {
                 surface: rune::NativeSurface::new(),
                 log: log.clone(),
@@ -418,12 +548,14 @@ mod tests {
             volume: 1.0,
             speed: 1.0,
             last_dir: None,
+            tracks: Vec::new(),
         };
+        app.refresh_tracks();
         (app, log)
     }
 
     fn window() -> (f32, f32) {
-        (VIDEO_WIDTH as f32, VIDEO_HEIGHT as f32 + 104.0)
+        (VIDEO_WIDTH as f32, VIDEO_HEIGHT as f32 + 152.0)
     }
 
     #[test]
@@ -481,5 +613,30 @@ mod tests {
         app.open(PathBuf::from("https://example.test/movie.mp4"));
         assert!(app.error.is_some());
         assert_eq!(log.lock().unwrap().opened, None);
+    }
+
+    #[test]
+    fn audio_and_subtitle_buttons_pick_tracks() {
+        let (app, log) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.frame(0.0);
+
+        let (x, y) = runtime.find("audio-2").expect("the commentary track");
+        runtime.pointer_down(x, y);
+        runtime.pointer_up(x, y);
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(log.lock().unwrap().audio, Some(2));
+
+        let (x, y) = runtime.find("sub-10").expect("the subtitle track");
+        runtime.pointer_down(x, y);
+        runtime.pointer_up(x, y);
+        runtime.frame(2.0 / 60.0);
+        assert_eq!(log.lock().unwrap().subtitle, Some(10));
+
+        let (x, y) = runtime.find("subs-off").expect("the off button");
+        runtime.pointer_down(x, y);
+        runtime.pointer_up(x, y);
+        runtime.frame(3.0 / 60.0);
+        assert_eq!(log.lock().unwrap().subtitle, None);
     }
 }
