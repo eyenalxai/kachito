@@ -1,11 +1,13 @@
 //! Clip export through the system ffmpeg.
 
+use std::fmt;
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportMode {
@@ -29,22 +31,98 @@ impl ExportMode {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExportError {
+    InvalidRange,
+    InvalidPath,
+    SameFile,
+    NonUtf8Path,
+    AudioTrackOutOfRange,
+    Spawn(String),
+}
+
+impl fmt::Display for ExportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRange => {
+                f.write_str("Choose a start and end time with the end after the start.")
+            }
+            Self::InvalidPath => {
+                f.write_str("Choose a source video and an output file with valid paths.")
+            }
+            Self::SameFile => f.write_str("Choose an output file other than the source video."),
+            Self::NonUtf8Path => f.write_str("The file path must be valid UTF-8."),
+            Self::AudioTrackOutOfRange => {
+                f.write_str("The selected audio track is no longer available.")
+            }
+            Self::Spawn(error) => write!(f, "Could not start the export worker: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ExportError {}
+
 #[derive(Clone, Debug)]
 pub struct ExportRequest {
-    pub source: PathBuf,
-    pub start: f64,
-    pub end: f64,
-    pub audio_index: Option<usize>,
-    pub mode: ExportMode,
-    pub output: PathBuf,
+    source: PathBuf,
+    start: f64,
+    end: f64,
+    audio_index: Option<usize>,
+    mode: ExportMode,
+    output: PathBuf,
 }
 
 impl ExportRequest {
-    pub fn duration(&self) -> f64 {
-        (self.end - self.start).max(0.0)
+    pub fn new(
+        source: PathBuf,
+        start: f64,
+        end: f64,
+        audio_index: Option<usize>,
+        audio_count: usize,
+        mode: ExportMode,
+        output: PathBuf,
+    ) -> Result<Self, ExportError> {
+        if source.as_os_str().is_empty() || output.as_os_str().is_empty() {
+            return Err(ExportError::InvalidPath);
+        }
+        if source.file_name().is_none() || output.file_name().is_none() {
+            return Err(ExportError::InvalidPath);
+        }
+        let Some(source_text) = source.to_str() else {
+            return Err(ExportError::NonUtf8Path);
+        };
+        let Some(output_text) = output.to_str() else {
+            return Err(ExportError::NonUtf8Path);
+        };
+        if source_text.contains('\0') || output_text.contains('\0') {
+            return Err(ExportError::InvalidPath);
+        }
+        if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
+            return Err(ExportError::InvalidRange);
+        }
+        if same_file(&source, &output)? {
+            return Err(ExportError::SameFile);
+        }
+        if let Some(index) = audio_index
+            && index >= audio_count
+        {
+            return Err(ExportError::AudioTrackOutOfRange);
+        }
+        Ok(Self {
+            source,
+            start,
+            end,
+            audio_index,
+            mode,
+            output,
+        })
     }
 
-    pub fn command(&self) -> Vec<String> {
+    pub fn duration(&self) -> f64 {
+        self.end - self.start
+    }
+
+    fn command_to(&self, output: &Path) -> Vec<String> {
         let mut args = vec![
             "-hide_banner".into(),
             "-loglevel".into(),
@@ -53,7 +131,7 @@ impl ExportRequest {
             "-progress".into(),
             "pipe:1".into(),
             "-ss".into(),
-            format!("{:.3}", self.start.max(0.0)),
+            format!("{:.3}", self.start),
             "-t".into(),
             format!("{:.3}", self.duration()),
             "-i".into(),
@@ -79,60 +157,65 @@ impl ExportRequest {
             }
         }
         args.push("-y".into());
-        args.push(self.output.display().to_string());
+        args.push(output.display().to_string());
         args
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct ExportProgress {
-    pub running: bool,
-    pub fraction: f32,
-    pub error: Option<String>,
-    pub finished: bool,
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExportState {
+    Running { fraction: f32 },
+    Finished,
+    Cancelled,
+    Failed(String),
 }
 
 pub struct ExportJob {
-    progress: Arc<Mutex<ExportProgress>>,
+    state: Arc<Mutex<ExportState>>,
     cancel: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl ExportJob {
-    pub fn start(request: ExportRequest) -> Self {
-        let progress = Arc::new(Mutex::new(ExportProgress {
-            running: true,
-            ..Default::default()
-        }));
+    pub fn start(request: ExportRequest) -> Result<Self, ExportError> {
+        let state = Arc::new(Mutex::new(ExportState::Running { fraction: 0.0 }));
         let cancel = Arc::new(AtomicBool::new(false));
         let child = Arc::new(Mutex::new(None));
         let thread = {
-            let progress = progress.clone();
+            let state = state.clone();
             let cancel = cancel.clone();
             let child = child.clone();
             thread::Builder::new()
                 .name("kachito-export".into())
-                .spawn(move || run(request, progress, cancel, child))
-                .ok()
+                .spawn(move || run(request, state, cancel, child))
+                .map_err(|error| ExportError::Spawn(error.to_string()))?
         };
-        Self {
-            progress,
+        Ok(Self {
+            state,
             cancel,
             child,
-            thread,
+            thread: Some(thread),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_state(state: ExportState) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(state)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            child: Arc::new(Mutex::new(None)),
+            thread: None,
         }
     }
 
-    pub fn progress(&self) -> ExportProgress {
-        self.progress.lock().unwrap().clone()
+    pub fn state(&self) -> ExportState {
+        self.state.lock().unwrap().clone()
     }
 
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
-        if let Some(child) = self.child.lock().unwrap().as_mut() {
-            let _ = child.kill();
-        }
+        kill_child(&self.child);
     }
 }
 
@@ -147,33 +230,37 @@ impl Drop for ExportJob {
 
 fn run(
     request: ExportRequest,
-    progress: Arc<Mutex<ExportProgress>>,
+    state: Arc<Mutex<ExportState>>,
     cancel: Arc<AtomicBool>,
     child_slot: Arc<Mutex<Option<Child>>>,
 ) {
     let duration = request.duration();
+    let temp = temp_output(&request.output);
     let mut command = Command::new("ffmpeg");
     command
-        .args(request.command())
+        .args(request.command_to(&temp))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            finish(
-                &progress,
-                Some(format!("could not start ffmpeg: {error}")),
-                false,
+            remove_file(&temp);
+            set_state(
+                &state,
+                ExportState::Failed(format!("Could not start ffmpeg: {error}")),
             );
             return;
         }
     };
     let stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
+    let stderr = child.stderr.take();
     *child_slot.lock().unwrap() = Some(child);
+    if cancel.load(Ordering::Relaxed) {
+        kill_child(&child_slot);
+    }
 
     let errors = Arc::new(Mutex::new(String::new()));
-    let stderr_thread = stderr.take().map(|mut stderr| {
+    let stderr_thread = stderr.map(|mut stderr| {
         let errors = errors.clone();
         thread::spawn(move || {
             let mut text = String::new();
@@ -191,56 +278,117 @@ fn run(
                 && let Ok(micros) = value.parse::<f64>()
                 && duration > 0.0
             {
-                let fraction = (micros / 1_000_000.0 / duration).clamp(0.0, 1.0) as f32;
-                progress.lock().unwrap().fraction = fraction;
+                let next = (micros / 1_000_000.0 / duration).clamp(0.0, 1.0) as f32;
+                if let ExportState::Running { fraction } = &mut *state.lock().unwrap() {
+                    *fraction = next;
+                }
             }
         }
     }
 
-    let status = child_slot
-        .lock()
-        .unwrap()
-        .as_mut()
-        .and_then(|child| child.wait().ok());
+    let status = loop {
+        let mut slot = child_slot.lock().unwrap();
+        let Some(child) = slot.as_mut() else {
+            break Err("The export process was not available.".to_string());
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => break Err(format!("Could not wait for ffmpeg: {error}")),
+        }
+        drop(slot);
+        if cancel.load(Ordering::Relaxed) {
+            kill_child(&child_slot);
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
     if let Some(thread) = stderr_thread {
         let _ = thread.join();
     }
-    let cancelled = cancel.load(Ordering::Relaxed);
-    if cancelled {
-        let _ = std::fs::remove_file(&request.output);
-        finish(&progress, None, false);
+    if cancel.load(Ordering::Relaxed) {
+        remove_file(&temp);
+        set_state(&state, ExportState::Cancelled);
         return;
     }
     let errors = errors.lock().unwrap().trim().to_string();
     match status {
-        Some(status) if status.success() => finish(&progress, None, true),
-        Some(status) => finish(
-            &progress,
-            Some(if errors.is_empty() {
-                format!("ffmpeg exited with {status}")
-            } else {
-                errors
-            }),
-            false,
-        ),
-        None => finish(&progress, Some("ffmpeg did not finish".into()), false),
+        Ok(status) if status.success() => match std::fs::rename(&temp, &request.output) {
+            Ok(()) => set_state(&state, ExportState::Finished),
+            Err(error) => {
+                remove_file(&temp);
+                set_state(
+                    &state,
+                    ExportState::Failed(format!("Could not move the export into place: {error}")),
+                );
+            }
+        },
+        Ok(status) => {
+            remove_file(&temp);
+            set_state(
+                &state,
+                ExportState::Failed(if errors.is_empty() {
+                    format!("ffmpeg exited with {status}")
+                } else {
+                    errors
+                }),
+            );
+        }
+        Err(error) => {
+            remove_file(&temp);
+            set_state(&state, ExportState::Failed(error));
+        }
     }
 }
 
-fn finish(progress: &Arc<Mutex<ExportProgress>>, error: Option<String>, finished: bool) {
-    let mut progress = progress.lock().unwrap();
-    progress.running = false;
-    progress.finished = finished;
-    progress.error = error;
-    if finished {
-        progress.fraction = 1.0;
+fn set_state(state: &Arc<Mutex<ExportState>>, next: ExportState) {
+    *state.lock().unwrap() = next;
+}
+
+fn kill_child(slot: &Arc<Mutex<Option<Child>>>) {
+    if let Some(child) = slot.lock().unwrap().as_mut() {
+        let _ = child.kill();
+    }
+}
+
+fn temp_output(output: &Path) -> PathBuf {
+    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let mut name = std::ffi::OsString::from(".");
+    if let Some(file_name) = output.file_name() {
+        name.push(file_name);
+    }
+    let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    name.push(format!(".{}.{id}.part", std::process::id()));
+    if let Some(extension) = output.extension() {
+        name.push(".");
+        name.push(extension);
+    }
+    output.with_file_name(name)
+}
+
+fn remove_file(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+fn same_file(a: &Path, b: &Path) -> Result<bool, ExportError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return Ok(a.dev() == b.dev() && a.ino() == b.ino());
+        }
+    }
+    if let (Ok(a), Ok(b)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        return Ok(a == b);
+    }
+    match (std::path::absolute(a), std::path::absolute(b)) {
+        (Ok(a), Ok(b)) => Ok(a == b),
+        _ => Err(ExportError::InvalidPath),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use std::time::{Duration, Instant};
 
     fn fixture(name: &str) -> PathBuf {
@@ -249,17 +397,30 @@ mod tests {
             .join(name)
     }
 
+    fn wait_for_terminal(job: &ExportJob, timeout: Duration) -> ExportState {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let state = job.state();
+            if !matches!(&state, ExportState::Running { .. }) || Instant::now() >= deadline {
+                return state;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn precise_command_keeps_video_and_audio_and_drops_subtitles() {
-        let request = ExportRequest {
-            source: PathBuf::from("in.mkv"),
-            start: 2.0,
-            end: 5.0,
-            audio_index: Some(1),
-            mode: ExportMode::Precise,
-            output: PathBuf::from("out.mkv"),
-        };
-        let command = request.command();
+        let request = ExportRequest::new(
+            PathBuf::from("in.mkv"),
+            2.0,
+            5.0,
+            Some(1),
+            2,
+            ExportMode::Precise,
+            PathBuf::from("out.mkv"),
+        )
+        .unwrap();
+        let command = request.command_to(Path::new("out.mkv"));
         assert!(command.contains(&"-ss".into()));
         assert!(command.contains(&"2.000".into()));
         assert!(command.contains(&"3.000".into()));
@@ -272,41 +433,152 @@ mod tests {
 
     #[test]
     fn fast_command_copies_packets() {
-        let request = ExportRequest {
-            source: PathBuf::from("in.mkv"),
-            start: 0.0,
-            end: 2.0,
-            audio_index: None,
-            mode: ExportMode::Fast,
-            output: PathBuf::from("out.mkv"),
-        };
-        let command = request.command();
+        let request = ExportRequest::new(
+            PathBuf::from("in.mkv"),
+            0.0,
+            2.0,
+            None,
+            0,
+            ExportMode::Fast,
+            PathBuf::from("out.mkv"),
+        )
+        .unwrap();
+        let command = request.command_to(Path::new("out.mkv"));
         assert!(command.contains(&"copy".into()));
         assert!(!command.contains(&"libx264".into()));
         assert!(!command.contains(&"0:a:0".into()));
     }
 
     #[test]
-    fn a_precise_export_writes_video_and_audio_without_subtitles() {
-        let output =
-            std::env::temp_dir().join(format!("kachito-export-test-{}.mkv", std::process::id()));
-        let _ = std::fs::remove_file(&output);
-        let job = ExportJob::start(ExportRequest {
-            source: fixture("tracks.mkv"),
-            start: 0.0,
-            end: 0.8,
-            audio_index: Some(0),
-            mode: ExportMode::Precise,
-            output: output.clone(),
-        });
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while job.progress().running && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(50));
+    fn rejects_inverted_range() {
+        let result = ExportRequest::new(
+            PathBuf::from("in.mkv"),
+            2.0,
+            2.0,
+            None,
+            0,
+            ExportMode::Fast,
+            PathBuf::from("out.mkv"),
+        );
+        assert_eq!(result.unwrap_err(), ExportError::InvalidRange);
+    }
+
+    #[test]
+    fn rejects_non_finite_range() {
+        for (start, end) in [(f64::NAN, 2.0), (0.0, f64::INFINITY)] {
+            let result = ExportRequest::new(
+                PathBuf::from("in.mkv"),
+                start,
+                end,
+                None,
+                0,
+                ExportMode::Fast,
+                PathBuf::from("out.mkv"),
+            );
+            assert_eq!(result.unwrap_err(), ExportError::InvalidRange);
         }
-        let progress = job.progress();
-        assert!(!progress.running, "the export did not finish");
-        assert_eq!(progress.error, None);
-        assert!(Path::new(&output).exists());
+    }
+
+    #[test]
+    fn rejects_the_source_as_output() {
+        let result = ExportRequest::new(
+            PathBuf::from("clip.mkv"),
+            0.0,
+            2.0,
+            None,
+            0,
+            ExportMode::Fast,
+            PathBuf::from("clip.mkv"),
+        );
+        assert_eq!(result.unwrap_err(), ExportError::SameFile);
+    }
+
+    #[test]
+    fn rejects_an_audio_index_outside_the_track_list() {
+        let result = ExportRequest::new(
+            PathBuf::from("in.mkv"),
+            0.0,
+            2.0,
+            Some(1),
+            1,
+            ExportMode::Fast,
+            PathBuf::from("out.mkv"),
+        );
+        assert_eq!(result.unwrap_err(), ExportError::AudioTrackOutOfRange);
+    }
+
+    #[test]
+    fn rejects_empty_paths() {
+        let result = ExportRequest::new(
+            PathBuf::new(),
+            0.0,
+            2.0,
+            None,
+            0,
+            ExportMode::Fast,
+            PathBuf::from("out.mkv"),
+        );
+        assert_eq!(result.unwrap_err(), ExportError::InvalidPath);
+    }
+
+    #[test]
+    fn rejects_paths_with_a_nul_byte() {
+        let result = ExportRequest::new(
+            PathBuf::from("in\0.mkv"),
+            0.0,
+            2.0,
+            None,
+            0,
+            ExportMode::Fast,
+            PathBuf::from("out.mkv"),
+        );
+        assert_eq!(result.unwrap_err(), ExportError::InvalidPath);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let source = PathBuf::from(OsString::from_vec(vec![0xff]));
+        let result = ExportRequest::new(
+            source,
+            0.0,
+            2.0,
+            None,
+            0,
+            ExportMode::Fast,
+            PathBuf::from("out.mkv"),
+        );
+        assert_eq!(result.unwrap_err(), ExportError::NonUtf8Path);
+    }
+
+    #[test]
+    fn a_precise_export_writes_video_and_audio_without_subtitles() {
+        let dir =
+            std::env::temp_dir().join(format!("kachito-export-success-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("out.mkv");
+        let request = ExportRequest::new(
+            fixture("tracks.mkv"),
+            0.0,
+            0.8,
+            Some(0),
+            1,
+            ExportMode::Precise,
+            output.clone(),
+        )
+        .expect("a valid request");
+        let job = ExportJob::start(request).expect("start the export");
+        let state = wait_for_terminal(&job, Duration::from_secs(30));
+        assert_eq!(state, ExportState::Finished);
+        assert!(output.exists());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "a successful export leaves only the final file"
+        );
 
         let probe = Command::new("ffprobe")
             .args([
@@ -324,6 +596,60 @@ mod tests {
         assert!(streams.contains("video"), "{streams}");
         assert!(streams.contains("audio"), "{streams}");
         assert!(!streams.contains("subtitle"), "{streams}");
-        let _ = std::fs::remove_file(&output);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_export_leaves_no_output() {
+        let dir =
+            std::env::temp_dir().join(format!("kachito-export-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("not-video.mkv");
+        std::fs::write(&source, b"not a video").unwrap();
+        let output = dir.join("out.mkv");
+        let request =
+            ExportRequest::new(source, 0.0, 1.0, None, 0, ExportMode::Fast, output.clone())
+                .expect("a valid request");
+        let job = ExportJob::start(request).expect("start the export");
+        let state = wait_for_terminal(&job, Duration::from_secs(10));
+        assert!(matches!(state, ExportState::Failed(_)), "{state:?}");
+        assert!(!output.exists());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "a failed export leaves only the source file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cancelled_export_leaves_no_output() {
+        let dir =
+            std::env::temp_dir().join(format!("kachito-export-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("out.mkv");
+        let request = ExportRequest::new(
+            fixture("tracks.mkv"),
+            0.0,
+            2.0,
+            Some(0),
+            1,
+            ExportMode::Precise,
+            output.clone(),
+        )
+        .expect("a valid request");
+        let job = ExportJob::start(request).expect("start the export");
+        job.cancel();
+        let state = wait_for_terminal(&job, Duration::from_secs(10));
+        assert_eq!(state, ExportState::Cancelled);
+        assert!(!output.exists());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "a cancelled export leaves no file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
