@@ -56,6 +56,10 @@ impl PlaybackState {
     pub fn is_loaded(&self) -> bool {
         matches!(self, Self::Playing | Self::Paused | Self::Ended)
     }
+
+    fn from_paused(paused: bool) -> Self {
+        if paused { Self::Paused } else { Self::Playing }
+    }
 }
 
 /// What the UI needs from a playback backend.
@@ -291,24 +295,23 @@ impl Core {
         self.state.lock().unwrap().clone()
     }
 
-    fn set_paused(&self, paused: bool) {
-        if !paused && matches!(*self.state.lock().unwrap(), PlaybackState::Ended) {
-            self.seek(0.0);
-        }
-        let _ = self.set_flag("pause", paused);
-        self.set_state(if paused {
-            PlaybackState::Paused
-        } else {
-            PlaybackState::Playing
-        });
-    }
-
     fn toggle(&self) {
-        match self.state() {
-            PlaybackState::Playing => self.set_paused(true),
-            PlaybackState::Paused | PlaybackState::Ended => self.set_paused(false),
-            _ => {}
+        let mut state = self.state.lock().unwrap();
+        let (paused, replay) = match *state {
+            PlaybackState::Playing => (true, false),
+            PlaybackState::Paused => (false, false),
+            PlaybackState::Ended => (false, true),
+            PlaybackState::Empty | PlaybackState::Loading | PlaybackState::Failed(_) => return,
+        };
+        if replay && self.command(&["seek", "0.000", "absolute+exact"]).is_err() {
+            return;
         }
+        if self.set_flag("pause", paused).is_err() {
+            return;
+        }
+        *state = PlaybackState::from_paused(paused);
+        drop(state);
+        self.wake();
     }
 
     fn seek(&self, seconds: f64) {
@@ -316,9 +319,17 @@ impl Core {
             return;
         }
         let seconds = seconds.max(0.0);
-        let _ = self.command(&["seek", &format!("{seconds:.3}"), "absolute+exact"]);
-        if matches!(self.state(), PlaybackState::Ended) {
-            self.set_state(PlaybackState::Paused);
+        if self
+            .command(&["seek", &format!("{seconds:.3}"), "absolute+exact"])
+            .is_err()
+        {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        if matches!(*state, PlaybackState::Ended) {
+            *state = PlaybackState::Paused;
+            drop(state);
+            self.wake();
         }
     }
 
@@ -473,12 +484,8 @@ impl Core {
             }
             match id {
                 mpv::EVENT_FILE_LOADED => {
-                    let paused = self.get_flag("pause").unwrap_or(false);
-                    self.set_state(if paused {
-                        PlaybackState::Paused
-                    } else {
-                        PlaybackState::Playing
-                    });
+                    let paused = self.get_flag("pause").unwrap_or(true);
+                    self.set_state(PlaybackState::from_paused(paused));
                 }
                 mpv::EVENT_END_FILE => {
                     let data = unsafe { (*event).data };
@@ -944,10 +951,7 @@ mod tests {
         let first = engine.state();
         let second = engine.state();
         assert_eq!(first, second, "two reads of the playback state must agree");
-        assert!(
-            matches!(first, PlaybackState::Playing | PlaybackState::Paused),
-            "{first:?}"
-        );
+        assert_eq!(first, PlaybackState::Playing, "the fixture loads playing");
         engine.toggle();
         assert_eq!(
             engine.state(),
