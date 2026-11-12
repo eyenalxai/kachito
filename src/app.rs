@@ -1,7 +1,7 @@
 //! The Kachito screen: one file, one video surface, one transport bar.
 
 use crate::engine::{MpvEngine, PlayerEngine, Track, TrackKind, VIDEO_HEIGHT, VIDEO_WIDTH};
-use crate::export::{ExportJob, ExportMode, ExportRequest};
+use crate::export::{ExportJob, ExportMode, ExportRequest, ExportState};
 use crate::timeline::Timeline;
 use rune::tok::{self, type_};
 use rune::{
@@ -188,15 +188,32 @@ impl App {
             Some(path) => path.clone(),
             None => return,
         };
-        self.export = Some(ExportJob::start(ExportRequest {
+        let audio_count = self
+            .tracks
+            .iter()
+            .filter(|track| track.kind == TrackKind::Audio)
+            .count();
+        self.export = None;
+        self.export_error = None;
+        let request = match ExportRequest::new(
             source,
             start,
             end,
             audio_index,
-            mode: self.export_mode,
+            audio_count,
+            self.export_mode,
             output,
-        }));
-        self.export_error = None;
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                self.export_error = Some(error.to_string());
+                return;
+            }
+        };
+        match ExportJob::start(request) {
+            Ok(job) => self.export = Some(job),
+            Err(error) => self.export_error = Some(error.to_string()),
+        }
     }
 
     fn error_text(&self) -> Option<String> {
@@ -240,15 +257,10 @@ fn poll(app: &mut App, _: f64, tx: &mut Tx) -> bool {
             }
         }
         if let Some(job) = &app.export {
-            let progress = job.progress();
-            if progress.running {
+            if matches!(job.state(), ExportState::Running { .. }) {
                 tx.wake_after(Duration::from_millis(100));
-                changed = true;
             }
-            if progress.error != app.export_error {
-                app.export_error = progress.error.clone();
-                changed = true;
-            }
+            changed = true;
         }
         if engine.is_playing() {
             tx.wake_after(Duration::from_millis(100));
@@ -456,44 +468,58 @@ fn timeline_bar(app: &App, theme: &tok::Theme) -> El {
         .child(button("-", false, theme).on_press(|app: &mut App| app.timeline.zoom_out()))
         .child(button("+", false, theme).on_press(|app: &mut App| app.timeline.zoom_in()));
 
-    if let Some(job) = &app.export {
-        let progress = job.progress();
-        if progress.running {
-            bar = bar
-                .child(
-                    text(format!("{}%", (progress.fraction * 100.0).round()))
+    let export_state = app.export.as_ref().map(ExportJob::state);
+    if let Some(state) = &export_state {
+        match state {
+            ExportState::Running { fraction } => {
+                bar = bar
+                    .child(
+                        text(format!("{}%", (*fraction * 100.0).round()))
+                            .key("export-status")
+                            .font(type_::LABEL)
+                            .color(theme.text_secondary),
+                    )
+                    .child(
+                        button("Cancel", false, theme)
+                            .key("cancel-export")
+                            .on_press(|app: &mut App| {
+                                if let Some(job) = &app.export {
+                                    job.cancel();
+                                }
+                            }),
+                    );
+            }
+            ExportState::Finished => {
+                bar = bar.child(
+                    text("Exported")
+                        .key("export-status")
                         .font(type_::LABEL)
                         .color(theme.text_secondary),
-                )
-                .child(
-                    button("Cancel", false, theme)
-                        .key("cancel-export")
-                        .on_press(|app: &mut App| {
-                            if let Some(job) = &app.export {
-                                job.cancel();
-                            }
-                        }),
                 );
-        } else if progress.finished {
-            bar = bar.child(
-                text("Exported")
-                    .font(type_::LABEL)
-                    .color(theme.text_secondary),
-            );
-        } else if let Some(error) = &progress.error {
-            bar = bar.child(
-                text(error.clone())
-                    .font(type_::LABEL)
-                    .color(tok::accent(2, true)),
-            );
+            }
+            ExportState::Cancelled => {
+                bar = bar.child(
+                    text("Cancelled")
+                        .key("export-status")
+                        .font(type_::LABEL)
+                        .color(theme.text_secondary),
+                );
+            }
+            ExportState::Failed(error) => {
+                bar = bar.child(
+                    text(error.clone())
+                        .key("export-status")
+                        .font(type_::LABEL)
+                        .color(tok::accent(2, true)),
+                );
+            }
         }
     }
 
-    if app
-        .export
+    let export_running = export_state
         .as_ref()
-        .is_none_or(|job| !job.progress().running)
-    {
+        .is_some_and(|state| matches!(state, ExportState::Running { .. }));
+    if !export_running {
         bar = bar
             .child(
                 button(app.export_mode.label(), false, theme)
@@ -877,5 +903,29 @@ mod tests {
         runtime.pointer_up(x, y);
         runtime.frame(3.0 / 60.0);
         assert_eq!(log.lock().unwrap().subtitle, None);
+    }
+
+    #[test]
+    fn the_export_bar_renders_each_export_state() {
+        let states = [
+            ExportState::Running { fraction: 0.5 },
+            ExportState::Finished,
+            ExportState::Cancelled,
+            ExportState::Failed("export failed".into()),
+        ];
+        for state in states {
+            let (mut app, _) = app_with_fake();
+            app.export = Some(ExportJob::with_state(state.clone()));
+            let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+            runtime.frame(0.0);
+            assert!(runtime.find("export-status").is_some(), "{state:?}");
+            if matches!(state, ExportState::Running { .. }) {
+                assert!(runtime.find("cancel-export").is_some(), "{state:?}");
+                assert!(runtime.find("export").is_none(), "{state:?}");
+            } else {
+                assert!(runtime.find("cancel-export").is_none(), "{state:?}");
+                assert!(runtime.find("export").is_some(), "{state:?}");
+            }
+        }
     }
 }
