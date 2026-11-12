@@ -24,7 +24,6 @@ enum Menu {
 struct App {
     session: Option<PlaybackSession>,
     notice: Option<String>,
-    last_playback: PlaybackState,
     volume: f32,
     last_volume: f32,
     speed: f32,
@@ -57,14 +56,9 @@ impl App {
     }
 
     fn with_session(session: Option<PlaybackSession>) -> Self {
-        let last_playback = session
-            .as_ref()
-            .map(PlaybackSession::state)
-            .unwrap_or(PlaybackState::Empty);
         Self {
             session,
             notice: None,
-            last_playback,
             volume: 1.0,
             last_volume: 1.0,
             speed: 1.0,
@@ -91,9 +85,6 @@ impl App {
             Ok(()) => {
                 self.last_dir = parent;
                 self.notice = None;
-                // An accepted open starts loading. Base the next failure on that, not on the
-                // previous file's state, so a same-message failure still writes a notice.
-                self.last_playback = PlaybackState::Loading;
                 self.menu = None;
                 self.touch();
             }
@@ -278,19 +269,6 @@ impl App {
         self.notice.as_deref()
     }
 
-    fn watch_playback(&mut self) -> bool {
-        let Some(session) = &self.session else {
-            return false;
-        };
-        let state = session.state();
-        let transitioned = self.last_playback != state;
-        if transitioned && let PlaybackState::Failed(error) = &state {
-            self.set_notice(error.clone());
-        }
-        self.last_playback = state;
-        transitioned
-    }
-
     fn export_state(&self) -> Option<ExportState> {
         self.session
             .as_ref()
@@ -355,7 +333,11 @@ fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
             changed = true;
         }
     }
-    changed |= app.watch_playback();
+    let failure = app.session.as_mut().and_then(PlaybackSession::take_failure);
+    if let Some(error) = failure {
+        app.set_notice(error);
+        changed = true;
+    }
     if app.activity {
         app.activity = false;
         app.last_activity = t;
@@ -1727,8 +1709,10 @@ mod tests {
         assert_eq!(session(&app).tracks(), &old_tracks);
         assert_eq!(session(&app).timeline(), &old_timeline);
         assert!(!session(&app).is_awaiting_source());
-        app.watch_playback();
-        assert_eq!(app.notice(), Some("corrupt"));
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        assert_eq!(runtime.state.notice(), Some("corrupt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1808,11 +1792,18 @@ mod tests {
         std::fs::write(&next, b"not a video").unwrap();
         let (mut app, log) = app_with_fake();
         app.open(PathBuf::from("notes.txt"));
-        assert!(app.notice().is_some());
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        assert!(shows_text(
+            &runtime,
+            "notes.txt is not a supported video file."
+        ));
 
-        log.lock().unwrap().state = PlaybackState::Loading;
-        app.open(next);
-        assert_eq!(app.notice(), None);
+        log.lock().unwrap().state = PlaybackState::Paused;
+        runtime.state.open(next);
+        runtime.frame(1.0 / 60.0);
+        assert!(runtime.find("error-banner").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1829,15 +1820,16 @@ mod tests {
         let dir = temp_dir("repeat-failure");
         let next = dir.join("next.mkv");
         std::fs::write(&next, b"not a video").unwrap();
-        let (mut app, log) = app_with_fake();
+        let (app, log) = app_with_fake();
         log.lock().unwrap().state = PlaybackState::Failed("the decoder gave up".into());
-        app.watch_playback();
-        assert_eq!(app.notice(), Some("the decoder gave up"));
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        assert!(shows_text(&runtime, "the decoder gave up"));
 
-        app.open(next);
-        assert_eq!(app.notice(), None);
-        app.watch_playback();
-        assert_eq!(app.notice(), Some("the decoder gave up"));
+        runtime.state.open(next);
+        runtime.frame(1.0 / 60.0);
+        assert!(shows_text(&runtime, "the decoder gave up"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

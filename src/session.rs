@@ -23,6 +23,8 @@ pub struct PlaybackSession {
     tracks: TracksState,
     timeline: Timeline,
     export: Option<ExportJob>,
+    failure: Option<String>,
+    last_state: PlaybackState,
 }
 
 impl PlaybackSession {
@@ -34,6 +36,8 @@ impl PlaybackSession {
             tracks: TracksState::Unloaded,
             timeline: Timeline::new(),
             export: None,
+            failure: None,
+            last_state: PlaybackState::Empty,
         }
     }
 
@@ -55,6 +59,8 @@ impl PlaybackSession {
         let awaiting = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
         self.engine.open(&path)?;
         self.awaiting_source = Some(awaiting);
+        self.failure = None;
+        self.last_state = PlaybackState::Loading;
         Ok(())
     }
 
@@ -158,7 +164,7 @@ impl PlaybackSession {
 
     pub fn start_export(&mut self, output: PathBuf, mode: ExportMode) -> Result<(), String> {
         let Some(source) = self.source.clone() else {
-            return Err("Open a video before exporting.".into());
+            return Ok(());
         };
         let start = self.timeline.in_point();
         let end = self.timeline.out_point();
@@ -193,6 +199,12 @@ impl PlaybackSession {
 
     pub fn poll(&mut self, tx: &mut Tx) -> bool {
         let state = self.engine.state();
+        if self.last_state != state
+            && let PlaybackState::Failed(error) = &state
+        {
+            self.failure = Some(error.clone());
+        }
+        self.last_state = state.clone();
         let mut changed = self.confirm_open(&state);
         let playback_ready = self.awaiting_source.is_none()
             && !matches!(&state, PlaybackState::Loading | PlaybackState::Failed(_));
@@ -223,6 +235,10 @@ impl PlaybackSession {
             changed = true;
         }
         changed
+    }
+
+    pub fn take_failure(&mut self) -> Option<String> {
+        self.failure.take()
     }
 
     pub(crate) fn confirm_open(&mut self, state: &PlaybackState) -> bool {
@@ -290,6 +306,7 @@ impl PlaybackSession {
         source: PathBuf,
         tracks: TracksState,
     ) -> Self {
+        let last_state = engine.state();
         Self {
             engine,
             source: Some(source),
@@ -297,6 +314,8 @@ impl PlaybackSession {
             tracks,
             timeline: Timeline::new(),
             export: None,
+            failure: None,
+            last_state,
         }
     }
 
