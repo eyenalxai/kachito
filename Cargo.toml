@@ -1,0 +1,10 @@
+[package]
+name = "kachito"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+rune = { git = "https://github.com/anomalyco/rune", rev = "f18ead891aba2437674cd8c54e238287cceb8b3a", features = ["native-file-dialog"] }
+
+[workspace]
