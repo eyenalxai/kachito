@@ -2,11 +2,18 @@
 
 ## Project
 
-Kachito is a Linux desktop video player built with Rune. The architecture is Rune for the UI, libmpv for playback, and ffmpeg for clip export. The approved spec is `.scratch/kachito/spec.md`; the mission record is `.scratch/kachito/map.md`.
+Kachito is a Linux desktop video player built with Rune. The architecture is Rune for the UI, libmpv for playback, and ffmpeg for clip export. The approved spec is KACH-1; the mission record is KACH-6.
 
-## Tracker
+## Agent skills
 
-Issues and specs are local markdown under `.scratch/kachito/`. One feature directory, a spec, and one ticket per file under `issues/`. Status lines use `open`, `claimed`, `ready-for-agent`, or `resolved`. The tracker conventions are in the `issue-tracker-local` skill.
+### Issue tracker
+Issues and specs live in Linear on the KACH team. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+The default role labels are used. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+Single-context: `GLOSSARY.md` and `docs/adr/`. See `docs/agents/domain.md`.
 
 ## Commands
 

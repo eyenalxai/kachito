@@ -27,8 +27,8 @@ cargo run -- /path/to/video.mkv
 
 ## Documents
 
-- Spec: `.scratch/kachito/spec.md`
-- Mission record: `.scratch/kachito/map.md`
+- Spec: [KACH-1](https://linear.app/utbetdix/issue/KACH-1/kachito-local-video-player-with-libmpv-and-rune)
+- Mission record: [KACH-6](https://linear.app/utbetdix/issue/KACH-6/kachito)
 - Research: `docs/research/video-player-feasibility.md`
 
 ## License
