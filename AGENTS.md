@@ -2,12 +2,12 @@
 
 ## Project
 
-Kachito is a Linux desktop video player built with Rune. The architecture is Rune for the UI, libmpv for playback, and ffmpeg for clip export. The approved spec is KACH-1; the mission record is KACH-6.
+Kachito is a Linux desktop video player built with Rune. The architecture is Rune for the UI, libmpv for playback, and ffmpeg for clip export. The approved spec is KACHITO-1; the mission record is KACHITO-6.
 
 ## Agent skills
 
 ### Issue tracker
-Issues and specs live in Linear on the KACH team. See `docs/agents/issue-tracker.md`.
+Issues and specs live in Linear on the KACHITO team. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 The default role labels are used. See `docs/agents/triage-labels.md`.

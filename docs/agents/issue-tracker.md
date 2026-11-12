@@ -1,6 +1,6 @@
 # Issue tracker: Linear
 
-Issues and specs for this repository live in Linear, on the `KACH` team. Use
+Issues and specs for this repository live in Linear, on the `KACHITO` team. Use
 the `rata` CLI for all operations.
 
 ## Conventions
