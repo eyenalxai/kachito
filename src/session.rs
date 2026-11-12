@@ -16,10 +16,61 @@ pub enum TracksState {
     Failed(String),
 }
 
+enum SourceSlot {
+    Empty,
+    Pending {
+        path: PathBuf,
+        previous: Option<PathBuf>,
+    },
+    Open {
+        path: PathBuf,
+    },
+}
+
+impl SourceSlot {
+    fn begin(&mut self, path: PathBuf) {
+        let previous = self.active().map(Path::to_path_buf);
+        *self = Self::Pending { path, previous };
+    }
+
+    fn confirm(&mut self, path: &Path) -> bool {
+        let pending = match self {
+            Self::Pending { path: pending, .. } => pending.clone(),
+            _ => return false,
+        };
+        if pending.as_path() != path {
+            return false;
+        }
+        *self = Self::Open { path: pending };
+        true
+    }
+
+    fn fail(&mut self) -> bool {
+        let previous = match self {
+            Self::Pending { previous, .. } => previous.take(),
+            _ => return false,
+        };
+        *self = previous.map_or(Self::Empty, |path| Self::Open { path });
+        true
+    }
+
+    /// The open file, or the previous source a pending open keeps active.
+    fn active(&self) -> Option<&Path> {
+        match self {
+            Self::Empty => None,
+            Self::Pending { previous, .. } => previous.as_deref(),
+            Self::Open { path } => Some(path),
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
+}
+
 pub struct PlaybackSession {
     engine: Box<dyn PlayerEngine>,
-    source: Option<PathBuf>,
-    awaiting_source: Option<PathBuf>,
+    source: SourceSlot,
     tracks: TracksState,
     timeline: Timeline,
     export: Option<ExportJob>,
@@ -31,8 +82,7 @@ impl PlaybackSession {
     pub fn new(engine: Box<dyn PlayerEngine>) -> Self {
         Self {
             engine,
-            source: None,
-            awaiting_source: None,
+            source: SourceSlot::Empty,
             tracks: TracksState::Unloaded,
             timeline: Timeline::new(),
             export: None,
@@ -56,21 +106,21 @@ impl PlaybackSession {
         if !path.is_file() {
             return Err(format!("{} is not a readable video file.", path.display()));
         }
-        let awaiting = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+        let pending = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
         self.engine.open(&path)?;
-        self.awaiting_source = Some(awaiting);
+        self.source.begin(pending);
         self.failure = None;
         self.last_state = PlaybackState::Loading;
         Ok(())
     }
 
     pub fn source(&self) -> Option<&Path> {
-        self.source.as_deref()
+        self.source.active()
     }
 
     #[cfg(test)]
-    pub(crate) fn is_awaiting_source(&self) -> bool {
-        self.awaiting_source.is_some()
+    pub(crate) fn has_pending_source(&self) -> bool {
+        self.source.is_pending()
     }
 
     pub fn state(&self) -> PlaybackState {
@@ -163,7 +213,7 @@ impl PlaybackSession {
     }
 
     pub fn start_export(&mut self, output: PathBuf, mode: ExportMode) -> Result<(), String> {
-        let Some(source) = self.source.clone() else {
+        let Some(source) = self.source.active().map(Path::to_path_buf) else {
             return Ok(());
         };
         let start = self.timeline.in_point();
@@ -206,7 +256,7 @@ impl PlaybackSession {
         }
         self.last_state = state.clone();
         let mut changed = self.confirm_open(&state);
-        let playback_ready = self.awaiting_source.is_none()
+        let playback_ready = !self.source.is_pending()
             && !matches!(&state, PlaybackState::Loading | PlaybackState::Failed(_));
         if playback_ready {
             if let Some(frame_duration) = self.engine.frame_duration()
@@ -242,28 +292,31 @@ impl PlaybackSession {
     }
 
     pub(crate) fn confirm_open(&mut self, state: &PlaybackState) -> bool {
-        if self.awaiting_source.is_none() {
+        // Only a pending open consumes an engine state. A settled slot has nothing
+        // to confirm, and skipping the path read keeps the poll off the property.
+        if !self.source.is_pending() {
             return false;
         }
-        let current = self.engine.current_path();
-        if current.as_deref() != self.awaiting_source.as_deref() {
+        if matches!(state, PlaybackState::Failed(_)) {
+            return self.source.fail();
+        }
+        if !state.is_loaded() {
             return false;
         }
-        if matches!(state, PlaybackState::Playing | PlaybackState::Paused) {
-            self.commit_source();
-            true
-        } else if matches!(state, PlaybackState::Failed(_)) {
-            self.awaiting_source = None;
-            true
-        } else {
-            false
+        let Some(current) = self.engine.current_path() else {
+            return false;
+        };
+        if !self.source.confirm(&current) {
+            return false;
         }
+        self.clear_source_data();
+        true
     }
 
     pub(crate) fn load_tracks(&mut self, state: &PlaybackState) -> bool {
-        if self.awaiting_source.is_some()
+        if self.source.is_pending()
             || !state.is_loaded()
-            || self.source.is_none()
+            || self.source.active().is_none()
             || !matches!(self.tracks, TracksState::Unloaded)
         {
             return false;
@@ -272,13 +325,10 @@ impl PlaybackSession {
         true
     }
 
-    fn commit_source(&mut self) {
-        if let Some(path) = self.awaiting_source.take() {
-            self.source = Some(path);
-            self.tracks = TracksState::Unloaded;
-            self.timeline = Timeline::new();
-            self.export = None;
-        }
+    fn clear_source_data(&mut self) {
+        self.tracks = TracksState::Unloaded;
+        self.timeline = Timeline::new();
+        self.export = None;
     }
 
     fn read_tracks(&mut self) {
@@ -306,8 +356,7 @@ impl PlaybackSession {
         let last_state = engine.state();
         Self {
             engine,
-            source: Some(source),
-            awaiting_source: None,
+            source: SourceSlot::Open { path: source },
             tracks,
             timeline: Timeline::new(),
             export: None,
