@@ -1,6 +1,6 @@
 //! Design tokens, icons, font detection and the shared controls of the player shell.
 
-use rune::{Color, El, Icon, TextStyle, el, icon, oklch, oklcha, row, text};
+use rune::{Color, El, Icon, Spring, SpringPair, TextStyle, el, icon, oklch, oklcha, row, text};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -8,6 +8,7 @@ pub const TOP_BAR_H: f32 = 48.0;
 pub const TRANSPORT_MAX_W: f32 = 720.0;
 pub const EXPORT_MAX_W: f32 = 760.0;
 pub const RADIUS_LG: f32 = 12.0;
+pub const TRAY_MOTION: SpringPair = SpringPair::new(Spring::new(0.20, 0.0), Spring::new(0.15, 0.0));
 
 pub const TITLE: TextStyle = TextStyle::new(22.0, 600.0).tracking(-0.2);
 pub const BODY: TextStyle = TextStyle::new(13.0, 400.0);
@@ -123,6 +124,8 @@ pub mod icons {
         "alert",
         r#"<path d="M12 3 2.5 20h19z"/><path d="M12 9v5"/><path d="M12 17h.01"/>"#
     );
+    stroke_icon!(PLUS, "plus", r#"<path d="M12 5v14M5 12h14"/>"#);
+    stroke_icon!(MINUS, "minus", r#"<path d="M5 12h14"/>"#);
     stroke_icon!(
         VOLUME,
         "volume",
