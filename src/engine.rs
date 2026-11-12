@@ -40,6 +40,26 @@ impl Track {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlaybackState {
+    Empty,
+    Loading,
+    Ready,
+    Playing,
+    Paused,
+    Ended,
+    Failed(String),
+}
+
+impl PlaybackState {
+    pub fn is_loaded(&self) -> bool {
+        matches!(
+            self,
+            Self::Ready | Self::Playing | Self::Paused | Self::Ended
+        )
+    }
+}
+
 /// What the UI needs from a playback backend.
 pub trait PlayerEngine: Send {
     fn open(&mut self, path: &Path) -> Result<(), String>;
@@ -51,11 +71,10 @@ pub trait PlayerEngine: Send {
     fn set_speed(&mut self, speed: f32);
     fn position(&self) -> f64;
     fn duration(&self) -> Option<f64>;
-    fn is_playing(&self) -> bool;
-    fn error(&self) -> Option<String>;
+    fn state(&self) -> PlaybackState;
     fn surface(&self) -> NativeSurface;
     fn frames(&self) -> u64;
-    fn tracks(&self) -> Vec<Track>;
+    fn tracks(&self) -> Result<Vec<Track>, String>;
     fn select_audio(&mut self, id: i64) -> Result<(), String>;
     fn select_subtitle(&mut self, id: Option<i64>) -> Result<(), String>;
     fn set_waker(&self, waker: Waker);
@@ -119,7 +138,6 @@ impl MpvEngine {
 
 impl PlayerEngine for MpvEngine {
     fn open(&mut self, path: &Path) -> Result<(), String> {
-        self.surface.clear();
         self.core.open(path)
     }
     fn play(&mut self) {
@@ -146,11 +164,8 @@ impl PlayerEngine for MpvEngine {
     fn duration(&self) -> Option<f64> {
         self.core.duration()
     }
-    fn is_playing(&self) -> bool {
-        self.core.is_playing()
-    }
-    fn error(&self) -> Option<String> {
-        self.core.error()
+    fn state(&self) -> PlaybackState {
+        self.core.state()
     }
     fn surface(&self) -> NativeSurface {
         self.surface.clone()
@@ -158,7 +173,7 @@ impl PlayerEngine for MpvEngine {
     fn frames(&self) -> u64 {
         self.core.frames.load(Ordering::Relaxed)
     }
-    fn tracks(&self) -> Vec<Track> {
+    fn tracks(&self) -> Result<Vec<Track>, String> {
         self.core.tracks()
     }
     fn select_audio(&mut self, id: i64) -> Result<(), String> {
@@ -183,19 +198,14 @@ impl Drop for MpvEngine {
 
 struct Core {
     handle: *mut mpv::Handle,
-    status: Mutex<Status>,
+    state: Mutex<PlaybackState>,
+    ready_reported: AtomicBool,
     waker: Mutex<Option<Waker>>,
     frames: AtomicU64,
 }
 
 unsafe impl Send for Core {}
 unsafe impl Sync for Core {}
-
-struct Status {
-    loaded: bool,
-    eof: bool,
-    error: Option<String>,
-}
 
 impl Core {
     fn new(headless: bool) -> Result<Self, String> {
@@ -236,11 +246,8 @@ impl Core {
             }
             Ok(Self {
                 handle,
-                status: Mutex::new(Status {
-                    loaded: false,
-                    eof: false,
-                    error: None,
-                }),
+                state: Mutex::new(PlaybackState::Empty),
+                ready_reported: AtomicBool::new(false),
                 waker: Mutex::new(None),
                 frames: AtomicU64::new(0),
             })
@@ -258,36 +265,59 @@ impl Core {
         }
     }
 
-    fn set_status(&self, loaded: bool, eof: bool, error: Option<String>) {
-        {
-            let mut status = self.status.lock().unwrap();
-            status.loaded = loaded;
-            status.eof = eof;
-            status.error = error;
+    fn set_state(&self, state: PlaybackState) {
+        if matches!(&state, PlaybackState::Ready) {
+            self.ready_reported.store(false, Ordering::Relaxed);
         }
+        *self.state.lock().unwrap() = state;
         self.wake();
     }
 
     fn open(&self, path: &Path) -> Result<(), String> {
         let path = path.to_str().ok_or("the file path is not valid UTF-8")?;
-        {
-            let mut status = self.status.lock().unwrap();
-            status.loaded = false;
-            status.eof = false;
-            status.error = None;
+        self.set_state(PlaybackState::Loading);
+        match self.command(&["loadfile", path]) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.set_state(PlaybackState::Failed(error.clone()));
+                Err(error)
+            }
         }
-        self.command(&["loadfile", path])
+    }
+
+    fn state(&self) -> PlaybackState {
+        let state = self.state.lock().unwrap().clone();
+        match state {
+            PlaybackState::Ready => {
+                if !self.ready_reported.swap(true, Ordering::Relaxed) {
+                    PlaybackState::Ready
+                } else if self.get_flag("pause").unwrap_or(true) {
+                    PlaybackState::Paused
+                } else {
+                    PlaybackState::Playing
+                }
+            }
+            PlaybackState::Playing | PlaybackState::Paused => {
+                if self.get_flag("pause").unwrap_or(true) {
+                    PlaybackState::Paused
+                } else {
+                    PlaybackState::Playing
+                }
+            }
+            other => other,
+        }
     }
 
     fn set_paused(&self, paused: bool) {
-        if !paused && self.status.lock().unwrap().eof {
+        let ended = matches!(*self.state.lock().unwrap(), PlaybackState::Ended);
+        if !paused && ended {
             self.seek(0.0);
         }
         let _ = self.set_flag("pause", paused);
     }
 
     fn toggle(&self) {
-        if self.status.lock().unwrap().eof {
+        if matches!(*self.state.lock().unwrap(), PlaybackState::Ended) {
             self.set_paused(false);
             return;
         }
@@ -301,7 +331,10 @@ impl Core {
         }
         let seconds = seconds.max(0.0);
         let _ = self.command(&["seek", &format!("{seconds:.3}"), "absolute+exact"]);
-        self.status.lock().unwrap().eof = false;
+        let mut state = self.state.lock().unwrap();
+        if matches!(*state, PlaybackState::Ended) {
+            *state = PlaybackState::Paused;
+        }
     }
 
     fn set_volume(&self, volume: f32) {
@@ -321,19 +354,7 @@ impl Core {
             .filter(|duration| duration.is_finite() && *duration > 0.0)
     }
 
-    fn is_playing(&self) -> bool {
-        let (loaded, eof, failed) = {
-            let status = self.status.lock().unwrap();
-            (status.loaded, status.eof, status.error.is_some())
-        };
-        loaded && !eof && !failed && !self.get_flag("pause").unwrap_or(true)
-    }
-
-    fn error(&self) -> Option<String> {
-        self.status.lock().unwrap().error.clone()
-    }
-
-    fn tracks(&self) -> Vec<Track> {
+    fn tracks(&self) -> Result<Vec<Track>, String> {
         let mut node = mpv::Node {
             data: mpv::NodeData { int64: 0 },
             format: 0,
@@ -348,7 +369,7 @@ impl Core {
             )
         };
         if result < 0 {
-            return Vec::new();
+            return Err(error_string(result));
         }
         let mut tracks = Vec::new();
         unsafe {
@@ -419,7 +440,7 @@ impl Core {
             }
             mpv::mpv_free_node_contents(&mut node);
         }
-        tracks
+        Ok(tracks)
     }
 
     fn select_audio(&self, id: i64) -> Result<(), String> {
@@ -460,19 +481,19 @@ impl Core {
                 break;
             }
             match id {
-                mpv::EVENT_FILE_LOADED => self.set_status(true, false, None),
+                mpv::EVENT_FILE_LOADED => self.set_state(PlaybackState::Ready),
                 mpv::EVENT_END_FILE => {
                     let data = unsafe { (*event).data };
                     if data.is_null() {
-                        self.set_status(false, false, Some("the file ended unexpectedly".into()));
+                        self.set_state(PlaybackState::Failed("the file ended unexpectedly".into()));
                     } else {
                         let end = unsafe { &*(data as *const mpv::EventEndFile) };
                         if end.reason == mpv::END_FILE_REASON_ERROR {
-                            self.set_status(false, false, Some(error_string(end.error)));
+                            self.set_state(PlaybackState::Failed(error_string(end.error)));
                         } else if end.reason == mpv::END_FILE_REASON_EOF {
-                            self.set_status(true, true, None);
+                            self.set_state(PlaybackState::Ended);
                         } else {
-                            self.set_status(false, false, None);
+                            self.set_state(PlaybackState::Empty);
                         }
                     }
                 }
@@ -823,17 +844,17 @@ mod tests {
         assert!(
             engine.frames() > 0,
             "libmpv pushed no frame: {:?}",
-            engine.error()
+            engine.state()
         );
     }
 
     fn wait_for_error(engine: &MpvEngine) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while engine.error().is_none() && Instant::now() < deadline {
+        while !matches!(engine.state(), PlaybackState::Failed(_)) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            engine.error().is_some(),
+            matches!(engine.state(), PlaybackState::Failed(_)),
             "a missing file must report an error"
         );
     }
@@ -842,13 +863,19 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut tracks = Vec::new();
         while Instant::now() < deadline {
-            tracks = engine.tracks();
-            if !tracks.is_empty() {
+            if let Ok(found) = engine.tracks()
+                && !found.is_empty()
+            {
+                tracks = found;
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(!tracks.is_empty(), "libmpv listed no tracks");
+        assert!(
+            !tracks.is_empty(),
+            "libmpv listed no tracks: {:?}",
+            engine.state()
+        );
         tracks
     }
 
@@ -874,6 +901,15 @@ mod tests {
             "{:?}",
             engine.surface().last_error()
         );
+    }
+
+    #[test]
+    fn the_engine_reports_a_loaded_state_after_a_frame() {
+        let mut engine = MpvEngine::new(true).unwrap();
+        assert_eq!(engine.state(), PlaybackState::Empty);
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_frame(&engine);
+        assert!(engine.state().is_loaded(), "{:?}", engine.state());
     }
 
     #[test]
