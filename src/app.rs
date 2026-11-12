@@ -1,162 +1,61 @@
 //! The Kachito screen: one file, one video surface, one transport bar.
 
-use crate::engine::{
-    MpvEngine, PlaybackState, PlayerEngine, Track, TrackKind, VIDEO_HEIGHT, VIDEO_WIDTH,
-};
-use crate::export::{ExportJob, ExportMode, ExportRequest, ExportState};
-use crate::timeline::Timeline;
+use crate::engine::{MpvEngine, PlaybackState, Track, TrackKind, VIDEO_HEIGHT, VIDEO_WIDTH};
+use crate::export::{ExportMode, ExportState};
+use crate::session::{PlaybackSession, SUPPORTED, TracksState, tracks_of};
 use rune::tok::{self, type_};
 use rune::{
     AppSpec, Cx, Drag, El, FileDialogOptions, Phase, SurfaceFit, Tx, Waker, col, el, row, text,
 };
 use std::path::PathBuf;
-use std::time::Duration;
 
-const SUPPORTED: &[&str] = &["mkv", "mp4", "m4v", "mov", "webm"];
 const SPEEDS: &[f32] = &[0.5, 1.0, 1.25, 1.5, 2.0];
 
-#[derive(Clone, Debug, PartialEq)]
-enum TracksState {
-    Unloaded,
-    Loaded(Vec<Track>),
-    Failed(String),
-}
-
-fn tracks_of(tracks: &[Track], kind: TrackKind) -> impl Iterator<Item = &Track> {
-    tracks.iter().filter(move |track| track.kind == kind)
-}
-
 struct App {
-    engine: Option<Box<dyn PlayerEngine>>,
-    path: Option<PathBuf>,
-    pending_path: Option<PathBuf>,
+    session: Option<PlaybackSession>,
     error: Option<String>,
     volume: f32,
     speed: f32,
     last_dir: Option<PathBuf>,
-    tracks: TracksState,
-    timeline: Timeline,
-    export: Option<ExportJob>,
     export_mode: ExportMode,
-    export_error: Option<String>,
 }
 
 impl App {
     fn new() -> Self {
-        let mut app = Self {
-            engine: None,
-            path: None,
-            pending_path: None,
-            error: None,
-            volume: 1.0,
-            speed: 1.0,
-            last_dir: None,
-            tracks: TracksState::Unloaded,
-            timeline: Timeline::new(),
-            export: None,
-            export_mode: ExportMode::Precise,
-            export_error: None,
+        let mut app = match MpvEngine::new(rune::is_headless()) {
+            Ok(engine) => Self::with_session(Some(PlaybackSession::new(Box::new(engine)))),
+            Err(error) => {
+                let mut app = Self::with_session(None);
+                app.error = Some(error);
+                app
+            }
         };
-        match MpvEngine::new(rune::is_headless()) {
-            Ok(engine) => app.engine = Some(Box::new(engine)),
-            Err(error) => app.error = Some(error),
-        }
         if let Some(path) = rune::extra_args().first() {
             app.open(PathBuf::from(path));
-        }
-        if rune::is_headless() && app.pending_path.is_some() {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while app.engine.as_ref().is_some_and(|engine| {
-                engine.frames() == 0 && !matches!(engine.state(), PlaybackState::Failed(_))
-            }) && std::time::Instant::now() < deadline
-            {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            let loaded = app
-                .engine
-                .as_ref()
-                .is_some_and(|engine| engine.state().is_loaded());
-            if loaded {
-                app.commit_pending_path();
-            }
         }
         app
     }
 
-    fn commit_pending_path(&mut self) {
-        if let Some(path) = self.pending_path.take() {
-            self.path = Some(path);
-            self.tracks = TracksState::Unloaded;
-            self.timeline = Timeline::new();
+    fn with_session(session: Option<PlaybackSession>) -> Self {
+        Self {
+            session,
+            error: None,
+            volume: 1.0,
+            speed: 1.0,
+            last_dir: None,
+            export_mode: ExportMode::Precise,
         }
-    }
-
-    fn sync_pending_path(&mut self, state: &PlaybackState) -> bool {
-        if self.pending_path.is_some()
-            && matches!(
-                state,
-                PlaybackState::Ready | PlaybackState::Playing | PlaybackState::Paused
-            )
-        {
-            self.commit_pending_path();
-            true
-        } else if self.pending_path.is_some() && matches!(state, PlaybackState::Failed(_)) {
-            self.pending_path = None;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn load_tracks(&mut self, state: &PlaybackState) -> bool {
-        if self.pending_path.is_some()
-            || !state.is_loaded()
-            || self.path.is_none()
-            || !matches!(self.tracks, TracksState::Unloaded)
-        {
-            return false;
-        }
-        let Some(engine) = self.engine.as_ref() else {
-            return false;
-        };
-        let result = engine.tracks();
-        self.store_tracks(result);
-        true
-    }
-
-    fn store_tracks(&mut self, result: Result<Vec<Track>, String>) {
-        self.tracks = match result {
-            Ok(tracks) => TracksState::Loaded(tracks),
-            Err(error) => TracksState::Failed(error),
-        };
     }
 
     fn open(&mut self, path: PathBuf) {
-        if path.to_string_lossy().contains("://") {
-            self.error = Some("Remote URLs are not supported yet.".into());
-            return;
-        }
-        let extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if !SUPPORTED.contains(&extension.as_str()) {
-            self.error = Some(format!("{} is not a supported video file.", path.display()));
-            return;
-        }
-        if !path.is_file() {
-            self.error = Some(format!("{} is not a readable video file.", path.display()));
-            return;
-        }
-        let Some(engine) = self.engine.as_mut() else {
+        let Some(session) = &mut self.session else {
             self.error = Some("The playback engine is not available.".into());
             return;
         };
-        match engine.open(&path) {
+        let parent = path.parent().map(|parent| parent.to_path_buf());
+        match session.open(path) {
             Ok(()) => {
-                self.last_dir = path.parent().map(|parent| parent.to_path_buf());
-                self.pending_path = Some(path);
+                self.last_dir = parent;
                 self.error = None;
             }
             Err(error) => self.error = Some(error),
@@ -170,26 +69,21 @@ impl App {
     }
 
     fn toggle(&mut self) {
-        if let Some(engine) = self.engine.as_mut()
-            && engine.state().is_loaded()
-        {
-            engine.toggle();
+        if let Some(session) = &mut self.session {
+            session.toggle();
         }
     }
 
     fn seek_fraction(&mut self, fraction: f32) {
-        if let Some(engine) = self.engine.as_mut()
-            && engine.state().is_loaded()
-            && let Some(duration) = engine.duration()
-        {
-            engine.seek(f64::from(fraction.clamp(0.0, 1.0)) * duration);
+        if let Some(session) = &mut self.session {
+            session.seek_fraction(fraction);
         }
     }
 
     fn volume_delta(&mut self, delta: f32) {
         self.volume = (self.volume + delta).clamp(0.0, 1.0);
-        if let Some(engine) = self.engine.as_mut() {
-            engine.set_volume(self.volume);
+        if let Some(session) = &mut self.session {
+            session.set_volume(self.volume);
         }
     }
 
@@ -199,109 +93,82 @@ impl App {
             .position(|speed| (*speed - self.speed).abs() < 0.01)
             .unwrap_or(1);
         self.speed = SPEEDS[(index + 1) % SPEEDS.len()];
-        if let Some(engine) = self.engine.as_mut() {
-            engine.set_speed(self.speed);
-        }
-    }
-
-    fn refresh_tracks(&mut self) {
-        let tracks = self.engine.as_ref().map(|engine| engine.tracks());
-        if let Some(result) = tracks {
-            self.store_tracks(result);
+        if let Some(session) = &mut self.session {
+            session.set_speed(self.speed);
         }
     }
 
     fn select_audio(&mut self, id: i64) {
-        if let Some(engine) = self.engine.as_mut() {
-            match engine.select_audio(id) {
-                Ok(()) => self.refresh_tracks(),
-                Err(error) => self.error = Some(error),
-            }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        if let Err(error) = session.select_audio(id) {
+            self.error = Some(error);
         }
     }
 
     fn select_subtitle(&mut self, id: Option<i64>) {
-        if let Some(engine) = self.engine.as_mut() {
-            match engine.select_subtitle(id) {
-                Ok(()) => self.refresh_tracks(),
-                Err(error) => self.error = Some(error),
-            }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        if let Err(error) = session.select_subtitle(id) {
+            self.error = Some(error);
         }
     }
 
     fn seek_to(&mut self, time: f64) {
-        if let Some(engine) = self.engine.as_mut()
-            && engine.state().is_loaded()
-        {
-            engine.seek(time);
+        if let Some(session) = &mut self.session {
+            session.seek(time);
+            session.timeline_mut().set_position(time);
         }
-        self.timeline.set_position(time);
     }
 
     fn set_in(&mut self, time: f64) {
-        self.timeline.set_in(time);
-    }
-
-    fn set_out(&mut self, time: f64) {
-        self.timeline.set_out(time);
-    }
-
-    fn selected_audio_index(&self) -> Option<usize> {
-        let TracksState::Loaded(tracks) = &self.tracks else {
-            return None;
-        };
-        let audio: Vec<&Track> = tracks_of(tracks, TrackKind::Audio).collect();
-        if audio.is_empty() {
-            None
-        } else {
-            Some(audio.iter().position(|track| track.selected).unwrap_or(0))
+        if let Some(session) = &mut self.session {
+            session.timeline_mut().set_in(time);
         }
     }
 
-    fn start_export(&mut self, output: PathBuf, start: f64, end: f64, audio_index: Option<usize>) {
-        let source = match &self.path {
-            Some(path) => path.clone(),
-            None => return,
-        };
-        let audio_count = match &self.tracks {
-            TracksState::Loaded(tracks) => tracks_of(tracks, TrackKind::Audio).count(),
-            TracksState::Unloaded | TracksState::Failed(_) => 0,
-        };
-        self.export = None;
-        self.export_error = None;
-        let request = match ExportRequest::new(
-            source,
-            start,
-            end,
-            audio_index,
-            audio_count,
-            self.export_mode,
-            output,
-        ) {
-            Ok(request) => request,
-            Err(error) => {
-                self.export_error = Some(error.to_string());
-                return;
-            }
-        };
-        match ExportJob::start(request) {
-            Ok(job) => self.export = Some(job),
-            Err(error) => self.export_error = Some(error.to_string()),
+    fn set_out(&mut self, time: f64) {
+        if let Some(session) = &mut self.session {
+            session.timeline_mut().set_out(time);
+        }
+    }
+
+    fn zoom_in(&mut self) {
+        if let Some(session) = &mut self.session {
+            session.timeline_mut().zoom_in();
+        }
+    }
+
+    fn zoom_out(&mut self) {
+        if let Some(session) = &mut self.session {
+            session.timeline_mut().zoom_out();
+        }
+    }
+
+    fn start_export(&mut self, output: PathBuf) {
+        if let Some(session) = &mut self.session {
+            session.start_export(output, self.export_mode);
+        }
+    }
+
+    fn cancel_export(&self) {
+        if let Some(session) = &self.session {
+            session.cancel_export();
+        }
+    }
+
+    fn set_export_error(&mut self, error: String) {
+        if let Some(session) = &mut self.session {
+            session.set_export_error(error);
         }
     }
 
     fn error_text(&self) -> Option<String> {
         self.error
             .clone()
-            .or_else(|| self.export_error.clone())
-            .or_else(|| {
-                self.engine
-                    .as_ref()
-                    .and_then(|engine| match engine.state() {
-                        PlaybackState::Failed(error) => Some(error),
-                        _ => None,
-                    })
-            })
+            .or_else(|| self.session.as_ref().and_then(|session| session.error()))
     }
 }
 
@@ -310,50 +177,13 @@ fn state() -> App {
 }
 
 fn setup(app: &mut App, waker: Waker) {
-    if let Some(engine) = app.engine.as_ref() {
-        engine.set_waker(waker.clone());
-        engine.surface().set_waker(waker);
+    if let Some(session) = &app.session {
+        session.set_waker(waker);
     }
 }
 
 fn poll(app: &mut App, _: f64, tx: &mut Tx) -> bool {
-    let mut changed = false;
-    let state = match app.engine.as_ref() {
-        Some(engine) => engine.state(),
-        None => return false,
-    };
-    changed |= app.sync_pending_path(&state);
-    let playback_ready = app.pending_path.is_none()
-        && !matches!(&state, PlaybackState::Loading | PlaybackState::Failed(_));
-    if playback_ready {
-        if let Some(duration) = app.engine.as_ref().and_then(|engine| engine.duration())
-            && (app.timeline.duration() - duration).abs() > 0.01
-        {
-            app.timeline.set_duration(duration);
-            changed = true;
-        }
-        let position = app
-            .engine
-            .as_ref()
-            .map(|engine| engine.position())
-            .unwrap_or(0.0);
-        if (app.timeline.position() - position).abs() > 0.01 {
-            app.timeline.set_position(position);
-            changed = true;
-        }
-        changed |= app.load_tracks(&state);
-    }
-    if let Some(job) = &app.export {
-        if matches!(job.state(), ExportState::Running { .. }) {
-            tx.wake_after(Duration::from_millis(100));
-        }
-        changed = true;
-    }
-    if matches!(&state, PlaybackState::Playing) {
-        tx.wake_after(Duration::from_millis(100));
-        changed = true;
-    }
-    changed
+    app.session.as_mut().is_some_and(|session| session.poll(tx))
 }
 
 fn open_dialog(app: &mut App, tx: &mut Tx) {
@@ -371,7 +201,10 @@ fn open_dialog(app: &mut App, tx: &mut Tx) {
 }
 
 fn export_dialog(app: &mut App, tx: &mut Tx) {
-    let Some(source) = &app.path else {
+    let Some(session) = &app.session else {
+        return;
+    };
+    let Some(source) = session.source() else {
         return;
     };
     let stem = source
@@ -385,13 +218,10 @@ fn export_dialog(app: &mut App, tx: &mut Tx) {
         ..Default::default()
     }
     .filter("Matroska", &["mkv"]);
-    let start = app.timeline.in_point();
-    let end = app.timeline.out_point();
-    let audio = app.selected_audio_index();
     tx.save_file(options, move |app: &mut App, result, _| match result {
-        Ok(Some(path)) => app.start_export(path, start, end, audio),
+        Ok(Some(path)) => app.start_export(path),
         Ok(None) => {}
-        Err(error) => app.export_error = Some(error.to_string()),
+        Err(error) => app.set_export_error(error.to_string()),
     });
 }
 
@@ -415,7 +245,7 @@ fn open_button(theme: &tok::Theme) -> El {
     button("Open", false, theme).on_press_tx(|app: &mut App, tx: &mut Tx| open_dialog(app, tx))
 }
 
-fn track_bar(app: &App, theme: &tok::Theme) -> El {
+fn track_bar(session: &PlaybackSession, theme: &tok::Theme) -> El {
     let mut bar = row()
         .w_full()
         .padding(8.0)
@@ -423,7 +253,7 @@ fn track_bar(app: &App, theme: &tok::Theme) -> El {
         .center_y()
         .fill(theme.bg)
         .child(text("Audio").font(type_::LABEL).color(theme.text_secondary));
-    match &app.tracks {
+    match session.tracks() {
         TracksState::Unloaded => {
             bar = bar.child(
                 text("Loading tracks")
@@ -499,8 +329,8 @@ fn track_bar(app: &App, theme: &tok::Theme) -> El {
     bar
 }
 
-fn timeline_bar(app: &App, theme: &tok::Theme) -> El {
-    let timeline = &app.timeline;
+fn timeline_bar(app: &App, session: &PlaybackSession, theme: &tok::Theme) -> El {
+    let timeline = session.timeline();
     let start = timeline.fraction_of(timeline.in_point()) as f32;
     let end = timeline.fraction_of(timeline.out_point()) as f32;
     let position = timeline.fraction_of(timeline.position()) as f32;
@@ -528,10 +358,15 @@ fn timeline_bar(app: &App, theme: &tok::Theme) -> El {
                     if drag.w <= 0.0 {
                         return;
                     }
-                    let time = app.timeline.time_at_fraction(f64::from(drag.x / drag.w));
+                    let Some(session) = &app.session else {
+                        return;
+                    };
+                    let time = session
+                        .timeline()
+                        .time_at_fraction(f64::from(drag.x / drag.w));
                     if matches!(drag.phase, Phase::Down) {
-                        let near_in = (time - app.timeline.in_point()).abs() <= 0.75;
-                        let near_out = (time - app.timeline.out_point()).abs() <= 0.75;
+                        let near_in = (time - session.timeline().in_point()).abs() <= 0.75;
+                        let near_out = (time - session.timeline().out_point()).abs() <= 0.75;
                         drag.data = if near_in {
                             1.0
                         } else if near_out {
@@ -571,10 +406,10 @@ fn timeline_bar(app: &App, theme: &tok::Theme) -> El {
                         ),
                 ),
         )
-        .child(button("-", false, theme).on_press(|app: &mut App| app.timeline.zoom_out()))
-        .child(button("+", false, theme).on_press(|app: &mut App| app.timeline.zoom_in()));
+        .child(button("-", false, theme).on_press(|app: &mut App| app.zoom_out()))
+        .child(button("+", false, theme).on_press(|app: &mut App| app.zoom_in()));
 
-    let export_state = app.export.as_ref().map(ExportJob::state);
+    let export_state = session.export_state();
     if let Some(state) = &export_state {
         match state {
             ExportState::Running { fraction } => {
@@ -588,11 +423,7 @@ fn timeline_bar(app: &App, theme: &tok::Theme) -> El {
                     .child(
                         button("Cancel", false, theme)
                             .key("cancel-export")
-                            .on_press(|app: &mut App| {
-                                if let Some(job) = &app.export {
-                                    job.cancel();
-                                }
-                            }),
+                            .on_press(|app: &mut App| app.cancel_export()),
                     );
             }
             ExportState::Finished => {
@@ -657,12 +488,42 @@ fn view(app: &App, cx: &mut Cx<App>) -> El {
     let error = app.error_text();
     let root = col().w_full().h_full().fill(theme.bg);
 
-    let screen = if let Some(path) = &app.path {
-        let engine = app.engine.as_ref().unwrap();
-        let duration = engine.duration().unwrap_or(0.0);
-        let position = engine.position();
-        let playback = engine.state();
-        let surface = engine.surface();
+    let empty_screen = || {
+        let mut screen = col()
+            .w_full()
+            .h_full()
+            .center()
+            .gap(12.0)
+            .fill(theme.bg)
+            .child(text("Kachito").font(type_::TITLE).color(theme.text))
+            .child(
+                text("Open a local MKV or MP4")
+                    .font(type_::BODY)
+                    .color(theme.text_secondary),
+            )
+            .child(open_button(&theme))
+            .child(
+                text("or drop a file here")
+                    .font(type_::LABEL)
+                    .color(theme.text_secondary),
+            );
+        if let Some(error) = &error {
+            screen = screen.child(
+                text(error.clone())
+                    .font(type_::LABEL)
+                    .color(tok::accent(2, true)),
+            );
+        }
+        screen
+    };
+
+    let screen = if let Some(session) = &app.session
+        && let Some(path) = session.source()
+    {
+        let duration = session.duration().unwrap_or(0.0);
+        let position = session.position();
+        let playback = session.state();
+        let surface = session.surface();
         let fraction = if duration > 0.0 {
             (position / duration).clamp(0.0, 1.0) as f32
         } else {
@@ -747,42 +608,17 @@ fn view(app: &App, cx: &mut Cx<App>) -> El {
             .h_full()
             .fill(theme.bg)
             .child(top)
-            .child(track_bar(app, &theme))
+            .child(track_bar(session, &theme))
             .child(
                 el().key("video")
                     .w(VIDEO_WIDTH as f32)
                     .h(VIDEO_HEIGHT as f32)
                     .native_surface(&surface, SurfaceFit::Fit),
             )
-            .child(timeline_bar(app, &theme))
+            .child(timeline_bar(app, session, &theme))
             .child(controls)
     } else {
-        let mut screen = col()
-            .w_full()
-            .h_full()
-            .center()
-            .gap(12.0)
-            .fill(theme.bg)
-            .child(text("Kachito").font(type_::TITLE).color(theme.text))
-            .child(
-                text("Open a local MKV or MP4")
-                    .font(type_::BODY)
-                    .color(theme.text_secondary),
-            )
-            .child(open_button(&theme))
-            .child(
-                text("or drop a file here")
-                    .font(type_::LABEL)
-                    .color(theme.text_secondary),
-            );
-        if let Some(error) = &error {
-            screen = screen.child(
-                text(error.clone())
-                    .font(type_::LABEL)
-                    .color(tok::accent(2, true)),
-            );
-        }
-        screen
+        empty_screen()
     };
 
     root.child(screen)
@@ -814,6 +650,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::PlayerEngine;
+    use crate::export::ExportJob;
+    use crate::timeline::Timeline;
     use rune::{Env, Runtime};
     use std::sync::{Arc, Mutex};
 
@@ -855,12 +694,6 @@ mod tests {
             self.log.lock().unwrap().opened = Some(path.to_path_buf());
             Ok(())
         }
-        fn play(&mut self) {
-            self.log.lock().unwrap().state = PlaybackState::Playing;
-        }
-        fn pause(&mut self) {
-            self.log.lock().unwrap().state = PlaybackState::Paused;
-        }
         fn toggle(&mut self) {
             let mut log = self.log.lock().unwrap();
             log.state = if matches!(log.state, PlaybackState::Playing) {
@@ -887,11 +720,11 @@ mod tests {
         fn state(&self) -> PlaybackState {
             self.log.lock().unwrap().state.clone()
         }
+        fn current_path(&self) -> Option<PathBuf> {
+            self.log.lock().unwrap().opened.clone()
+        }
         fn surface(&self) -> rune::NativeSurface {
             self.surface.clone()
-        }
-        fn frames(&self) -> u64 {
-            0
         }
         fn tracks(&self) -> Result<Vec<Track>, String> {
             let mut log = self.log.lock().unwrap();
@@ -936,25 +769,25 @@ mod tests {
 
     fn app_with_fake() -> (App, Arc<Mutex<FakeLog>>) {
         let log = Arc::new(Mutex::new(FakeLog::default()));
-        let mut app = App {
-            engine: Some(Box::new(Fake {
-                surface: rune::NativeSurface::new(),
-                log: log.clone(),
-            })),
-            path: Some(PathBuf::from("test.mkv")),
-            pending_path: None,
-            error: None,
-            volume: 1.0,
-            speed: 1.0,
-            last_dir: None,
-            tracks: TracksState::Unloaded,
-            timeline: Timeline::new(),
-            export: None,
-            export_mode: ExportMode::Precise,
-            export_error: None,
+        let engine = Fake {
+            surface: rune::NativeSurface::new(),
+            log: log.clone(),
         };
-        app.refresh_tracks();
-        (app, log)
+        let tracks = engine.tracks().expect("the fake track list");
+        let session = PlaybackSession::with_source(
+            Box::new(engine),
+            PathBuf::from("test.mkv"),
+            TracksState::Loaded(tracks),
+        );
+        (App::with_session(Some(session)), log)
+    }
+
+    fn session(app: &App) -> &PlaybackSession {
+        app.session.as_ref().expect("a playback session")
+    }
+
+    fn session_mut(app: &mut App) -> &mut PlaybackSession {
+        app.session.as_mut().expect("a playback session")
     }
 
     fn window() -> (f32, f32) {
@@ -982,21 +815,23 @@ mod tests {
 
     #[test]
     fn dropping_a_file_opens_it() {
-        let dir = std::env::temp_dir().join(format!("kachito-app-drop-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("drop");
         let dropped = dir.join("dropped.mkv");
         std::fs::write(&dropped, b"not a video").unwrap();
-        let (mut app, log) = app_with_fake();
-        app.path = None;
+        let log = Arc::new(Mutex::new(FakeLog::default()));
+        let playback = PlaybackSession::new(Box::new(Fake {
+            surface: rune::NativeSurface::new(),
+            log: log.clone(),
+        }));
+        let app = App::with_session(Some(playback));
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.frame(0.0);
         let at = runtime.find("video").unwrap_or((10.0, 10.0));
         runtime.drop_files(vec![dropped.clone()], Some(at));
         runtime.frame(1.0 / 60.0);
-        let state = runtime.state.engine.as_ref().unwrap().state();
-        runtime.state.sync_pending_path(&state);
-        assert_eq!(runtime.state.path, Some(dropped.clone()));
+        let state = session(&runtime.state).state();
+        assert!(session_mut(&mut runtime.state).confirm_open(&state));
+        assert_eq!(session(&runtime.state).source(), Some(dropped.as_path()));
         assert_eq!(log.lock().unwrap().opened, Some(dropped));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1016,10 +851,14 @@ mod tests {
 
     #[test]
     fn a_non_video_file_is_rejected() {
-        let (mut app, _) = app_with_fake();
+        let (mut app, log) = app_with_fake();
         app.open(PathBuf::from("notes.txt"));
         assert!(app.error.is_some());
-        assert!(app.path.is_some(), "the previous file stays open");
+        assert!(
+            session(&app).source().is_some(),
+            "the previous file stays open"
+        );
+        assert_eq!(log.lock().unwrap().opened, None);
     }
 
     #[test]
@@ -1033,18 +872,18 @@ mod tests {
     #[test]
     fn opening_a_missing_file_keeps_the_previous_session() {
         let (mut app, log) = app_with_fake();
-        app.timeline.set_duration(12.0);
-        app.timeline.set_in(3.0);
-        app.timeline.set_out(8.0);
-        let old_path = app.path.clone();
-        let old_tracks = app.tracks.clone();
-        let old_timeline = app.timeline.clone();
+        session_mut(&mut app).timeline_mut().set_duration(12.0);
+        session_mut(&mut app).timeline_mut().set_in(3.0);
+        session_mut(&mut app).timeline_mut().set_out(8.0);
+        let old_path = session(&app).source().map(|path| path.to_path_buf());
+        let old_tracks = session(&app).tracks().clone();
+        let old_timeline = session(&app).timeline().clone();
 
         app.open(PathBuf::from("missing.mkv"));
-        assert_eq!(app.path, old_path);
-        assert_eq!(app.tracks, old_tracks);
-        assert_eq!(app.timeline, old_timeline);
-        assert!(app.pending_path.is_none());
+        assert_eq!(session(&app).source(), old_path.as_deref());
+        assert_eq!(session(&app).tracks(), &old_tracks);
+        assert_eq!(session(&app).timeline(), &old_timeline);
+        assert!(!session(&app).is_awaiting_source());
         assert!(app.error_text().is_some());
         assert_eq!(log.lock().unwrap().opened, None);
     }
@@ -1055,27 +894,27 @@ mod tests {
         let corrupt = dir.join("corrupt.mkv");
         std::fs::write(&corrupt, b"not a video").unwrap();
         let (mut app, log) = app_with_fake();
-        app.timeline.set_duration(12.0);
-        app.timeline.set_in(3.0);
-        app.timeline.set_out(8.0);
-        let old_path = app.path.clone();
-        let old_tracks = app.tracks.clone();
-        let old_timeline = app.timeline.clone();
+        session_mut(&mut app).timeline_mut().set_duration(12.0);
+        session_mut(&mut app).timeline_mut().set_in(3.0);
+        session_mut(&mut app).timeline_mut().set_out(8.0);
+        let old_path = session(&app).source().map(|path| path.to_path_buf());
+        let old_tracks = session(&app).tracks().clone();
+        let old_timeline = session(&app).timeline().clone();
         log.lock().unwrap().state = PlaybackState::Loading;
 
         app.open(corrupt);
-        assert_eq!(app.path, old_path);
-        assert_eq!(app.tracks, old_tracks);
-        assert_eq!(app.timeline, old_timeline);
-        assert!(app.pending_path.is_some());
+        assert_eq!(session(&app).source(), old_path.as_deref());
+        assert_eq!(session(&app).tracks(), &old_tracks);
+        assert_eq!(session(&app).timeline(), &old_timeline);
+        assert!(session(&app).is_awaiting_source());
 
         log.lock().unwrap().state = PlaybackState::Failed("corrupt".into());
-        let state = app.engine.as_ref().unwrap().state();
-        assert!(app.sync_pending_path(&state));
-        assert_eq!(app.path, old_path);
-        assert_eq!(app.tracks, old_tracks);
-        assert_eq!(app.timeline, old_timeline);
-        assert!(app.pending_path.is_none());
+        let state = session(&app).state();
+        assert!(session_mut(&mut app).confirm_open(&state));
+        assert_eq!(session(&app).source(), old_path.as_deref());
+        assert_eq!(session(&app).tracks(), &old_tracks);
+        assert_eq!(session(&app).timeline(), &old_timeline);
+        assert!(!session(&app).is_awaiting_source());
         assert_eq!(app.error_text().as_deref(), Some("corrupt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1086,63 +925,151 @@ mod tests {
         let next = dir.join("next.mkv");
         std::fs::write(&next, b"not a video").unwrap();
         let (mut app, log) = app_with_fake();
-        app.timeline.set_duration(12.0);
-        app.timeline.set_in(3.0);
-        app.timeline.set_out(8.0);
-        let old_path = app.path.clone();
+        session_mut(&mut app).timeline_mut().set_duration(12.0);
+        session_mut(&mut app).timeline_mut().set_in(3.0);
+        session_mut(&mut app).timeline_mut().set_out(8.0);
+        let old_path = session(&app).source().map(|path| path.to_path_buf());
         log.lock().unwrap().state = PlaybackState::Loading;
 
         app.open(next.clone());
-        assert_eq!(app.path, old_path);
-        assert!(app.pending_path.is_some());
+        assert_eq!(session(&app).source(), old_path.as_deref());
+        assert!(session(&app).is_awaiting_source());
 
-        let state = app.engine.as_ref().unwrap().state();
-        assert!(!app.sync_pending_path(&state));
-        assert_eq!(app.path, old_path);
+        let state = session(&app).state();
+        assert!(!session_mut(&mut app).confirm_open(&state));
+        assert_eq!(session(&app).source(), old_path.as_deref());
 
         log.lock().unwrap().state = PlaybackState::Paused;
-        let state = app.engine.as_ref().unwrap().state();
-        assert!(app.sync_pending_path(&state));
-        assert_eq!(app.path, Some(next));
-        assert_eq!(app.tracks, TracksState::Unloaded);
-        assert_eq!(app.timeline, Timeline::new());
+        let state = session(&app).state();
+        assert!(session_mut(&mut app).confirm_open(&state));
+        assert_eq!(session(&app).source(), Some(next.as_path()));
+        assert_eq!(session(&app).tracks(), &TracksState::Unloaded);
+        assert_eq!(session(&app).timeline(), &Timeline::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_successful_source_swap_clears_the_old_export() {
+        let dir = temp_dir("swap");
+        let next = dir.join("next.mkv");
+        std::fs::write(&next, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        session_mut(&mut app).set_export(Some(ExportJob::with_state(ExportState::Finished)));
+        session_mut(&mut app).set_export_error("old export error".into());
+        log.lock().unwrap().state = PlaybackState::Loading;
+
+        app.open(next);
+        log.lock().unwrap().state = PlaybackState::Paused;
+        let state = session(&app).state();
+        assert!(session_mut(&mut app).confirm_open(&state));
+        assert_eq!(session(&app).export_state(), None);
+        assert_eq!(session(&app).export_error(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_open_error_wins_over_a_stale_export_error() {
+        let dir = temp_dir("stale-export-error");
+        let corrupt = dir.join("corrupt.mkv");
+        std::fs::write(&corrupt, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        session_mut(&mut app).set_export_error("old export error".into());
+        log.lock().unwrap().state = PlaybackState::Loading;
+
+        app.open(corrupt);
+        log.lock().unwrap().state = PlaybackState::Failed("corrupt".into());
+        let state = session(&app).state();
+        assert!(session_mut(&mut app).confirm_open(&state));
+        assert_eq!(app.error_text().as_deref(), Some("corrupt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_app_poll_commits_a_ready_source_and_clears_the_export() {
+        let dir = temp_dir("poll-ready");
+        let next = dir.join("next.mkv");
+        std::fs::write(&next, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        session_mut(&mut app).set_export(Some(ExportJob::with_state(ExportState::Running {
+            fraction: 0.5,
+        })));
+        let old_path = session(&app).source().map(|path| path.to_path_buf());
+        log.lock().unwrap().state = PlaybackState::Loading;
+        app.open(next.clone());
+
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        assert_eq!(session(&runtime.state).source(), old_path.as_deref());
+
+        log.lock().unwrap().state = PlaybackState::Paused;
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(session(&runtime.state).source(), Some(next.as_path()));
+        assert_eq!(session(&runtime.state).export_state(), None);
+        assert!(runtime.find("export-status").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_app_poll_keeps_the_previous_session_on_a_failed_open() {
+        let dir = temp_dir("poll-failed");
+        let corrupt = dir.join("corrupt.mkv");
+        std::fs::write(&corrupt, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        session_mut(&mut app).timeline_mut().set_duration(12.0);
+        session_mut(&mut app).timeline_mut().set_in(3.0);
+        session_mut(&mut app).timeline_mut().set_out(8.0);
+        let old_path = session(&app).source().map(|path| path.to_path_buf());
+        let old_timeline = session(&app).timeline().clone();
+        log.lock().unwrap().state = PlaybackState::Loading;
+        app.open(corrupt);
+
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        log.lock().unwrap().state = PlaybackState::Failed("corrupt".into());
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(session(&runtime.state).source(), old_path.as_deref());
+        assert_eq!(session(&runtime.state).timeline(), &old_timeline);
+        assert!(!session(&runtime.state).is_awaiting_source());
+        assert_eq!(runtime.state.error_text().as_deref(), Some("corrupt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_trackless_file_reads_the_track_list_once() {
         let (mut app, log) = app_with_fake();
-        app.tracks = TracksState::Unloaded;
+        session_mut(&mut app).set_tracks(TracksState::Unloaded);
         {
             let mut log = log.lock().unwrap();
             log.tracks_result = Some(Ok(Vec::new()));
             log.tracks_reads = 0;
         }
-        let state = app.engine.as_ref().unwrap().state();
-        assert!(app.load_tracks(&state));
-        assert_eq!(app.tracks, TracksState::Loaded(Vec::new()));
+        let state = session(&app).state();
+        assert!(session_mut(&mut app).load_tracks(&state));
+        assert_eq!(session(&app).tracks(), &TracksState::Loaded(Vec::new()));
         assert_eq!(log.lock().unwrap().tracks_reads, 1);
-        assert!(!app.load_tracks(&state));
+        assert!(!session_mut(&mut app).load_tracks(&state));
         assert_eq!(log.lock().unwrap().tracks_reads, 1);
     }
 
     #[test]
     fn a_track_list_failure_is_visible_and_distinct() {
         let (mut app, log) = app_with_fake();
-        app.tracks = TracksState::Unloaded;
+        session_mut(&mut app).set_tracks(TracksState::Unloaded);
         {
             let mut log = log.lock().unwrap();
             log.tracks_result = Some(Err("track list unavailable".into()));
             log.tracks_reads = 0;
         }
-        let state = app.engine.as_ref().unwrap().state();
-        assert!(app.load_tracks(&state));
+        let state = session(&app).state();
+        assert!(session_mut(&mut app).load_tracks(&state));
         assert_eq!(
-            app.tracks,
-            TracksState::Failed("track list unavailable".into())
+            session(&app).tracks(),
+            &TracksState::Failed("track list unavailable".into())
         );
         assert_eq!(log.lock().unwrap().tracks_reads, 1);
-        assert!(!app.load_tracks(&state));
+        assert!(!session_mut(&mut app).load_tracks(&state));
         assert_eq!(log.lock().unwrap().tracks_reads, 1);
     }
 
@@ -1157,7 +1084,7 @@ mod tests {
             ),
         ] {
             let (mut app, _) = app_with_fake();
-            app.tracks = tracks;
+            session_mut(&mut app).set_tracks(tracks);
             let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
             runtime.frame(0.0);
             assert!(runtime.find(key).is_some(), "{key}");
@@ -1216,7 +1143,7 @@ mod tests {
         ];
         for state in states {
             let (mut app, _) = app_with_fake();
-            app.export = Some(ExportJob::with_state(state.clone()));
+            session_mut(&mut app).set_export(Some(ExportJob::with_state(state.clone())));
             let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
             runtime.frame(0.0);
             assert!(runtime.find("export-status").is_some(), "{state:?}");

@@ -3,9 +3,11 @@
 use rune::native_surface::{ByteFrame, ColorInfo, Format};
 use rune::{NativeSurface, Waker};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -63,8 +65,6 @@ impl PlaybackState {
 /// What the UI needs from a playback backend.
 pub trait PlayerEngine: Send {
     fn open(&mut self, path: &Path) -> Result<(), String>;
-    fn play(&mut self);
-    fn pause(&mut self);
     fn toggle(&mut self);
     fn seek(&mut self, seconds: f64);
     fn set_volume(&mut self, volume: f32);
@@ -72,8 +72,8 @@ pub trait PlayerEngine: Send {
     fn position(&self) -> f64;
     fn duration(&self) -> Option<f64>;
     fn state(&self) -> PlaybackState;
+    fn current_path(&self) -> Option<PathBuf>;
     fn surface(&self) -> NativeSurface;
-    fn frames(&self) -> u64;
     fn tracks(&self) -> Result<Vec<Track>, String>;
     fn select_audio(&mut self, id: i64) -> Result<(), String>;
     fn select_subtitle(&mut self, id: Option<i64>) -> Result<(), String>;
@@ -88,6 +88,11 @@ pub struct MpvEngine {
 }
 
 impl MpvEngine {
+    #[cfg(test)]
+    fn frames(&self) -> u64 {
+        self.core.frames.load(Ordering::Relaxed)
+    }
+
     /// `headless` keeps audio off so tests do not open a device.
     pub fn new(headless: bool) -> Result<Self, String> {
         let core = Arc::new(Core::new(headless)?);
@@ -140,12 +145,6 @@ impl PlayerEngine for MpvEngine {
     fn open(&mut self, path: &Path) -> Result<(), String> {
         self.core.open(path)
     }
-    fn play(&mut self) {
-        self.core.set_paused(false);
-    }
-    fn pause(&mut self) {
-        self.core.set_paused(true);
-    }
     fn toggle(&mut self) {
         self.core.toggle();
     }
@@ -167,11 +166,11 @@ impl PlayerEngine for MpvEngine {
     fn state(&self) -> PlaybackState {
         self.core.state()
     }
+    fn current_path(&self) -> Option<PathBuf> {
+        self.core.current_path()
+    }
     fn surface(&self) -> NativeSurface {
         self.surface.clone()
-    }
-    fn frames(&self) -> u64 {
-        self.core.frames.load(Ordering::Relaxed)
     }
     fn tracks(&self) -> Result<Vec<Track>, String> {
         self.core.tracks()
@@ -201,6 +200,7 @@ struct Core {
     state: Mutex<PlaybackState>,
     ready_reported: AtomicBool,
     waker: Mutex<Option<Waker>>,
+    #[cfg(test)]
     frames: AtomicU64,
 }
 
@@ -249,6 +249,7 @@ impl Core {
                 state: Mutex::new(PlaybackState::Empty),
                 ready_reported: AtomicBool::new(false),
                 waker: Mutex::new(None),
+                #[cfg(test)]
                 frames: AtomicU64::new(0),
             })
         }
@@ -283,6 +284,10 @@ impl Core {
                 Err(error)
             }
         }
+    }
+
+    fn current_path(&self) -> Option<PathBuf> {
+        self.get_string("path").map(PathBuf::from)
     }
 
     fn state(&self) -> PlaybackState {
@@ -548,6 +553,25 @@ impl Core {
         )
     }
 
+    fn get_string(&self, name: &str) -> Option<String> {
+        let name = CString::new(name).unwrap();
+        let mut value: *mut c_char = ptr::null_mut();
+        let result = unsafe {
+            mpv::mpv_get_property(
+                self.handle,
+                name.as_ptr(),
+                mpv::FORMAT_STRING,
+                &mut value as *mut *mut c_char as *mut c_void,
+            )
+        };
+        if result < 0 || value.is_null() {
+            return None;
+        }
+        let text = unsafe { CStr::from_ptr(value).to_string_lossy().into_owned() };
+        unsafe { mpv::mpv_free(value as *mut c_void) };
+        Some(text)
+    }
+
     fn get_double(&self, name: &str) -> Option<f64> {
         let name = CString::new(name).unwrap();
         let mut value = 0.0f64;
@@ -607,6 +631,7 @@ impl RenderContext {
                     let bytes = std::mem::take(&mut buffer);
                     if surface.push_bytes(frame(bytes), id).is_ok() {
                         id += 1;
+                        #[cfg(test)]
                         core.frames.fetch_add(1, Ordering::Relaxed);
                     }
                     buffer = vec![0u8; size];
@@ -811,6 +836,7 @@ mod mpv {
         ) -> c_int;
         pub fn mpv_wait_event(ctx: *mut Handle, timeout: f64) -> *mut Event;
         pub fn mpv_error_string(error: c_int) -> *const c_char;
+        pub fn mpv_free(data: *mut c_void);
         pub fn mpv_free_node_contents(node: *mut Node);
         pub fn mpv_terminate_destroy(ctx: *mut Handle);
         pub fn mpv_render_context_create(
