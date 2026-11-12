@@ -78,6 +78,7 @@ pub trait PlayerEngine: Send {
     fn tracks(&self) -> Result<Vec<Track>, String>;
     fn select_audio(&mut self, id: i64) -> Result<(), String>;
     fn select_subtitle(&mut self, id: Option<i64>) -> Result<(), String>;
+    /// Installs the app waker for playback state changes and surface pushes.
     fn set_waker(&self, waker: Waker);
 }
 
@@ -873,28 +874,21 @@ mod tests {
             .join(name)
     }
 
-    fn wait_for_frame(engine: &MpvEngine) {
+    fn wait_for_frame_count(engine: &MpvEngine, target: u64) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while engine.frames() == 0 && Instant::now() < deadline {
+        while engine.frames() < target && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            engine.frames() > 0,
-            "libmpv pushed no frame: {:?}",
+            engine.frames() >= target,
+            "libmpv pushed {} frames, wanted {target}: {:?}",
+            engine.frames(),
             engine.state()
         );
     }
 
-    fn wait_for_next_frame(engine: &MpvEngine, after: u64) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while engine.frames() <= after && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            engine.frames() > after,
-            "the engine pushed no frame: {:?}",
-            engine.state()
-        );
+    fn wait_for_frame(engine: &MpvEngine) {
+        wait_for_frame_count(engine, 1);
     }
 
     fn wait_for_error(engine: &MpvEngine) {
@@ -984,12 +978,23 @@ mod tests {
         engine.open(&fixture("rgbw.mkv")).unwrap();
         wait_for_frame(&engine);
 
-        // A seek stores no state transition, so only the surface waker can fire next.
+        // Pause so the next frame is the seek's, and let an in-flight frame land.
+        engine.toggle();
+        thread::sleep(Duration::from_millis(100));
+        // Consume the one-shot Ready so the comparison measures a real transition.
+        let _ = engine.state();
+        let state_before = engine.state();
         let frames = engine.frames();
         let wakes_before = wakes.load(Ordering::Relaxed);
-        engine.seek(0.5);
-        wait_for_next_frame(&engine, frames);
 
+        engine.seek(0.5);
+        wait_for_frame_count(&engine, frames + 1);
+
+        assert_eq!(
+            engine.state(),
+            state_before,
+            "the seek must not change the core state"
+        );
         assert!(
             wakes.load(Ordering::Relaxed) > wakes_before,
             "the surface push after a seek did not wake the app"
