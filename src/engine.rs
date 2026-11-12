@@ -13,6 +13,33 @@ use std::time::Duration;
 pub const VIDEO_WIDTH: i32 = 1280;
 pub const VIDEO_HEIGHT: i32 = 720;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackKind {
+    Audio,
+    Subtitle,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Track {
+    pub id: i64,
+    pub kind: TrackKind,
+    pub title: Option<String>,
+    pub language: Option<String>,
+    pub selected: bool,
+}
+
+impl Track {
+    pub fn label(&self) -> String {
+        if let Some(title) = &self.title {
+            return title.clone();
+        }
+        if let Some(language) = &self.language {
+            return language.to_ascii_uppercase();
+        }
+        format!("Track {}", self.id)
+    }
+}
+
 /// What the UI needs from a playback backend.
 pub trait PlayerEngine: Send {
     fn open(&mut self, path: &Path) -> Result<(), String>;
@@ -28,6 +55,9 @@ pub trait PlayerEngine: Send {
     fn error(&self) -> Option<String>;
     fn surface(&self) -> NativeSurface;
     fn frames(&self) -> u64;
+    fn tracks(&self) -> Vec<Track>;
+    fn select_audio(&mut self, id: i64) -> Result<(), String>;
+    fn select_subtitle(&mut self, id: Option<i64>) -> Result<(), String>;
     fn set_waker(&self, waker: Waker);
 }
 
@@ -127,6 +157,15 @@ impl PlayerEngine for MpvEngine {
     }
     fn frames(&self) -> u64 {
         self.core.frames.load(Ordering::Relaxed)
+    }
+    fn tracks(&self) -> Vec<Track> {
+        self.core.tracks()
+    }
+    fn select_audio(&mut self, id: i64) -> Result<(), String> {
+        self.core.select_audio(id)
+    }
+    fn select_subtitle(&mut self, id: Option<i64>) -> Result<(), String> {
+        self.core.select_subtitle(id)
     }
     fn set_waker(&self, waker: Waker) {
         self.core.set_waker(waker);
@@ -292,6 +331,122 @@ impl Core {
 
     fn error(&self) -> Option<String> {
         self.status.lock().unwrap().error.clone()
+    }
+
+    fn tracks(&self) -> Vec<Track> {
+        let mut node = mpv::Node {
+            data: mpv::NodeData { int64: 0 },
+            format: 0,
+        };
+        let name = CString::new("track-list").unwrap();
+        let result = unsafe {
+            mpv::mpv_get_property(
+                self.handle,
+                name.as_ptr(),
+                mpv::FORMAT_NODE,
+                &mut node as *mut mpv::Node as *mut c_void,
+            )
+        };
+        if result < 0 {
+            return Vec::new();
+        }
+        let mut tracks = Vec::new();
+        unsafe {
+            if node.format == mpv::FORMAT_NODE_ARRAY {
+                let list = &*node.data.list;
+                for index in 0..list.num.max(0) as isize {
+                    let item = &*list.values.offset(index);
+                    if item.format != mpv::FORMAT_NODE_MAP {
+                        continue;
+                    }
+                    let map = &*item.data.list;
+                    let mut id = None;
+                    let mut kind = None;
+                    let mut title = None;
+                    let mut language = None;
+                    let mut selected = false;
+                    for pair in 0..map.num.max(0) as isize {
+                        let key = CStr::from_ptr(*map.keys.offset(pair)).to_string_lossy();
+                        let value = &*map.values.offset(pair);
+                        match key.as_ref() {
+                            "id" if value.format == mpv::FORMAT_INT64 => {
+                                id = Some(value.data.int64)
+                            }
+                            "type" if value.format == mpv::FORMAT_STRING => {
+                                kind = Some(
+                                    CStr::from_ptr(value.data.string)
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                )
+                            }
+                            "title" if value.format == mpv::FORMAT_STRING => {
+                                let text = CStr::from_ptr(value.data.string)
+                                    .to_string_lossy()
+                                    .into_owned();
+                                if !text.is_empty() {
+                                    title = Some(text);
+                                }
+                            }
+                            "lang" if value.format == mpv::FORMAT_STRING => {
+                                let text = CStr::from_ptr(value.data.string)
+                                    .to_string_lossy()
+                                    .into_owned();
+                                if !text.is_empty() {
+                                    language = Some(text);
+                                }
+                            }
+                            "selected" if value.format == mpv::FORMAT_FLAG => {
+                                selected = value.data.flag != 0
+                            }
+                            _ => {}
+                        }
+                    }
+                    let kind = match kind.as_deref() {
+                        Some("audio") => TrackKind::Audio,
+                        Some("sub") => TrackKind::Subtitle,
+                        _ => continue,
+                    };
+                    if let Some(id) = id {
+                        tracks.push(Track {
+                            id,
+                            kind,
+                            title,
+                            language,
+                            selected,
+                        });
+                    }
+                }
+            }
+            mpv::mpv_free_node_contents(&mut node);
+        }
+        tracks
+    }
+
+    fn select_audio(&self, id: i64) -> Result<(), String> {
+        self.set_int("aid", id)
+    }
+
+    fn select_subtitle(&self, id: Option<i64>) -> Result<(), String> {
+        match id {
+            Some(id) => self.set_int("sid", id),
+            None => self.command(&["set", "sid", "no"]),
+        }
+    }
+
+    fn set_int(&self, name: &str, value: i64) -> Result<(), String> {
+        let name = CString::new(name).unwrap();
+        let mut value = value;
+        check(
+            unsafe {
+                mpv::mpv_set_property(
+                    self.handle,
+                    name.as_ptr(),
+                    mpv::FORMAT_INT64,
+                    &mut value as *mut i64 as *mut c_void,
+                )
+            },
+            "set property",
+        )
     }
 
     fn drain_events(&self) {
@@ -566,6 +721,26 @@ mod mpv {
         pub type_: c_int,
         pub data: *mut c_void,
     }
+    #[repr(C)]
+    pub union NodeData {
+        pub string: *mut c_char,
+        pub flag: c_int,
+        pub int64: i64,
+        pub double_: f64,
+        pub list: *mut NodeList,
+        pub ba: *mut c_void,
+    }
+    #[repr(C)]
+    pub struct Node {
+        pub data: NodeData,
+        pub format: c_int,
+    }
+    #[repr(C)]
+    pub struct NodeList {
+        pub num: c_int,
+        pub values: *mut Node,
+        pub keys: *mut *mut c_char,
+    }
 
     pub const EVENT_NONE: c_int = 0;
     pub const EVENT_END_FILE: c_int = 7;
@@ -573,8 +748,13 @@ mod mpv {
     pub const END_FILE_REASON_EOF: c_int = 0;
     pub const END_FILE_REASON_ERROR: c_int = 4;
 
+    pub const FORMAT_STRING: c_int = 1;
     pub const FORMAT_FLAG: c_int = 3;
+    pub const FORMAT_INT64: c_int = 4;
     pub const FORMAT_DOUBLE: c_int = 5;
+    pub const FORMAT_NODE: c_int = 6;
+    pub const FORMAT_NODE_ARRAY: c_int = 7;
+    pub const FORMAT_NODE_MAP: c_int = 8;
 
     pub const PARAM_API_TYPE: c_int = 1;
     pub const PARAM_BLOCK_FOR_TARGET_TIME: c_int = 12;
@@ -610,6 +790,7 @@ mod mpv {
         ) -> c_int;
         pub fn mpv_wait_event(ctx: *mut Handle, timeout: f64) -> *mut Event;
         pub fn mpv_error_string(error: c_int) -> *const c_char;
+        pub fn mpv_free_node_contents(node: *mut Node);
         pub fn mpv_terminate_destroy(ctx: *mut Handle);
         pub fn mpv_render_context_create(
             res: *mut *mut Render,
@@ -657,6 +838,20 @@ mod tests {
         );
     }
 
+    fn wait_for_tracks(engine: &MpvEngine) -> Vec<Track> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut tracks = Vec::new();
+        while Instant::now() < deadline {
+            tracks = engine.tracks();
+            if !tracks.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!tracks.is_empty(), "libmpv listed no tracks");
+        tracks
+    }
+
     #[test]
     fn opens_an_mp4_file_and_pushes_a_frame() {
         let mut engine = MpvEngine::new(true).unwrap();
@@ -686,5 +881,26 @@ mod tests {
         let mut engine = MpvEngine::new(true).unwrap();
         let _ = engine.open(Path::new("/definitely/not/here.mkv"));
         wait_for_error(&engine);
+    }
+
+    #[test]
+    fn lists_and_selects_audio_and_subtitle_tracks() {
+        let mut engine = MpvEngine::new(true).unwrap();
+        engine.open(&fixture("tracks.mkv")).unwrap();
+        let tracks = wait_for_tracks(&engine);
+        let audio: Vec<&Track> = tracks
+            .iter()
+            .filter(|track| track.kind == TrackKind::Audio)
+            .collect();
+        assert!(audio.len() >= 2, "{tracks:?}");
+        assert!(audio.iter().any(|track| track.label() == "Main"));
+        assert!(audio.iter().any(|track| track.label() == "Commentary"));
+        let subtitle = tracks
+            .iter()
+            .find(|track| track.kind == TrackKind::Subtitle)
+            .expect("a subtitle track");
+        engine.select_audio(audio[1].id).unwrap();
+        engine.select_subtitle(Some(subtitle.id)).unwrap();
+        engine.select_subtitle(None).unwrap();
     }
 }
