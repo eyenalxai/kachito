@@ -1675,7 +1675,7 @@ mod tests {
         assert_eq!(session(&app).source(), old_path.as_deref());
         assert_eq!(session(&app).tracks(), &old_tracks);
         assert_eq!(session(&app).timeline(), &old_timeline);
-        assert!(!session(&app).is_awaiting_source());
+        assert!(!session(&app).has_pending_source());
         assert!(app.notice().is_some());
         assert_eq!(log.lock().unwrap().opened, None);
     }
@@ -1700,7 +1700,7 @@ mod tests {
         assert_eq!(session(&app).source(), old_path.as_deref());
         assert_eq!(session(&app).tracks(), &old_tracks);
         assert_eq!(session(&app).timeline(), &old_timeline);
-        assert!(session(&app).is_awaiting_source());
+        assert!(session(&app).has_pending_source());
 
         log.lock().unwrap().state = PlaybackState::Failed("corrupt".into());
         let state = session(&app).state();
@@ -1708,7 +1708,7 @@ mod tests {
         assert_eq!(session(&app).source(), old_path.as_deref());
         assert_eq!(session(&app).tracks(), &old_tracks);
         assert_eq!(session(&app).timeline(), &old_timeline);
-        assert!(!session(&app).is_awaiting_source());
+        assert!(!session(&app).has_pending_source());
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.poll = Some(poll);
         runtime.frame(0.0);
@@ -1745,7 +1745,7 @@ mod tests {
         session.poll(&mut tx);
 
         assert_eq!(session.source(), Some(previous.as_path()));
-        assert!(!session.is_awaiting_source());
+        assert!(!session.has_pending_source());
         assert_eq!(session.take_failure().as_deref(), Some("corrupt"));
         assert_eq!(session.timeline().selection(), (3.0, 8.0));
 
@@ -1757,6 +1757,57 @@ mod tests {
         }
         session.poll(&mut tx);
         assert_eq!(session.timeline().position(), 4.0);
+        assert!(matches!(session.tracks(), TracksState::Loaded(_)));
+        assert_eq!(log.lock().unwrap().tracks_reads, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_first_open_leaves_an_empty_slot() {
+        let dir = temp_dir("first-fail");
+        let corrupt = dir.join("corrupt.mkv");
+        std::fs::write(&corrupt, b"not a video").unwrap();
+        let log = Arc::new(Mutex::new(FakeLog::default()));
+        let engine = Fake {
+            surface: rune::NativeSurface::new(),
+            log: log.clone(),
+        };
+        let mut session = PlaybackSession::new(Box::new(engine));
+        log.lock().unwrap().state = PlaybackState::Failed("corrupt".into());
+        session.open(corrupt).expect("the fake accepts the file");
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+
+        assert_eq!(session.source(), None);
+        assert!(!session.has_pending_source());
+        assert_eq!(session.take_failure().as_deref(), Some("corrupt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pending_open_that_ends_commits_the_source() {
+        let dir = temp_dir("ended-open");
+        let next = dir.join("next.mkv");
+        std::fs::write(&next, b"not a video").unwrap();
+        let log = Arc::new(Mutex::new(FakeLog::default()));
+        let engine = Fake {
+            surface: rune::NativeSurface::new(),
+            log: log.clone(),
+        };
+        let mut session = PlaybackSession::with_source(
+            Box::new(engine),
+            PathBuf::from("previous.mkv"),
+            TracksState::Loaded(Vec::new()),
+        );
+        log.lock().unwrap().state = PlaybackState::Ended;
+        session
+            .open(next.clone())
+            .expect("the fake accepts the file");
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+
+        assert_eq!(session.source(), Some(next.as_path()));
+        assert_eq!(session.timeline().duration(), 10.0);
         assert!(matches!(session.tracks(), TracksState::Loaded(_)));
         assert_eq!(log.lock().unwrap().tracks_reads, 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1778,7 +1829,7 @@ mod tests {
 
         app.open(next.clone());
         assert_eq!(session(&app).source(), old_path.as_deref());
-        assert!(session(&app).is_awaiting_source());
+        assert!(session(&app).has_pending_source());
 
         let state = session(&app).state();
         assert!(!session_mut(&mut app).confirm_open(&state));
@@ -1962,7 +2013,7 @@ mod tests {
         runtime.frame(1.0 / 60.0);
         assert_eq!(session(&runtime.state).source(), old_path.as_deref());
         assert_eq!(session(&runtime.state).timeline(), &old_timeline);
-        assert!(!session(&runtime.state).is_awaiting_source());
+        assert!(!session(&runtime.state).has_pending_source());
         assert_eq!(runtime.state.notice(), Some("corrupt"));
         let _ = std::fs::remove_dir_all(&dir);
     }

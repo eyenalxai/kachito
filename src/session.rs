@@ -119,7 +119,7 @@ impl PlaybackSession {
     }
 
     #[cfg(test)]
-    pub(crate) fn is_awaiting_source(&self) -> bool {
+    pub(crate) fn has_pending_source(&self) -> bool {
         self.source.is_pending()
     }
 
@@ -292,13 +292,15 @@ impl PlaybackSession {
     }
 
     pub(crate) fn confirm_open(&mut self, state: &PlaybackState) -> bool {
+        // Only a pending open consumes an engine state. A settled slot has nothing
+        // to confirm, and skipping the path read keeps the poll off the property.
         if !self.source.is_pending() {
             return false;
         }
         if matches!(state, PlaybackState::Failed(_)) {
             return self.source.fail();
         }
-        if !matches!(state, PlaybackState::Playing | PlaybackState::Paused) {
+        if !state.is_loaded() {
             return false;
         }
         let Some(current) = self.engine.current_path() else {
