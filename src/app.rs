@@ -1,8 +1,11 @@
 //! The Kachito screen: one file, one video surface, one transport bar.
 
 use crate::engine::{MpvEngine, PlayerEngine, Track, TrackKind, VIDEO_HEIGHT, VIDEO_WIDTH};
+use crate::timeline::Timeline;
 use rune::tok::{self, type_};
-use rune::{AppSpec, Cx, Drag, El, FileDialogOptions, SurfaceFit, Tx, Waker, col, el, row, text};
+use rune::{
+    AppSpec, Cx, Drag, El, FileDialogOptions, Phase, SurfaceFit, Tx, Waker, col, el, row, text,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -17,6 +20,7 @@ struct App {
     speed: f32,
     last_dir: Option<PathBuf>,
     tracks: Vec<Track>,
+    timeline: Timeline,
 }
 
 impl App {
@@ -29,6 +33,7 @@ impl App {
             speed: 1.0,
             last_dir: None,
             tracks: Vec::new(),
+            timeline: Timeline::new(),
         };
         match MpvEngine::new(rune::is_headless()) {
             Ok(engine) => app.engine = Some(Box::new(engine)),
@@ -75,6 +80,7 @@ impl App {
                 self.path = Some(path);
                 self.error = None;
                 self.tracks.clear();
+                self.timeline = Timeline::new();
             }
             Err(error) => self.error = Some(error),
         }
@@ -142,6 +148,21 @@ impl App {
         }
     }
 
+    fn seek_to(&mut self, time: f64) {
+        if let Some(engine) = self.engine.as_mut() {
+            engine.seek(time);
+        }
+        self.timeline.set_position(time);
+    }
+
+    fn set_in(&mut self, time: f64) {
+        self.timeline.set_in(time);
+    }
+
+    fn set_out(&mut self, time: f64) {
+        self.timeline.set_out(time);
+    }
+
     fn error_text(&self) -> Option<String> {
         self.error
             .clone()
@@ -163,6 +184,17 @@ fn setup(app: &mut App, waker: Waker) {
 fn poll(app: &mut App, _: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
     if let Some(engine) = app.engine.as_ref() {
+        if let Some(duration) = engine.duration()
+            && (app.timeline.duration - duration).abs() > 0.01
+        {
+            app.timeline.set_duration(duration);
+            changed = true;
+        }
+        let position = engine.position();
+        if (app.timeline.position - position).abs() > 0.01 {
+            app.timeline.set_position(position);
+            changed = true;
+        }
         if app.tracks.is_empty() && app.path.is_some() {
             let tracks = engine.tracks();
             if !tracks.is_empty() {
@@ -276,6 +308,82 @@ fn track_bar(app: &App, theme: &tok::Theme) -> El {
     bar
 }
 
+fn timeline_bar(app: &App, theme: &tok::Theme) -> El {
+    let timeline = &app.timeline;
+    let start = timeline.fraction_of(timeline.in_point) as f32;
+    let end = timeline.fraction_of(timeline.out_point) as f32;
+    let position = timeline.fraction_of(timeline.position) as f32;
+    let selection = (end - start).max(0.0);
+    let accent = tok::accent(0, true);
+    let label = format!(
+        "{:.1}s  {} - {}",
+        timeline.selection_duration(),
+        format_clock(timeline.in_point),
+        format_clock(timeline.out_point)
+    );
+
+    row()
+        .w_full()
+        .padding(8.0)
+        .gap(8.0)
+        .center_y()
+        .fill(theme.card)
+        .child(text(label).font(type_::LABEL).color(theme.text_secondary))
+        .child(
+            el().key("timeline")
+                .grow(1.0)
+                .h(30.0)
+                .on_drag(|app: &mut App, drag: &mut Drag, _: &mut Tx| {
+                    if drag.w <= 0.0 {
+                        return;
+                    }
+                    let time = app.timeline.time_at_fraction(f64::from(drag.x / drag.w));
+                    if matches!(drag.phase, Phase::Down) {
+                        let near_in = (time - app.timeline.in_point).abs() <= 0.75;
+                        let near_out = (time - app.timeline.out_point).abs() <= 0.75;
+                        drag.data = if near_in {
+                            1.0
+                        } else if near_out {
+                            2.0
+                        } else {
+                            0.0
+                        };
+                    }
+                    match drag.data as i32 {
+                        1 => app.set_in(time),
+                        2 => app.set_out(time),
+                        _ => app.seek_to(time),
+                    }
+                })
+                .child(
+                    col()
+                        .w_full()
+                        .h(30.0)
+                        .gap(2.0)
+                        .child(
+                            row()
+                                .w_full()
+                                .h(8.0)
+                                .radius(4.0)
+                                .fill(theme.control_track)
+                                .child(el().grow(start.max(0.001)).h(8.0))
+                                .child(el().grow(selection.max(0.001)).h(8.0).fill(accent))
+                                .child(el().grow((1.0 - end).max(0.001)).h(8.0)),
+                        )
+                        .child(
+                            row()
+                                .w_full()
+                                .h(20.0)
+                                .child(el().grow(position.max(0.001)))
+                                .child(el().w(2.0).h(20.0).fill(accent))
+                                .child(el().grow((1.0 - position).max(0.001))),
+                        ),
+                ),
+        )
+        .child(button("-", false, theme).on_press(|app: &mut App| app.timeline.zoom_out()))
+        .child(button("+", false, theme).on_press(|app: &mut App| app.timeline.zoom_in()))
+}
+
 fn view(app: &App, cx: &mut Cx<App>) -> El {
     let theme = tok::theme(true);
     let accent = cx.accent();
@@ -379,6 +487,7 @@ fn view(app: &App, cx: &mut Cx<App>) -> El {
                     .h(VIDEO_HEIGHT as f32)
                     .native_surface(&surface, SurfaceFit::Fit),
             )
+            .child(timeline_bar(app, &theme))
             .child(controls)
     } else {
         let mut screen = col()
@@ -428,7 +537,7 @@ pub fn run() {
         poll: Some(poll),
         ..AppSpec::new(
             "Kachito",
-            (VIDEO_WIDTH as f32, VIDEO_HEIGHT as f32 + 152.0),
+            (VIDEO_WIDTH as f32, VIDEO_HEIGHT as f32 + 192.0),
             state,
             view,
         )
@@ -549,13 +658,14 @@ mod tests {
             speed: 1.0,
             last_dir: None,
             tracks: Vec::new(),
+            timeline: Timeline::new(),
         };
         app.refresh_tracks();
         (app, log)
     }
 
     fn window() -> (f32, f32) {
-        (VIDEO_WIDTH as f32, VIDEO_HEIGHT as f32 + 152.0)
+        (VIDEO_WIDTH as f32, VIDEO_HEIGHT as f32 + 192.0)
     }
 
     #[test]
