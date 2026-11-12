@@ -1,6 +1,6 @@
 //! Design tokens, icons, font detection and the shared controls of the player shell.
 
-use rune::{Color, El, Icon, TextStyle, el, icon, oklch, oklcha, row, text};
+use rune::{Color, El, Icon, Spring, SpringPair, TextStyle, el, icon, oklch, oklcha, row, text};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -8,6 +8,7 @@ pub const TOP_BAR_H: f32 = 48.0;
 pub const TRANSPORT_MAX_W: f32 = 720.0;
 pub const EXPORT_MAX_W: f32 = 760.0;
 pub const RADIUS_LG: f32 = 12.0;
+pub const TRAY_MOTION: SpringPair = SpringPair::new(Spring::new(0.20, 0.0), Spring::new(0.15, 0.0));
 
 pub const TITLE: TextStyle = TextStyle::new(22.0, 600.0).tracking(-0.2);
 pub const BODY: TextStyle = TextStyle::new(13.0, 400.0);

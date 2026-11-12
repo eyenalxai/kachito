@@ -86,7 +86,6 @@ impl App {
                 self.last_dir = parent;
                 self.error = None;
                 self.menu = None;
-                self.export_open = false;
                 self.touch();
             }
             Err(error) => self.error = Some(error),
@@ -204,15 +203,22 @@ impl App {
         self.touch();
     }
 
-    fn toggle_export(&mut self) {
-        let ready = self
-            .session
+    fn export_ready(&self) -> bool {
+        self.session
             .as_ref()
-            .is_some_and(|session| session.source().is_some() && session.duration().is_some());
-        if !ready {
+            .is_some_and(|session| session.source().is_some() && session.duration().is_some())
+    }
+
+    fn toggle_export(&mut self) {
+        if self.export_open {
+            self.export_open = false;
+            self.touch();
             return;
         }
-        self.export_open = !self.export_open;
+        if !self.export_ready() {
+            return;
+        }
+        self.export_open = true;
         self.menu = None;
         self.touch();
     }
@@ -325,6 +331,7 @@ fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
         if app.title_source != source {
             tx.set_title(format!("{} — Kachito", file_title(source.as_deref())));
             app.title_source = source;
+            app.export_open = false;
             changed = true;
         }
     }
@@ -565,7 +572,7 @@ fn subtitle_button(app: &App, theme: &Palette) -> El {
 }
 
 fn export_button(app: &App, theme: &Palette) -> El {
-    if !app.has_source() {
+    if !app.export_ready() {
         return ui::label_button(Some(&icons::EXPORT), "Export", false, theme)
             .key("export-toggle")
             .disabled(true)
@@ -718,7 +725,11 @@ fn transport(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
         .fill(theme.surface)
         .border(1.0, theme.border_strong)
         .shadow(14.0, 30.0, theme.shadow)
-        .transition(Transition::offset(0.0, 8.0).combined(Transition::opacity()))
+        .transition(
+            Transition::offset(0.0, 8.0)
+                .combined(Transition::opacity())
+                .springs(ui::TRAY_MOTION),
+        )
         .on_hover_change(|app: &mut App, inside: bool, _: &mut Tx| {
             app.transport_hovered = inside;
             if inside {
@@ -1095,22 +1106,33 @@ fn export_tray(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
     let timeline = session.timeline();
     let state = session.export_state();
     let running = matches!(&state, Some(ExportState::Running { .. }));
+    let mut precise = ui::segment(
+        ExportMode::Precise.label(),
+        app.export_mode == ExportMode::Precise,
+        theme,
+    )
+    .key("mode-precise");
+    let mut fast = ui::segment(
+        ExportMode::Fast.label(),
+        app.export_mode == ExportMode::Fast,
+        theme,
+    )
+    .key("mode-fast");
+    if running {
+        precise = precise.disabled(true).dim(0.5);
+        fast = fast.disabled(true).dim(0.5);
+    } else {
+        precise = precise.on_press(|app: &mut App| app.export_mode = ExportMode::Precise);
+        fast = fast.on_press(|app: &mut App| app.export_mode = ExportMode::Fast);
+    }
     let mut footer = row().w_full().gap(8.0).center_y().child(
         row()
             .gap(2.0)
             .padding(2.0)
             .radius(8.0)
             .fill(theme.stage)
-            .child(
-                ui::segment("Precise", app.export_mode == ExportMode::Precise, theme)
-                    .key("mode-precise")
-                    .on_press(|app: &mut App| app.export_mode = ExportMode::Precise),
-            )
-            .child(
-                ui::segment("Fast", app.export_mode == ExportMode::Fast, theme)
-                    .key("mode-fast")
-                    .on_press(|app: &mut App| app.export_mode = ExportMode::Fast),
-            ),
+            .child(precise)
+            .child(fast),
     );
     footer = footer.child(el().grow(1.0));
     match &state {
@@ -1180,7 +1202,11 @@ fn export_tray(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
         .fill(theme.surface)
         .border(1.0, theme.border_strong)
         .shadow(16.0, 36.0, theme.shadow)
-        .transition(Transition::offset(0.0, 8.0).combined(Transition::opacity()))
+        .transition(
+            Transition::offset(0.0, 8.0)
+                .combined(Transition::opacity())
+                .springs(ui::TRAY_MOTION),
+        )
         .child(
             row()
                 .w_full()
@@ -1237,11 +1263,19 @@ fn range_bar(timeline: &crate::timeline::Timeline, theme: &Palette) -> El {
                 .timeline()
                 .time_at_fraction(f64::from(drag.x / drag.w));
             if matches!(drag.phase, Phase::Down) {
-                let near_in = (time - session.timeline().in_point()).abs() <= 0.75;
-                let near_out = (time - session.timeline().out_point()).abs() <= 0.75;
-                drag.data = if near_in {
+                let in_x = session
+                    .timeline()
+                    .fraction_of(session.timeline().in_point()) as f32
+                    * drag.w;
+                let out_x = session
+                    .timeline()
+                    .fraction_of(session.timeline().out_point()) as f32
+                    * drag.w;
+                let in_distance = (drag.x - in_x).abs();
+                let out_distance = (drag.x - out_x).abs();
+                drag.data = if in_distance <= 12.0 && in_distance <= out_distance {
                     1.0
-                } else if near_out {
+                } else if out_distance <= 12.0 {
                     2.0
                 } else {
                     0.0
@@ -1387,6 +1421,7 @@ mod tests {
         subtitle: Option<i64>,
         frame_duration: f64,
         position: f64,
+        duration: f64,
     }
 
     impl Default for FakeLog {
@@ -1403,6 +1438,7 @@ mod tests {
                 subtitle: None,
                 frame_duration: 1.0 / 60.0,
                 position: 0.0,
+                duration: 10.0,
             }
         }
     }
@@ -1438,7 +1474,7 @@ mod tests {
             self.log.lock().unwrap().position
         }
         fn duration(&self) -> Option<f64> {
-            Some(10.0)
+            Some(self.log.lock().unwrap().duration)
         }
         fn state(&self) -> PlaybackState {
             self.log.lock().unwrap().state.clone()
@@ -2046,6 +2082,7 @@ mod tests {
         });
         runtime.frame(0.5);
         assert!(runtime.find("export-tray").is_none());
+        assert!(runtime.find("transport").is_some());
     }
 
     #[test]
@@ -2229,5 +2266,65 @@ mod tests {
         });
         runtime.frame(1.0 / 60.0);
         assert_eq!(log.lock().unwrap().state, PlaybackState::Paused);
+    }
+    #[test]
+    fn the_export_mode_can_change_before_a_run() {
+        let (app, _) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.frame(0.0);
+        click(&mut runtime, "export-toggle");
+        runtime.frame(0.2);
+        assert_eq!(runtime.state.export_mode, ExportMode::Precise);
+        click(&mut runtime, "mode-fast");
+        runtime.frame(0.1);
+        assert_eq!(runtime.state.export_mode, ExportMode::Fast);
+    }
+
+    #[test]
+    fn the_out_handle_follows_the_pointer() {
+        let (app, log) = app_with_fake();
+        log.lock().unwrap().duration = 3600.0;
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        click(&mut runtime, "export-toggle");
+        runtime.frame(0.2);
+        let range = rect(&runtime, "range");
+        let y = range[1] + range[3] * 0.5;
+        let from_x = range[0] + range[2] - 2.0;
+        let to_x = range[0] + range[2] * 0.5;
+        runtime.pointer_down(from_x, y);
+        runtime.pointer_move(to_x, y);
+        runtime.pointer_up(to_x, y);
+        runtime.frame(0.1);
+        let out = runtime
+            .state
+            .session
+            .as_ref()
+            .unwrap()
+            .timeline()
+            .out_point();
+        assert!((out - 1800.0).abs() < 30.0, "{out}");
+    }
+
+    #[test]
+    fn a_new_source_closes_the_export_tray() {
+        let dir = temp_dir("new-source-tray");
+        let next = dir.join("next.mkv");
+        std::fs::write(&next, b"not a video").unwrap();
+        let (app, log) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        click(&mut runtime, "export-toggle");
+        runtime.frame(0.2);
+        assert!(runtime.find("export-tray").is_some());
+        runtime.state.open(next);
+        log.lock().unwrap().state = PlaybackState::Loading;
+        runtime.frame(0.1);
+        log.lock().unwrap().state = PlaybackState::Paused;
+        runtime.frame(0.2);
+        assert!(runtime.find("export-tray").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
