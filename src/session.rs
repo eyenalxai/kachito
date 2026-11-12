@@ -23,7 +23,6 @@ pub struct PlaybackSession {
     tracks: TracksState,
     timeline: Timeline,
     export: Option<ExportJob>,
-    export_error: Option<String>,
 }
 
 impl PlaybackSession {
@@ -35,7 +34,6 @@ impl PlaybackSession {
             tracks: TracksState::Unloaded,
             timeline: Timeline::new(),
             export: None,
-            export_error: None,
         }
     }
 
@@ -101,18 +99,6 @@ impl PlaybackSession {
         self.export.as_ref().map(ExportJob::state)
     }
 
-    #[cfg(test)]
-    pub(crate) fn export_error(&self) -> Option<&str> {
-        self.export_error.as_deref()
-    }
-
-    pub fn error(&self) -> Option<String> {
-        match self.engine.state() {
-            PlaybackState::Failed(error) => Some(error),
-            _ => self.export_error.clone(),
-        }
-    }
-
     pub fn set_waker(&self, waker: rune::Waker) {
         self.engine.set_waker(waker);
     }
@@ -170,9 +156,9 @@ impl PlaybackSession {
         }
     }
 
-    pub fn start_export(&mut self, output: PathBuf, mode: ExportMode) {
+    pub fn start_export(&mut self, output: PathBuf, mode: ExportMode) -> Result<(), String> {
         let Some(source) = self.source.clone() else {
-            return;
+            return Err("Open a video before exporting.".into());
         };
         let start = self.timeline.in_point();
         let end = self.timeline.out_point();
@@ -182,8 +168,7 @@ impl PlaybackSession {
             TracksState::Unloaded | TracksState::Failed(_) => 0,
         };
         self.export = None;
-        self.export_error = None;
-        let request = match ExportRequest::new(
+        let request = ExportRequest::new(
             source,
             start,
             end,
@@ -194,27 +179,16 @@ impl PlaybackSession {
             self.timeline.frame_duration(),
             mode,
             output,
-        ) {
-            Ok(request) => request,
-            Err(error) => {
-                self.export_error = Some(error.to_string());
-                return;
-            }
-        };
-        match ExportJob::start(request) {
-            Ok(job) => self.export = Some(job),
-            Err(error) => self.export_error = Some(error.to_string()),
-        }
+        )
+        .map_err(|error| error.to_string())?;
+        self.export = Some(ExportJob::start(request).map_err(|error| error.to_string())?);
+        Ok(())
     }
 
     pub fn cancel_export(&self) {
         if let Some(job) = &self.export {
             job.cancel();
         }
-    }
-
-    pub fn set_export_error(&mut self, error: String) {
-        self.export_error = Some(error);
     }
 
     pub fn poll(&mut self, tx: &mut Tx) -> bool {
@@ -291,7 +265,6 @@ impl PlaybackSession {
             self.tracks = TracksState::Unloaded;
             self.timeline = Timeline::new();
             self.export = None;
-            self.export_error = None;
         }
     }
 
@@ -324,7 +297,6 @@ impl PlaybackSession {
             tracks,
             timeline: Timeline::new(),
             export: None,
-            export_error: None,
         }
     }
 

@@ -23,7 +23,8 @@ enum Menu {
 
 struct App {
     session: Option<PlaybackSession>,
-    error: Option<String>,
+    notice: Option<String>,
+    last_playback: PlaybackState,
     volume: f32,
     last_volume: f32,
     speed: f32,
@@ -45,7 +46,7 @@ impl App {
             Ok(engine) => Self::with_session(Some(PlaybackSession::new(Box::new(engine)))),
             Err(error) => {
                 let mut app = Self::with_session(None);
-                app.error = Some(error);
+                app.set_notice(error);
                 app
             }
         };
@@ -56,9 +57,14 @@ impl App {
     }
 
     fn with_session(session: Option<PlaybackSession>) -> Self {
+        let last_playback = session
+            .as_ref()
+            .map(PlaybackSession::state)
+            .unwrap_or(PlaybackState::Empty);
         Self {
             session,
-            error: None,
+            notice: None,
+            last_playback,
             volume: 1.0,
             last_volume: 1.0,
             speed: 1.0,
@@ -77,18 +83,21 @@ impl App {
 
     fn open(&mut self, path: PathBuf) {
         let Some(session) = &mut self.session else {
-            self.error = Some("The playback engine is not available.".into());
+            self.set_notice("The playback engine is not available.");
             return;
         };
         let parent = path.parent().map(|parent| parent.to_path_buf());
         match session.open(path) {
             Ok(()) => {
                 self.last_dir = parent;
-                self.error = None;
+                self.notice = None;
+                // An accepted open starts loading. Base the next failure on that, not on the
+                // previous file's state, so a same-message failure still writes a notice.
+                self.last_playback = PlaybackState::Loading;
                 self.menu = None;
                 self.touch();
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => self.set_notice(error),
         }
     }
 
@@ -184,7 +193,7 @@ impl App {
         if let Some(session) = &mut self.session
             && let Err(error) = session.select_audio(id)
         {
-            self.error = Some(error);
+            self.set_notice(error);
         }
         self.menu = None;
     }
@@ -193,7 +202,7 @@ impl App {
         if let Some(session) = &mut self.session
             && let Err(error) = session.select_subtitle(id)
         {
-            self.error = Some(error);
+            self.set_notice(error);
         }
         self.menu = None;
     }
@@ -248,8 +257,10 @@ impl App {
     }
 
     fn start_export(&mut self, output: PathBuf) {
-        if let Some(session) = &mut self.session {
-            session.start_export(output, self.export_mode);
+        if let Some(session) = &mut self.session
+            && let Err(error) = session.start_export(output, self.export_mode)
+        {
+            self.set_notice(error);
         }
     }
 
@@ -259,16 +270,25 @@ impl App {
         }
     }
 
-    fn set_export_error(&mut self, error: String) {
-        if let Some(session) = &mut self.session {
-            session.set_export_error(error);
-        }
+    fn set_notice(&mut self, message: impl Into<String>) {
+        self.notice = Some(message.into());
     }
 
-    fn error_text(&self) -> Option<String> {
-        self.error
-            .clone()
-            .or_else(|| self.session.as_ref().and_then(|session| session.error()))
+    fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    fn watch_playback(&mut self) -> bool {
+        let Some(session) = &self.session else {
+            return false;
+        };
+        let state = session.state();
+        let transitioned = self.last_playback != state;
+        if transitioned && let PlaybackState::Failed(error) = &state {
+            self.set_notice(error.clone());
+        }
+        self.last_playback = state;
+        transitioned
     }
 
     fn export_state(&self) -> Option<ExportState> {
@@ -335,6 +355,7 @@ fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
             changed = true;
         }
     }
+    changed |= app.watch_playback();
     if app.activity {
         app.activity = false;
         app.last_activity = t;
@@ -423,7 +444,7 @@ fn open_dialog(app: &mut App, tx: &mut Tx) {
     tx.open_file(options, |app: &mut App, result, _| match result {
         Ok(Some(path)) => app.open(path),
         Ok(None) => {}
-        Err(error) => app.error = Some(error.to_string()),
+        Err(error) => app.set_notice(error.to_string()),
     });
 }
 
@@ -448,13 +469,13 @@ fn export_dialog(app: &mut App, tx: &mut Tx) {
     tx.save_file(options, move |app: &mut App, result, _| match result {
         Ok(Some(path)) => app.start_export(path),
         Ok(None) => {}
-        Err(error) => app.set_export_error(error.to_string()),
+        Err(error) => app.set_notice(error.to_string()),
     });
 }
 
 fn view(app: &App, _: &mut Cx<App>) -> El {
     let theme = ui::palette();
-    let error = app.error_text();
+    let notice = app.notice();
     let mut root = col()
         .key("root")
         .w_full()
@@ -476,14 +497,14 @@ fn view(app: &App, _: &mut Cx<App>) -> El {
         } else if app.transport_visible {
             stage = stage.child(transport(app, session, &theme));
         }
-        if let Some(error) = &error {
-            stage = stage.child(error_banner(error, &theme));
+        if let Some(notice) = &notice {
+            stage = stage.child(error_banner(notice, &theme));
         }
         root = root.child(top_bar(app, &theme)).child(stage);
     } else {
         root = root
             .child(top_bar(app, &theme))
-            .child(empty_screen(app, &theme, error.as_deref()));
+            .child(empty_screen(app, &theme, notice));
     }
     if let Some(menu) = menu_overlay(app, &theme) {
         root = root.child(menu);
@@ -1572,6 +1593,15 @@ mod tests {
             .rect
     }
 
+    fn shows_text(runtime: &Runtime<App>, needle: &str) -> bool {
+        runtime.elements().into_iter().any(|element| {
+            element
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains(needle))
+        })
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kachito-app-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1631,7 +1661,7 @@ mod tests {
     fn a_non_video_file_is_rejected() {
         let (mut app, log) = app_with_fake();
         app.open(PathBuf::from("notes.txt"));
-        assert!(app.error.is_some());
+        assert!(app.notice().is_some());
         assert!(
             session(&app).source().is_some(),
             "the previous file stays open"
@@ -1643,7 +1673,7 @@ mod tests {
     fn a_remote_url_is_rejected() {
         let (mut app, log) = app_with_fake();
         app.open(PathBuf::from("https://example.test/movie.mp4"));
-        assert!(app.error.is_some());
+        assert!(app.notice().is_some());
         assert_eq!(log.lock().unwrap().opened, None);
     }
 
@@ -1664,7 +1694,7 @@ mod tests {
         assert_eq!(session(&app).tracks(), &old_tracks);
         assert_eq!(session(&app).timeline(), &old_timeline);
         assert!(!session(&app).is_awaiting_source());
-        assert!(app.error_text().is_some());
+        assert!(app.notice().is_some());
         assert_eq!(log.lock().unwrap().opened, None);
     }
 
@@ -1697,7 +1727,8 @@ mod tests {
         assert_eq!(session(&app).tracks(), &old_tracks);
         assert_eq!(session(&app).timeline(), &old_timeline);
         assert!(!session(&app).is_awaiting_source());
-        assert_eq!(app.error_text().as_deref(), Some("corrupt"));
+        app.watch_playback();
+        assert_eq!(app.notice(), Some("corrupt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1739,7 +1770,6 @@ mod tests {
         std::fs::write(&next, b"not a video").unwrap();
         let (mut app, log) = app_with_fake();
         session_mut(&mut app).set_export(Some(ExportJob::with_state(ExportState::Finished)));
-        session_mut(&mut app).set_export_error("old export error".into());
         log.lock().unwrap().state = PlaybackState::Loading;
 
         app.open(next);
@@ -1747,25 +1777,102 @@ mod tests {
         let state = session(&app).state();
         assert!(session_mut(&mut app).confirm_open(&state));
         assert_eq!(session(&app).export_state(), None);
-        assert_eq!(session(&app).export_error(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_failed_open_error_wins_over_a_stale_export_error() {
-        let dir = temp_dir("stale-export-error");
-        let corrupt = dir.join("corrupt.mkv");
-        std::fs::write(&corrupt, b"not a video").unwrap();
+    fn a_rejected_open_is_replaced_by_a_later_playback_failure() {
         let (mut app, log) = app_with_fake();
-        session_mut(&mut app).set_export_error("old export error".into());
-        log.lock().unwrap().state = PlaybackState::Loading;
+        app.open(PathBuf::from("notes.txt"));
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
 
-        app.open(corrupt);
-        log.lock().unwrap().state = PlaybackState::Failed("corrupt".into());
-        let state = session(&app).state();
-        assert!(session_mut(&mut app).confirm_open(&state));
-        assert_eq!(app.error_text().as_deref(), Some("corrupt"));
+        assert!(
+            shows_text(&runtime, "notes.txt is not a supported video file."),
+            "the rejected open is on screen"
+        );
+
+        log.lock().unwrap().state = PlaybackState::Failed("the decoder gave up".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(
+            shows_text(&runtime, "the decoder gave up"),
+            "the playback failure replaces the rejected open"
+        );
+    }
+
+    #[test]
+    fn a_successful_open_clears_the_notice() {
+        let dir = temp_dir("clear-notice");
+        let next = dir.join("next.mkv");
+        std::fs::write(&next, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        app.open(PathBuf::from("notes.txt"));
+        assert!(app.notice().is_some());
+
+        log.lock().unwrap().state = PlaybackState::Loading;
+        app.open(next);
+        assert_eq!(app.notice(), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_notice_keeps_the_last_write() {
+        let (mut app, _) = app_with_fake();
+        app.set_notice("the first failure");
+        app.set_notice("the second failure");
+        assert_eq!(app.notice(), Some("the second failure"));
+    }
+
+    #[test]
+    fn a_same_message_failure_after_a_successful_open_is_noticed_again() {
+        let dir = temp_dir("repeat-failure");
+        let next = dir.join("next.mkv");
+        std::fs::write(&next, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        log.lock().unwrap().state = PlaybackState::Failed("the decoder gave up".into());
+        app.watch_playback();
+        assert_eq!(app.notice(), Some("the decoder gave up"));
+
+        app.open(next);
+        assert_eq!(app.notice(), None);
+        app.watch_playback();
+        assert_eq!(app.notice(), Some("the decoder gave up"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_export_start_failure_replaces_the_current_notice() {
+        let (mut app, _) = app_with_fake();
+        app.open(PathBuf::from("notes.txt"));
+        app.start_export(PathBuf::from("clip.mkv"));
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.frame(0.0);
+        assert!(
+            shows_text(
+                &runtime,
+                "Choose a start and end time with the end after the start."
+            ),
+            "the export start failure is on screen"
+        );
+    }
+
+    #[test]
+    fn a_newer_notice_survives_the_unchanged_playback_failure() {
+        let (app, log) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+
+        log.lock().unwrap().state = PlaybackState::Failed("the decoder gave up".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(shows_text(&runtime, "the decoder gave up"));
+
+        runtime.state.set_notice("a newer failure");
+        runtime.state.touch();
+        runtime.frame(1.0 / 60.0);
+        assert!(shows_text(&runtime, "a newer failure"));
+        assert!(!shows_text(&runtime, "the decoder gave up"));
     }
 
     #[test]
@@ -1818,7 +1925,7 @@ mod tests {
         assert_eq!(session(&runtime.state).source(), old_path.as_deref());
         assert_eq!(session(&runtime.state).timeline(), &old_timeline);
         assert!(!session(&runtime.state).is_awaiting_source());
-        assert_eq!(runtime.state.error_text().as_deref(), Some("corrupt"));
+        assert_eq!(runtime.state.notice(), Some("corrupt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2178,7 +2285,7 @@ mod tests {
     #[test]
     fn a_long_error_banner_wraps_instead_of_truncating() {
         let (mut app, _) = app_with_fake();
-        app.error = Some(
+        app.set_notice(
             "The playback engine could not open this file because the container is damaged.              Choose a different file or re-download the clip."
                 .repeat(4),
         );
