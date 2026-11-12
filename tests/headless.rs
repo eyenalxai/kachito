@@ -10,6 +10,8 @@ fn a_headless_snap_contains_a_video_frame() {
     let status = Command::new(env!("CARGO_BIN_EXE_kachito"))
         .arg("--snap")
         .arg(&png)
+        .arg("--at")
+        .arg("1.0")
         .arg(&source)
         .status()
         .expect("run the Kachito binary");
