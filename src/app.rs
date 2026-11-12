@@ -1717,6 +1717,52 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_pending_open_without_a_path_match_restores_the_previous_source() {
+        let dir = temp_dir("no-path-match");
+        let next = dir.join("next.mkv");
+        std::fs::write(&next, b"not a video").unwrap();
+        let log = Arc::new(Mutex::new(FakeLog::default()));
+        let engine = Fake {
+            surface: rune::NativeSurface::new(),
+            log: log.clone(),
+        };
+        let previous = PathBuf::from("previous.mkv");
+        let mut session =
+            PlaybackSession::with_source(Box::new(engine), previous.clone(), TracksState::Unloaded);
+        session.timeline_mut().set_duration(12.0, DEFAULT_FRAME);
+        session.timeline_mut().set_in(3.0);
+        session.timeline_mut().set_out(8.0);
+
+        log.lock().unwrap().state = PlaybackState::Loading;
+        session.open(next).expect("the fake accepts the file");
+        {
+            let mut log = log.lock().unwrap();
+            // The engine reports the failure before its path property names the pending file.
+            log.opened = None;
+            log.state = PlaybackState::Failed("corrupt".into());
+        }
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+
+        assert_eq!(session.source(), Some(previous.as_path()));
+        assert!(!session.is_awaiting_source());
+        assert_eq!(session.take_failure().as_deref(), Some("corrupt"));
+        assert_eq!(session.timeline().selection(), (3.0, 8.0));
+
+        // The resolved slot no longer blocks the timeline and track updates.
+        {
+            let mut log = log.lock().unwrap();
+            log.state = PlaybackState::Paused;
+            log.position = 4.0;
+        }
+        session.poll(&mut tx);
+        assert_eq!(session.timeline().position(), 4.0);
+        assert!(matches!(session.tracks(), TracksState::Loaded(_)));
+        assert_eq!(log.lock().unwrap().tracks_reads, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_valid_open_commits_only_when_the_engine_is_ready() {
         let dir = temp_dir("next");
         let next = dir.join("next.mkv");
