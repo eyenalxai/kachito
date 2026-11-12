@@ -1,7 +1,7 @@
 //! One open video and everything that belongs to it.
 
 use crate::engine::{PlaybackState, PlayerEngine, Track, TrackKind};
-use crate::export::{ExportJob, ExportMode, ExportRequest, ExportState};
+use crate::export::{AudioSelection, ExportJob, ExportMode, ExportRequest, ExportState};
 use crate::timeline::Timeline;
 use rune::Tx;
 use std::path::{Path, PathBuf};
@@ -184,14 +184,24 @@ impl PlaybackSession {
         };
         self.export = None;
         self.export_error = None;
-        let request =
-            match ExportRequest::new(source, start, end, audio_index, audio_count, mode, output) {
-                Ok(request) => request,
-                Err(error) => {
-                    self.export_error = Some(error.to_string());
-                    return;
-                }
-            };
+        let request = match ExportRequest::new(
+            source,
+            start,
+            end,
+            AudioSelection {
+                index: audio_index,
+                count: audio_count,
+            },
+            self.timeline.frame_duration(),
+            mode,
+            output,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                self.export_error = Some(error.to_string());
+                return;
+            }
+        };
         match ExportJob::start(request) {
             Ok(job) => self.export = Some(job),
             Err(error) => self.export_error = Some(error.to_string()),
@@ -214,10 +224,12 @@ impl PlaybackSession {
         let playback_ready = self.awaiting_source.is_none()
             && !matches!(&state, PlaybackState::Loading | PlaybackState::Failed(_));
         if playback_ready {
-            if let Some(duration) = self.engine.duration()
-                && (self.timeline.duration() - duration).abs() > 0.01
+            if let Some(frame_duration) = self.engine.frame_duration()
+                && let Some(duration) = self.engine.duration()
+                && ((self.timeline.duration() - duration).abs() > 0.01
+                    || (self.timeline.frame_duration() - frame_duration).abs() > 1e-9)
             {
-                self.timeline.set_duration(duration);
+                self.timeline.set_duration(duration, frame_duration);
                 changed = true;
             }
             let position = self.engine.position();

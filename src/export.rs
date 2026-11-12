@@ -34,6 +34,8 @@ impl ExportMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExportError {
     InvalidRange,
+    RangeShorterThanFrame,
+    InvalidFrameDuration,
     InvalidPath,
     SameFile,
     NonUtf8Path,
@@ -46,6 +48,12 @@ impl fmt::Display for ExportError {
         match self {
             Self::InvalidRange => {
                 f.write_str("Choose a start and end time with the end after the start.")
+            }
+            Self::RangeShorterThanFrame => {
+                f.write_str("Choose a range at least one source frame long.")
+            }
+            Self::InvalidFrameDuration => {
+                f.write_str("The source frame duration is not available.")
             }
             Self::InvalidPath => {
                 f.write_str("Choose a source video and an output file with valid paths.")
@@ -62,6 +70,12 @@ impl fmt::Display for ExportError {
 
 impl std::error::Error for ExportError {}
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AudioSelection {
+    pub index: Option<usize>,
+    pub count: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct ExportRequest {
     source: PathBuf,
@@ -77,8 +91,8 @@ impl ExportRequest {
         source: PathBuf,
         start: f64,
         end: f64,
-        audio_index: Option<usize>,
-        audio_count: usize,
+        audio: AudioSelection,
+        frame_duration: f64,
         mode: ExportMode,
         output: PathBuf,
     ) -> Result<Self, ExportError> {
@@ -100,11 +114,17 @@ impl ExportRequest {
         if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
             return Err(ExportError::InvalidRange);
         }
+        if !frame_duration.is_finite() || frame_duration <= 0.0 {
+            return Err(ExportError::InvalidFrameDuration);
+        }
+        if end - start + 1e-9 < frame_duration {
+            return Err(ExportError::RangeShorterThanFrame);
+        }
         if same_file(&source, &output)? {
             return Err(ExportError::SameFile);
         }
-        if let Some(index) = audio_index
-            && index >= audio_count
+        if let Some(index) = audio.index
+            && index >= audio.count
         {
             return Err(ExportError::AudioTrackOutOfRange);
         }
@@ -112,7 +132,7 @@ impl ExportRequest {
             source,
             start,
             end,
-            audio_index,
+            audio_index: audio.index,
             mode,
             output,
         })
@@ -414,8 +434,11 @@ mod tests {
             PathBuf::from("in.mkv"),
             2.0,
             5.0,
-            Some(1),
-            2,
+            AudioSelection {
+                index: Some(1),
+                count: 2,
+            },
+            1.0 / 60.0,
             ExportMode::Precise,
             PathBuf::from("out.mkv"),
         )
@@ -437,8 +460,8 @@ mod tests {
             PathBuf::from("in.mkv"),
             0.0,
             2.0,
-            None,
-            0,
+            AudioSelection::default(),
+            1.0 / 60.0,
             ExportMode::Fast,
             PathBuf::from("out.mkv"),
         )
@@ -455,8 +478,8 @@ mod tests {
             PathBuf::from("in.mkv"),
             2.0,
             2.0,
-            None,
-            0,
+            AudioSelection::default(),
+            1.0 / 60.0,
             ExportMode::Fast,
             PathBuf::from("out.mkv"),
         );
@@ -470,8 +493,8 @@ mod tests {
                 PathBuf::from("in.mkv"),
                 start,
                 end,
-                None,
-                0,
+                AudioSelection::default(),
+                1.0 / 60.0,
                 ExportMode::Fast,
                 PathBuf::from("out.mkv"),
             );
@@ -480,13 +503,55 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_range_shorter_than_one_source_frame() {
+        let result = ExportRequest::new(
+            PathBuf::from("in.mkv"),
+            0.0,
+            0.01,
+            AudioSelection::default(),
+            1.0 / 24.0,
+            ExportMode::Fast,
+            PathBuf::from("out.mkv"),
+        );
+        assert_eq!(result.unwrap_err(), ExportError::RangeShorterThanFrame);
+    }
+
+    #[test]
+    fn accepts_an_exact_one_frame_range() {
+        let result = ExportRequest::new(
+            PathBuf::from("in.mkv"),
+            3.0,
+            3.0 + 1.0 / 24.0,
+            AudioSelection::default(),
+            1.0 / 24.0,
+            ExportMode::Fast,
+            PathBuf::from("out.mkv"),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_a_missing_frame_duration() {
+        let result = ExportRequest::new(
+            PathBuf::from("in.mkv"),
+            0.0,
+            1.0,
+            AudioSelection::default(),
+            0.0,
+            ExportMode::Fast,
+            PathBuf::from("out.mkv"),
+        );
+        assert_eq!(result.unwrap_err(), ExportError::InvalidFrameDuration);
+    }
+
+    #[test]
     fn rejects_the_source_as_output() {
         let result = ExportRequest::new(
             PathBuf::from("clip.mkv"),
             0.0,
             2.0,
-            None,
-            0,
+            AudioSelection::default(),
+            1.0 / 60.0,
             ExportMode::Fast,
             PathBuf::from("clip.mkv"),
         );
@@ -499,8 +564,11 @@ mod tests {
             PathBuf::from("in.mkv"),
             0.0,
             2.0,
-            Some(1),
-            1,
+            AudioSelection {
+                index: Some(1),
+                count: 1,
+            },
+            1.0 / 60.0,
             ExportMode::Fast,
             PathBuf::from("out.mkv"),
         );
@@ -513,8 +581,8 @@ mod tests {
             PathBuf::new(),
             0.0,
             2.0,
-            None,
-            0,
+            AudioSelection::default(),
+            1.0 / 60.0,
             ExportMode::Fast,
             PathBuf::from("out.mkv"),
         );
@@ -527,8 +595,8 @@ mod tests {
             PathBuf::from("in\0.mkv"),
             0.0,
             2.0,
-            None,
-            0,
+            AudioSelection::default(),
+            1.0 / 60.0,
             ExportMode::Fast,
             PathBuf::from("out.mkv"),
         );
@@ -545,8 +613,8 @@ mod tests {
             source,
             0.0,
             2.0,
-            None,
-            0,
+            AudioSelection::default(),
+            1.0 / 60.0,
             ExportMode::Fast,
             PathBuf::from("out.mkv"),
         );
@@ -564,8 +632,11 @@ mod tests {
             fixture("tracks.mkv"),
             0.0,
             0.8,
-            Some(0),
-            1,
+            AudioSelection {
+                index: Some(0),
+                count: 1,
+            },
+            1.0 / 60.0,
             ExportMode::Precise,
             output.clone(),
         )
@@ -600,6 +671,70 @@ mod tests {
     }
 
     #[test]
+    fn a_one_frame_export_at_24fps_contains_a_frame() {
+        let dir = std::env::temp_dir().join(format!("kachito-export-24fps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.mkv");
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=24:duration=1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(&source)
+            .status()
+            .expect("generate the 24 fps source");
+        assert!(generated.success(), "ffmpeg could not generate the source");
+
+        let output = dir.join("out.mkv");
+        let request = ExportRequest::new(
+            source,
+            0.0,
+            1.0 / 24.0,
+            AudioSelection::default(),
+            1.0 / 24.0,
+            ExportMode::Precise,
+            output.clone(),
+        )
+        .expect("a one-frame request");
+        let job = ExportJob::start(request).expect("start the export");
+        let state = wait_for_terminal(&job, Duration::from_secs(30));
+        assert_eq!(state, ExportState::Finished);
+
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-count_frames",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&output)
+            .output()
+            .expect("run ffprobe");
+        let frames: u32 = String::from_utf8_lossy(&probe.stdout)
+            .trim()
+            .parse()
+            .expect("a frame count");
+        assert!(frames >= 1, "{frames}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_failed_export_leaves_no_output() {
         let dir =
             std::env::temp_dir().join(format!("kachito-export-failure-{}", std::process::id()));
@@ -608,9 +743,16 @@ mod tests {
         let source = dir.join("not-video.mkv");
         std::fs::write(&source, b"not a video").unwrap();
         let output = dir.join("out.mkv");
-        let request =
-            ExportRequest::new(source, 0.0, 1.0, None, 0, ExportMode::Fast, output.clone())
-                .expect("a valid request");
+        let request = ExportRequest::new(
+            source,
+            0.0,
+            1.0,
+            AudioSelection::default(),
+            1.0 / 60.0,
+            ExportMode::Fast,
+            output.clone(),
+        )
+        .expect("a valid request");
         let job = ExportJob::start(request).expect("start the export");
         let state = wait_for_terminal(&job, Duration::from_secs(10));
         assert!(matches!(state, ExportState::Failed(_)), "{state:?}");
@@ -634,8 +776,11 @@ mod tests {
             fixture("tracks.mkv"),
             0.0,
             2.0,
-            Some(0),
-            1,
+            AudioSelection {
+                index: Some(0),
+                count: 1,
+            },
+            1.0 / 60.0,
             ExportMode::Precise,
             output.clone(),
         )
