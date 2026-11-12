@@ -1,6 +1,7 @@
 //! The Kachito screen: one file, one video surface, one transport bar.
 
 use crate::engine::{MpvEngine, PlayerEngine, Track, TrackKind, VIDEO_HEIGHT, VIDEO_WIDTH};
+use crate::export::{ExportJob, ExportMode, ExportRequest};
 use crate::timeline::Timeline;
 use rune::tok::{self, type_};
 use rune::{
@@ -21,6 +22,9 @@ struct App {
     last_dir: Option<PathBuf>,
     tracks: Vec<Track>,
     timeline: Timeline,
+    export: Option<ExportJob>,
+    export_mode: ExportMode,
+    export_error: Option<String>,
 }
 
 impl App {
@@ -34,6 +38,9 @@ impl App {
             last_dir: None,
             tracks: Vec::new(),
             timeline: Timeline::new(),
+            export: None,
+            export_mode: ExportMode::Precise,
+            export_error: None,
         };
         match MpvEngine::new(rune::is_headless()) {
             Ok(engine) => app.engine = Some(Box::new(engine)),
@@ -163,9 +170,39 @@ impl App {
         self.timeline.set_out(time);
     }
 
+    fn selected_audio_index(&self) -> Option<usize> {
+        let audio: Vec<&Track> = self
+            .tracks
+            .iter()
+            .filter(|track| track.kind == TrackKind::Audio)
+            .collect();
+        if audio.is_empty() {
+            None
+        } else {
+            Some(audio.iter().position(|track| track.selected).unwrap_or(0))
+        }
+    }
+
+    fn start_export(&mut self, output: PathBuf, start: f64, end: f64, audio_index: Option<usize>) {
+        let source = match &self.path {
+            Some(path) => path.clone(),
+            None => return,
+        };
+        self.export = Some(ExportJob::start(ExportRequest {
+            source,
+            start,
+            end,
+            audio_index,
+            mode: self.export_mode,
+            output,
+        }));
+        self.export_error = None;
+    }
+
     fn error_text(&self) -> Option<String> {
         self.error
             .clone()
+            .or_else(|| self.export_error.clone())
             .or_else(|| self.engine.as_ref().and_then(|engine| engine.error()))
     }
 }
@@ -202,6 +239,17 @@ fn poll(app: &mut App, _: f64, tx: &mut Tx) -> bool {
                 changed = true;
             }
         }
+        if let Some(job) = &app.export {
+            let progress = job.progress();
+            if progress.running {
+                tx.wake_after(Duration::from_millis(100));
+                changed = true;
+            }
+            if progress.error != app.export_error {
+                app.export_error = progress.error.clone();
+                changed = true;
+            }
+        }
         if engine.is_playing() {
             tx.wake_after(Duration::from_millis(100));
             changed = true;
@@ -221,6 +269,31 @@ fn open_dialog(app: &mut App, tx: &mut Tx) {
         Ok(Some(path)) => app.open(path),
         Ok(None) => {}
         Err(error) => app.error = Some(error.to_string()),
+    });
+}
+
+fn export_dialog(app: &mut App, tx: &mut Tx) {
+    let Some(source) = &app.path else {
+        return;
+    };
+    let stem = source
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "clip".into());
+    let options = FileDialogOptions {
+        title: "Export clip".into(),
+        directory: app.last_dir.clone(),
+        file_name: Some(format!("{stem}-clip.mkv")),
+        ..Default::default()
+    }
+    .filter("Matroska", &["mkv"]);
+    let start = app.timeline.in_point;
+    let end = app.timeline.out_point;
+    let audio = app.selected_audio_index();
+    tx.save_file(options, move |app: &mut App, result, _| match result {
+        Ok(Some(path)) => app.start_export(path, start, end, audio),
+        Ok(None) => {}
+        Err(error) => app.export_error = Some(error.to_string()),
     });
 }
 
@@ -322,7 +395,7 @@ fn timeline_bar(app: &App, theme: &tok::Theme) -> El {
         format_clock(timeline.out_point)
     );
 
-    row()
+    let mut bar = row()
         .w_full()
         .padding(8.0)
         .gap(8.0)
@@ -381,7 +454,60 @@ fn timeline_bar(app: &App, theme: &tok::Theme) -> El {
                 ),
         )
         .child(button("-", false, theme).on_press(|app: &mut App| app.timeline.zoom_out()))
-        .child(button("+", false, theme).on_press(|app: &mut App| app.timeline.zoom_in()))
+        .child(button("+", false, theme).on_press(|app: &mut App| app.timeline.zoom_in()));
+
+    if let Some(job) = &app.export {
+        let progress = job.progress();
+        if progress.running {
+            bar = bar
+                .child(
+                    text(format!("{}%", (progress.fraction * 100.0).round()))
+                        .font(type_::LABEL)
+                        .color(theme.text_secondary),
+                )
+                .child(
+                    button("Cancel", false, theme)
+                        .key("cancel-export")
+                        .on_press(|app: &mut App| {
+                            if let Some(job) = &app.export {
+                                job.cancel();
+                            }
+                        }),
+                );
+        } else if progress.finished {
+            bar = bar.child(
+                text("Exported")
+                    .font(type_::LABEL)
+                    .color(theme.text_secondary),
+            );
+        } else if let Some(error) = &progress.error {
+            bar = bar.child(
+                text(error.clone())
+                    .font(type_::LABEL)
+                    .color(tok::accent(2, true)),
+            );
+        }
+    }
+
+    if app
+        .export
+        .as_ref()
+        .is_none_or(|job| !job.progress().running)
+    {
+        bar = bar
+            .child(
+                button(app.export_mode.label(), false, theme)
+                    .key("export-mode")
+                    .on_press(|app: &mut App| app.export_mode = app.export_mode.next()),
+            )
+            .child(
+                button("Export", true, theme)
+                    .key("export")
+                    .on_press_tx(|app: &mut App, tx: &mut Tx| export_dialog(app, tx)),
+            );
+    }
+
+    bar
 }
 
 fn view(app: &App, cx: &mut Cx<App>) -> El {
@@ -659,6 +785,9 @@ mod tests {
             last_dir: None,
             tracks: Vec::new(),
             timeline: Timeline::new(),
+            export: None,
+            export_mode: ExportMode::Precise,
+            export_error: None,
         };
         app.refresh_tracks();
         (app, log)
