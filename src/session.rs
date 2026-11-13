@@ -24,6 +24,7 @@ pub struct PlaybackSession {
     timeline: Timeline,
     scrubbing: bool,
     pending_seek: Option<f64>,
+    preview_target: Option<f64>,
     export: Option<ExportJob>,
     export_error: Option<String>,
 }
@@ -38,6 +39,7 @@ impl PlaybackSession {
             timeline: Timeline::new(),
             scrubbing: false,
             pending_seek: None,
+            preview_target: None,
             export: None,
             export_error: None,
         }
@@ -73,6 +75,11 @@ impl PlaybackSession {
         self.awaiting_source.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_scrubbing(&self) -> bool {
+        self.scrubbing
+    }
+
     pub fn state(&self) -> PlaybackState {
         self.engine.state()
     }
@@ -83,6 +90,10 @@ impl PlaybackSession {
 
     pub fn position(&self) -> f64 {
         self.engine.position()
+    }
+
+    pub fn is_seeking(&self) -> bool {
+        self.engine.is_seeking()
     }
 
     pub fn surface(&self) -> rune::NativeSurface {
@@ -131,31 +142,70 @@ impl PlaybackSession {
         if !seconds.is_finite() {
             return;
         }
-        if !self.engine.state().is_loaded() {
+        let state = self.engine.state();
+        let Some(seconds) = self.clamp_target(seconds, &state) else {
+            self.scrubbing = false;
+            self.pending_seek = None;
+            self.preview_target = None;
+            return;
+        };
+        let from_preview = self.scrubbing;
+        self.preview_target = None;
+        let settled = from_preview
+            && matches!(state, PlaybackState::Paused | PlaybackState::Playing)
+            && !self.engine.is_seeking()
+            && (self.engine.position() - seconds).abs() <= self.seek_tolerance();
+        if settled {
             self.scrubbing = false;
             self.pending_seek = None;
             return;
         }
-        let seconds = match self.engine.duration() {
-            Some(duration) => seconds.clamp(0.0, duration),
-            None => seconds.max(0.0),
-        };
         self.scrubbing = true;
         self.pending_seek = Some(seconds);
         self.engine.seek(seconds);
     }
 
     pub fn seek_preview(&mut self, seconds: f64) {
-        if self.engine.state().is_loaded() {
-            self.engine.seek_preview(seconds);
+        if !seconds.is_finite() {
+            return;
+        }
+        let state = self.engine.state();
+        let Some(seconds) = self.clamp_target(seconds, &state) else {
+            return;
+        };
+        // A new drag supersedes a final seek that has not landed.
+        self.scrubbing = true;
+        self.pending_seek = None;
+        self.preview_target = Some(seconds);
+        if !self.engine.is_seeking() {
+            self.issue_preview();
+        }
+    }
+
+    fn clamp_target(&self, seconds: f64, state: &PlaybackState) -> Option<f64> {
+        if !state.is_loaded() {
+            return None;
+        }
+        Some(match self.engine.duration() {
+            Some(duration) => seconds.clamp(0.0, duration),
+            None => seconds.max(0.0),
+        })
+    }
+
+    fn seek_tolerance(&self) -> f64 {
+        self.engine.frame_duration().unwrap_or(0.05)
+    }
+
+    fn issue_preview(&mut self) {
+        if let Some(target) = self.preview_target.take() {
+            self.engine.seek_preview(target);
         }
     }
 
     pub fn set_scrubbing(&mut self, scrubbing: bool) {
         self.scrubbing = scrubbing;
-        if scrubbing {
-            self.pending_seek = None;
-        }
+        self.pending_seek = None;
+        self.preview_target = None;
     }
 
     pub fn seek_fraction(&mut self, fraction: f32) {
@@ -258,12 +308,19 @@ impl PlaybackSession {
                 changed = true;
             }
             if let Some(target) = self.pending_seek {
-                let tolerance = self.engine.frame_duration().unwrap_or(0.05).max(0.05);
-                let landed = (self.engine.position() - target).abs() <= tolerance;
+                let landed = !self.engine.is_seeking()
+                    && (self.engine.position() - target).abs() <= self.seek_tolerance();
                 if landed || matches!(&state, PlaybackState::Failed(_) | PlaybackState::Empty) {
                     self.pending_seek = None;
                     self.scrubbing = false;
                 }
+            }
+            if self.scrubbing {
+                if !self.engine.is_seeking() {
+                    self.issue_preview();
+                }
+                tx.wake_after(Duration::from_millis(16));
+                changed = true;
             }
             if !self.scrubbing {
                 let position = self.engine.position();
@@ -328,6 +385,7 @@ impl PlaybackSession {
             self.timeline = Timeline::new();
             self.scrubbing = false;
             self.pending_seek = None;
+            self.preview_target = None;
             self.export = None;
             self.export_error = None;
         }
@@ -363,6 +421,7 @@ impl PlaybackSession {
             timeline: Timeline::new(),
             scrubbing: false,
             pending_seek: None,
+            preview_target: None,
             export: None,
             export_error: None,
         }

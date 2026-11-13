@@ -1,6 +1,7 @@
 # Can seeking be instant?
 
 Date: 2026-11-12
+Updated: 2026-11-13
 Status: answered
 
 ## Answer
@@ -16,40 +17,41 @@ took **about 15 ms**. A re-encode with a 10-second GOP took **387 ms** /
 scales with the distance from the previous keyframe, not with the file size or
 the cache.
 
-It is possible to make seeking *feel* instant:
+The app makes the preview truthful and as fast as the decoder allows:
 
-1. **Seek to a keyframe while the user is dragging**, then do one exact seek
-   when the pointer is released. The picture changes in roughly one frame
-   time, and the exact frame follows. This is the standard split: mpv's
-   `keyframes` flag is the fast path and `exact` is the precise path
-   (`DOCS/man/input.rst`, lines 300-326). If the GOP is long, the preview can
-   be several seconds away from the requested time; a thumbnail preview or a
-   short busy state is less misleading than a large jump.
-2. **Do not issue `absolute+exact` on every drag event.** The app now sends a
-   keyframe preview on pointer movement (`preview_fraction`, `src/app.rs`,
-   lines 132-150) and one exact seek on release (`seek_fraction`,
-   `src/app.rs`, lines 118-130). The engine exposes both paths
-   (`PlayerEngine::seek` and `PlayerEngine::seek_preview`, `src/engine.rs`,
-   lines 367-390). The preview is throttled to one per 40 ms.
-3. **Keep the exact seek for the final position and for keyboard skips.**
-   On this file a 74-140 ms pause after release is acceptable; a frozen
-   picture during the whole drag is not.
+1. **Preview exact frames while the user drags, but coalesce the seeks.** A
+   keyframe preview is fast but lands on the previous keyframe, up to one GOP
+   away, while the seek bar shows the requested time. The release exact seek
+   then lands on a different frame. The app now sends an exact seek for the
+   drag preview, keeps one seek in flight, and always sends the latest pointer
+   target. On the attached file that gives about 5 to 12 preview updates per
+   second (82 to 192 ms per exact seek with `hwdec=auto-safe`; 40 to 82 ms
+   with software decoding). On a 10-second GOP it gives about 1 to 2.5 updates
+   per second.
+2. **Keep the handle at the requested time and show that the picture is
+   catching up.** The session holds the timeline position during a scrub and
+   does not sync it from `time-pos` until the final seek lands. The seek bar
+   dims its handle while an exact seek is in flight.
+3. **Keep the exact seek for the final position and for keyboard skips.** On
+   release the app sends one exact seek for the release position. If the
+   preview already landed within one frame, it skips the redundant seek. The
+   export range body drag uses the same preview and final paths.
 4. **Consider software decoding for seek latency.** In this measurement,
    `hwdec=auto-safe` made precise seeks about 1.8 times slower than
    `hwdec=no` on the 2-second-GOP file, and about 2.7 times slower on the
    10-second-GOP file, with the same software render path. That is a
    measurement, not a universal rule; it should be checked with the real
    playback audio path and a 4K file before changing the default
-   (`src/engine.rs`, lines 240-244).
+   (`src/engine.rs`, lines 255-257).
 
 Truly instant exact seeking on an arbitrary file would require an all-intra
 file, a very short GOP, or a proxy/transcode. All of those change the file or
 add a preparation step; none is a property a player can add on demand to a
 normal H.264/HEVC recording.
 
-The attached file is 15 seconds long. The test session may have used a longer
-video; that source was not available. The numbers above are for the attached
-15-second file and synthetic re-encodes of it. A longer GOP on the real test
+The attached file is 15 seconds long. A longer source was not available. The
+numbers above are for the attached 15-second file and synthetic re-encodes of
+it. A longer GOP on the real test
 video would make exact seeking slower than these numbers.
 
 ## Evidence
@@ -75,17 +77,27 @@ video would make exact seeking slower than these numbers.
 - mpv's frame queue is off by default and is documented to make seeking
   slower: `--vd-queue-enable`, default `no`, `DOCS/man/options.rst`, lines
   5713-5735. The app does not enable it.
-- App seek path: `PlayerEngine::seek` sends `absolute+exact` and
-  `PlayerEngine::seek_preview` sends `absolute+keyframes`
-  (`src/engine.rs`, lines 367-390); `src/app.rs`, lines 118-150, chooses the
-  preview during a drag and the exact seek on release.
-- Drag path: `src/app.rs`, lines 814-833, calls `begin_scrub` on pointer down,
+- App seek path: `PlayerEngine::seek` and `PlayerEngine::seek_preview` both
+  send `absolute+exact` (`src/engine.rs`, lines 358-400); the engine exposes
+  the `seeking` property through `PlayerEngine::is_seeking`
+  (`src/engine.rs`, lines 398-400).
+- Drag path: `src/app.rs`, lines 801-854, calls `begin_scrub` on pointer down,
   `preview_fraction` on movement past 2 points, and `seek_fraction` on pointer
-  up. `preview_fraction` throttles engine previews to 40 ms.
+  up. The session coalesces previews in `src/session.rs`, lines 168-200, and
+  issues the next target from `poll` when the engine is idle
+  (`src/session.rs`, lines 318-323).
 - While scrubbing, the session stops syncing the timeline from `time-pos` and
-  resumes after the exact seek lands: `src/session.rs`, lines 246-280.
+  resumes after the exact seek lands: `src/session.rs`, lines 310-331.
+- The export range body drag uses the same preview path and exacts on release:
+  `src/app.rs`, lines 1291-1413.
+- Regression tests: `src/engine.rs`, lines 1045-1065, asserts a preview seek
+  to 0.25 s lands within one frame; `src/engine.rs`, lines 1067-1092, asserts
+  the release after a preview keeps that frame; `src/app.rs`, lines 2322-2341,
+  asserts the session keeps the latest target while a seek is in flight;
+  `src/app.rs`, lines 2344-2387, assert the release skip and the busy-engine
+  guard.
 - The app selects `hwdec=auto-safe` for non-headless playback and `no` for
-  headless tests: `src/engine.rs`, lines 240-244. On this machine, through the
+  headless tests: `src/engine.rs`, lines 255-257. On this machine, through the
   app's own `vo=libmpv` software-render path, mpv resolved `auto-safe` to
   `hwdec-current=vulkan-copy` for the attached H.264 file, so decoding is
   hardware-accelerated with copy-back. `hwdec=no` forces software decoding.
@@ -113,6 +125,12 @@ video would make exact seeking slower than these numbers.
   `-g 30` and `-g 600`, `-keyint_min` equal to `-g`, and
   `-sc_threshold 0`, so keyframes occur only at the requested interval.
 
+  The preview runs on the attached file took 82.0, 139.6, 192.1 and 158.7 ms
+  at 2.5, 3.0, 5.5 and 9.2 s with `hwdec=auto-safe`, and 40.5 and 82.3 ms at
+  2.5 and 5.5 s with `hwdec=no`. The keyframe runs at 2.5, 3.0, 3.5, 4.2, 5.0,
+  5.5, 6.4, 7.0 and 9.2 s landed at 1.9, 1.9, 1.9, 3.9, 3.9, 3.9, 5.9, 5.9
+  and 7.9 s. The exact runs landed on the requested times.
+
 ## Conflicts
 
 - The mpv manual says exact seeks "can take some time depending on decoding
@@ -126,8 +144,8 @@ video would make exact seeking slower than these numbers.
 - Keyframe seek is fast, but it lands on a keyframe, not on the requested
   time. The keyframe can be up to one GOP early (or, for some demuxers, the
   next keyframe). For a 2 s GOP that is at most 2 s of error; for a 10 s GOP
-  it is not acceptable as the final position. Use it for the drag preview,
-  then exact-seek on release.
+  it is not acceptable as the final position. The app does not use it for the
+  drag preview: the frame would not match the handle or the release frame.
 
 ## Not found
 
@@ -141,8 +159,6 @@ video would make exact seeking slower than these numbers.
 - No 1080p, 4K, HEVC or AV1 measurement. The cost model predicts a roughly
   linear increase with the number of frames between keyframes and with
   resolution; it was not measured.
-- No measurement of `absolute+keyframes` through the `PlayerEngine` trait.
-  The benchmark calls libmpv directly with the same render/seek options.
 
 ## References
 
@@ -153,6 +169,7 @@ video would make exact seeking slower than these numbers.
   `bcde6b93cca4d128d84e1a60d1a6db2cd81c889e`, 2026-11-09. The seek command
   and `--hr-seek` semantics live in `DOCS/man/input.rst` and
   `DOCS/man/options.rst`.
-- Kachito seek path: `src/engine.rs`, lines 367-390; `src/app.rs`, lines
-  118-150 and 814-833; `src/session.rs`, lines 246-280.
+- Kachito seek path: `src/engine.rs`, lines 358-400; `src/session.rs`, lines
+  141-200 and 310-331; `src/app.rs`, lines 127-160, 801-854 and 1291-1413.
+- Decision record: `docs/adr/0001-exact-coalesced-preview.md`.
 - Benchmark: `docs/research/seek-bench.c`. Local, not part of the product.

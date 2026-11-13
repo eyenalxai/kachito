@@ -67,7 +67,10 @@ pub trait PlayerEngine: Send {
     fn open(&mut self, path: &Path) -> Result<(), String>;
     fn toggle(&mut self);
     fn seek(&mut self, seconds: f64);
+    /// A transient seek for a scrub preview. The session coalesces these.
     fn seek_preview(&mut self, seconds: f64);
+    /// True while the player is seeking or restarting playback.
+    fn is_seeking(&self) -> bool;
     fn set_volume(&mut self, volume: f32);
     fn set_speed(&mut self, speed: f32);
     fn position(&self) -> f64;
@@ -162,6 +165,9 @@ impl PlayerEngine for MpvEngine {
     fn seek_preview(&mut self, seconds: f64) {
         self.core.seek_preview(seconds);
     }
+    fn is_seeking(&self) -> bool {
+        self.core.is_seeking()
+    }
     fn set_volume(&mut self, volume: f32) {
         self.core.set_volume(volume);
     }
@@ -219,21 +225,6 @@ struct Core {
     frames: AtomicU64,
     #[cfg(test)]
     last_seek_flags: Mutex<Option<String>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SeekMode {
-    Exact,
-    Keyframe,
-}
-
-impl SeekMode {
-    fn flags(self) -> &'static str {
-        match self {
-            Self::Exact => "absolute+exact",
-            Self::Keyframe => "absolute+keyframes",
-        }
-    }
 }
 
 unsafe impl Send for Core {}
@@ -368,7 +359,7 @@ impl Core {
         if !seconds.is_finite() {
             return;
         }
-        self.seek_with(seconds, SeekMode::Exact);
+        self.seek_exact(seconds);
         let mut state = self.state.lock().unwrap();
         if matches!(*state, PlaybackState::Ended) {
             *state = PlaybackState::Paused;
@@ -379,12 +370,12 @@ impl Core {
         if !seconds.is_finite() {
             return;
         }
-        self.seek_with(seconds, SeekMode::Keyframe);
+        self.seek_exact(seconds);
     }
 
-    fn seek_with(&self, seconds: f64, mode: SeekMode) {
+    fn seek_exact(&self, seconds: f64) {
         let seconds = seconds.max(0.0);
-        let flags = mode.flags();
+        let flags = "absolute+exact";
         let _ = self.command(&["seek", &format!("{seconds:.3}"), flags]);
         #[cfg(test)]
         {
@@ -402,6 +393,10 @@ impl Core {
 
     fn position(&self) -> f64 {
         self.get_double("time-pos").unwrap_or(0.0).max(0.0)
+    }
+
+    fn is_seeking(&self) -> bool {
+        self.get_flag("seeking").unwrap_or(false)
     }
 
     fn duration(&self) -> Option<f64> {
@@ -1047,6 +1042,55 @@ mod tests {
     }
 
     #[test]
+    fn a_preview_seek_lands_on_the_requested_frame() {
+        let mut engine = MpvEngine::new(true).unwrap();
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_frame(&engine);
+
+        engine.toggle();
+        thread::sleep(Duration::from_millis(150));
+        let frames = engine.frames();
+
+        // rgbw.mkv has keyframes at 0.0, 0.5 and 0.75 s. 0.25 s is between
+        // the first two keyframes, so a keyframe seek cannot show it.
+        engine.seek_preview(0.25);
+        wait_for_frame_count(&engine, frames + 1);
+
+        let landed = engine.position();
+        assert!(
+            (landed - 0.25).abs() <= 1.0 / 8.0,
+            "the preview landed at {landed:.3} s instead of the requested 0.250 s"
+        );
+    }
+
+    #[test]
+    fn a_release_after_a_preview_keeps_the_preview_frame() {
+        let mut engine = MpvEngine::new(true).unwrap();
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_frame(&engine);
+        engine.toggle();
+        thread::sleep(Duration::from_millis(150));
+
+        engine.seek_preview(0.25);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (engine.position() - 0.25).abs() > 1.0 / 8.0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let preview = engine.position();
+
+        engine.seek(0.25);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (engine.position() - 0.25).abs() > 1.0 / 8.0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let released = engine.position();
+        assert!(
+            (released - preview).abs() <= 1.0 / 8.0,
+            "the release landed at {released:.3} s after a {preview:.3} s preview"
+        );
+    }
+
+    #[test]
     fn a_preview_seek_pushes_a_frame_without_changing_state() {
         let mut engine = MpvEngine::new(true).unwrap();
         engine.open(&fixture("rgbw.mkv")).unwrap();
@@ -1060,10 +1104,7 @@ mod tests {
         let frames = engine.frames();
 
         engine.seek_preview(0.5);
-        assert_eq!(
-            engine.last_seek_flags().as_deref(),
-            Some("absolute+keyframes")
-        );
+        assert_eq!(engine.last_seek_flags().as_deref(), Some("absolute+exact"));
         wait_for_frame_count(&engine, frames + 1);
 
         assert_eq!(engine.state(), state_before);
