@@ -81,6 +81,21 @@ impl PlaybackState {
     }
 }
 
+/// A command or property write whose arguments name its log line and failure.
+enum Action<'a> {
+    Command(&'a [&'a str]),
+    Property { name: &'a str, value: &'a str },
+}
+
+impl Action<'_> {
+    fn describe(&self) -> String {
+        match self {
+            Self::Command(args) => args.join(" "),
+            Self::Property { name, value } => format!("{name} = {value}"),
+        }
+    }
+}
+
 /// What the UI needs from a playback backend.
 pub trait PlayerEngine: Send {
     fn open(&mut self, path: &Path) -> Result<(), String>;
@@ -227,7 +242,7 @@ impl PlayerEngine for MpvEngine {
         self.surface.set_waker(waker);
     }
     fn take_command_failure(&mut self) -> Option<String> {
-        self.core.take_failure()
+        self.core.failure.lock().unwrap().take()
     }
 }
 
@@ -245,6 +260,8 @@ struct Core {
     log: Arc<RunLog>,
     state: Mutex<PlaybackState>,
     ready_reported: AtomicBool,
+    end_reported: AtomicBool,
+    failure: Mutex<Option<String>>,
     waker: Mutex<Option<Waker>>,
     #[cfg(test)]
     frames: AtomicU64,
@@ -293,11 +310,8 @@ impl Core {
                 .collect::<Vec<_>>()
                 .join(" ");
             log.info(format!("options: {summary}"));
-            if let Err(error) = check(mpv::mpv_initialize(handle), "libmpv initialize") {
-                log.warn(format!("startup failed: {error}"));
-                mpv::mpv_terminate_destroy(handle);
-                return Err(error);
-            }
+            // The handle accepts the log request before initialization, so
+            // warnings emitted while the core starts are not lost.
             let warn = CString::new("warn").unwrap();
             if let Err(error) = check(
                 mpv::mpv_request_log_messages(handle, warn.as_ptr()),
@@ -305,11 +319,18 @@ impl Core {
             ) {
                 log.warn(format!("could not request mpv log messages: {error}"));
             }
+            if let Err(error) = check(mpv::mpv_initialize(handle), "libmpv initialize") {
+                log.warn(format!("startup failed: {error}"));
+                mpv::mpv_terminate_destroy(handle);
+                return Err(error);
+            }
             let core = Self {
                 handle,
                 log,
                 state: Mutex::new(PlaybackState::Empty),
                 ready_reported: AtomicBool::new(false),
+                end_reported: AtomicBool::new(false),
+                failure: Mutex::new(None),
                 waker: Mutex::new(None),
                 #[cfg(test)]
                 frames: AtomicU64::new(0),
@@ -349,6 +370,7 @@ impl Core {
     fn open(&self, path: &Path) -> Result<(), String> {
         let path = path.to_str().ok_or("the file path is not valid UTF-8")?;
         self.log.info(format!("load: {path}"));
+        self.end_reported.store(false, Ordering::Relaxed);
         self.set_state(PlaybackState::Loading);
         match self.command(&["loadfile", path]) {
             Ok(()) => Ok(()),
@@ -357,10 +379,6 @@ impl Core {
                 Err(error)
             }
         }
-    }
-
-    fn take_failure(&self) -> Option<String> {
-        self.log.take_failure()
     }
 
     fn current_path(&self) -> Option<PathBuf> {
@@ -593,7 +611,7 @@ impl Core {
                     if message.log_level > mpv::LOG_LEVEL_WARN {
                         continue;
                     }
-                    self.log.mpv(
+                    self.log.record_mpv_message(
                         &text_at(message.level),
                         &text_at(message.prefix),
                         &text_at(message.text),
@@ -603,18 +621,15 @@ impl Core {
                 mpv::EVENT_END_FILE => {
                     let data = unsafe { (*event).data };
                     if data.is_null() {
-                        self.log.info("end of file: unknown");
+                        self.log_end_of_file("unknown");
                         self.set_state(PlaybackState::Failed("the file ended unexpectedly".into()));
                     } else {
                         let end = unsafe { &*(data as *const mpv::EventEndFile) };
                         let reason = end_reason(end.reason);
                         if end.reason == mpv::END_FILE_REASON_ERROR {
-                            self.log.info(format!(
-                                "end of file: {reason}: {}",
-                                error_string(end.error)
-                            ));
+                            self.log_end_of_file(&format!("{reason}: {}", error_string(end.error)));
                         } else {
-                            self.log.info(format!("end of file: {reason}"));
+                            self.log_end_of_file(&reason);
                         }
                         if end.reason == mpv::END_FILE_REASON_ERROR {
                             self.set_state(PlaybackState::Failed(error_string(end.error)));
@@ -628,35 +643,68 @@ impl Core {
                 _ => {}
             }
         }
+        self.observe_natural_eof();
+    }
+
+    /// With keep-open, a natural end pauses at the last frame and emits no
+    /// END_FILE event, so the eof-reached property is the only signal.
+    fn observe_natural_eof(&self) {
+        let state = self.state.lock().unwrap().clone();
+        if !matches!(
+            state,
+            PlaybackState::Ready | PlaybackState::Playing | PlaybackState::Paused
+        ) {
+            return;
+        }
+        if self.get_flag("eof-reached").unwrap_or(false) {
+            if !self.end_reported.swap(true, Ordering::Relaxed) {
+                self.log.info("end of file: eof");
+                self.set_state(PlaybackState::Ended);
+            }
+        } else {
+            self.end_reported.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn log_end_of_file(&self, reason: &str) {
+        if !self.end_reported.swap(true, Ordering::Relaxed) {
+            self.log.info(format!("end of file: {reason}"));
+        }
     }
 
     fn command(&self, args: &[&str]) -> Result<(), String> {
         self.log.command(args);
+        let action = Action::Command(args);
         let strings: Vec<CString> = match args
             .iter()
             .map(|arg| CString::new(*arg))
             .collect::<Result<_, _>>()
         {
             Ok(strings) => strings,
-            Err(_) => {
-                let error = "an argument contains a NUL byte";
-                self.log.command_failed(args, error);
-                return Err(format!("{}: {error}", args.join(" ")));
-            }
+            Err(_) => return self.record_failure(&action, "an argument contains a NUL byte"),
         };
         let mut pointers: Vec<*const c_char> = strings.iter().map(|arg| arg.as_ptr()).collect();
         pointers.push(ptr::null());
         let code = unsafe { mpv::mpv_command(self.handle, pointers.as_ptr()) };
-        self.finish(args, code)
+        self.record_if_failed(&action, code)
     }
 
-    fn finish(&self, args: &[&str], code: c_int) -> Result<(), String> {
+    /// Logs and stores a failure when the return code is negative.
+    fn record_if_failed(&self, action: &Action, code: c_int) -> Result<(), String> {
         if code >= 0 {
             return Ok(());
         }
-        let error = error_string(code);
-        self.log.command_failed(args, &error);
-        Err(format!("{}: {error}", args.join(" ")))
+        self.record_failure(action, &error_string(code))
+    }
+
+    fn record_failure(&self, action: &Action, error: &str) -> Result<(), String> {
+        let failure = format!("{}: {error}", action.describe());
+        match action {
+            Action::Command(_) => self.log.command_failed(&failure),
+            Action::Property { .. } => self.log.property_failed(&failure),
+        }
+        *self.failure.lock().unwrap() = Some(failure.clone());
+        Err(failure)
     }
 
     fn record_property(
@@ -666,11 +714,11 @@ impl Core {
         format: c_int,
         data: *mut c_void,
     ) -> Result<(), String> {
-        let args = ["set", name, text];
-        self.log.command(&args);
+        let action = Action::Property { name, value: text };
+        self.log.property_write(name, text);
         let name = CString::new(name).unwrap();
         let code = unsafe { mpv::mpv_set_property(self.handle, name.as_ptr(), format, data) };
-        self.finish(&args, code)
+        self.record_if_failed(&action, code)
     }
 
     fn set_double(&self, name: &str, value: f64) -> Result<(), String> {
@@ -998,7 +1046,6 @@ mod mpv {
         pub fn mpv_initialize(ctx: *mut Handle) -> c_int;
         pub fn mpv_command(ctx: *mut Handle, args: *const *const c_char) -> c_int;
         pub fn mpv_request_log_messages(ctx: *mut Handle, min_level: *const c_char) -> c_int;
-        pub fn mpv_client_api_version() -> c_ulong;
         pub fn mpv_set_property(
             ctx: *mut Handle,
             name: *const c_char,
@@ -1159,18 +1206,42 @@ mod tests {
     }
 
     #[test]
-    fn rejected_volume_and_speed_commands_are_recorded() {
+    fn rejected_volume_and_speed_property_writes_are_recorded() {
         let (log, _sink, path) = crate::log::testing::log_to_file("engine-properties");
-        let engine = MpvEngine::new(true, log).unwrap();
+        let mut engine = MpvEngine::new(true, log).unwrap();
         let volume_error = engine.core.set_double("volume", f64::NAN).unwrap_err();
         assert!(volume_error.contains("volume"), "{volume_error}");
+        let failure = engine.take_command_failure().expect("a stored failure");
+        assert!(failure.starts_with("volume = NaN: "), "{failure}");
         let speed_error = engine.core.set_double("speed", 0.0).unwrap_err();
         assert!(speed_error.contains("speed"), "{speed_error}");
+        let failure = engine.take_command_failure().expect("a stored failure");
+        assert!(failure.starts_with("speed = 0: "), "{failure}");
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("command failed: set volume NaN"), "{text}");
-        assert!(text.contains("command failed: set speed 0"), "{text}");
+        assert!(
+            text.contains("property write failed: volume = NaN"),
+            "{text}"
+        );
+        assert!(text.contains("property write failed: speed = 0"), "{text}");
+        assert!(!text.contains("command: set volume"), "{text}");
+        assert!(!text.contains("command: set speed"), "{text}");
         drop(engine);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_failure_is_stored_once_when_the_log_is_off() {
+        let mut engine = MpvEngine::new(true, quiet()).unwrap();
+        engine
+            .core
+            .command(&["seek", "not-a-time", "absolute"])
+            .unwrap_err();
+        let failure = engine.take_command_failure().expect("a stored failure");
+        assert!(
+            failure.starts_with("seek not-a-time absolute: "),
+            "{failure}"
+        );
+        assert_eq!(engine.take_command_failure(), None);
     }
 
     #[test]
@@ -1184,26 +1255,37 @@ mod tests {
         engine.set_speed(1.25);
         engine.seek_preview(0.5);
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("command: set pause "), "{text}");
-        assert!(text.contains("command: set volume 40"), "{text}");
-        assert!(text.contains("command: set speed 1.25"), "{text}");
+        assert!(text.contains("property write: pause = yes"), "{text}");
+        assert!(text.contains("property write: volume = 40"), "{text}");
+        assert!(text.contains("property write: speed = 1.25"), "{text}");
         assert!(
             text.contains("command: seek 0.500 absolute+exact"),
             "{text}"
         );
+        assert!(!text.contains("command: set pause"), "{text}");
         drop(engine);
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn the_run_log_records_the_end_of_file_reason() {
+    fn the_run_log_records_a_natural_end_of_file_once() {
         let (log, _sink, path) = crate::log::testing::log_to_file("engine-eof");
         let mut engine = MpvEngine::new(true, log).unwrap();
-        engine.core.set_flag("keep-open", false).unwrap();
+        assert_eq!(engine.core.get_flag("keep-open"), Some(true));
         engine.open(&fixture("rgbw.mkv")).unwrap();
         wait_for_ended(&engine);
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("end of file: eof"), "{text}");
+        assert_eq!(text.matches("end of file: eof").count(), 1, "{text}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains("end of file:"))
+                .count(),
+            1,
+            "{text}"
+        );
+        let lines = our_lines(&path);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(lines, our_lines(&path), "the eof check wrote per frame");
         drop(engine);
         let _ = std::fs::remove_file(path);
     }

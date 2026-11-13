@@ -1476,6 +1476,7 @@ mod tests {
         position: f64,
         duration: f64,
         command_failure: Option<String>,
+        open_error: Option<String>,
     }
 
     impl Default for FakeLog {
@@ -1497,6 +1498,7 @@ mod tests {
                 position: 0.0,
                 duration: 10.0,
                 command_failure: None,
+                open_error: None,
             }
         }
     }
@@ -1508,8 +1510,12 @@ mod tests {
 
     impl PlayerEngine for Fake {
         fn open(&mut self, path: &std::path::Path) -> Result<(), String> {
-            self.log.lock().unwrap().opened = Some(path.to_path_buf());
-            Ok(())
+            let mut log = self.log.lock().unwrap();
+            log.opened = Some(path.to_path_buf());
+            match log.open_error.clone() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
         fn toggle(&mut self) {
             let mut log = self.log.lock().unwrap();
@@ -1683,6 +1689,66 @@ mod tests {
             !shows_text(&runtime, "seek 5.000"),
             "a second rejection is quiet"
         );
+    }
+
+    #[test]
+    fn the_newest_notice_wins() {
+        let (app, log) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+
+        log.lock().unwrap().command_failure = Some("set volume 40: rejected".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(shows_text(&runtime, "set volume 40"));
+
+        runtime.state.set_export_error("the export failed".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(shows_text(&runtime, "the export failed"));
+        assert!(!shows_text(&runtime, "set volume 40"));
+
+        log.lock().unwrap().state = PlaybackState::Failed("the engine failed".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(shows_text(&runtime, "the engine failed"));
+        assert!(!shows_text(&runtime, "the export failed"));
+
+        log.lock().unwrap().state = PlaybackState::Paused;
+        runtime
+            .state
+            .set_export_error("the newer export failed".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(shows_text(&runtime, "the newer export failed"));
+        assert!(!shows_text(&runtime, "the engine failed"));
+    }
+
+    #[test]
+    fn a_rejected_load_does_not_consume_the_command_notice() {
+        let dir = temp_dir("rejected-load-notice");
+        let corrupt = dir.join("corrupt.mkv");
+        std::fs::write(&corrupt, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        {
+            let mut log = log.lock().unwrap();
+            log.state = PlaybackState::Loading;
+            log.open_error = Some("loadfile rejected".into());
+            log.command_failure = Some("loadfile corrupt.mkv: loading failed".into());
+        }
+        assert!(session_mut(&mut app).open(corrupt).is_err());
+        log.lock().unwrap().state = PlaybackState::Failed("loadfile rejected".into());
+
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        assert!(shows_text(&runtime, "loadfile rejected"));
+        assert!(!shows_text(&runtime, "The player could not apply"));
+
+        log.lock().unwrap().command_failure = Some("set volume 40: rejected".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(
+            shows_text(&runtime, "set volume 40"),
+            "the later rejection gets the one notice"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

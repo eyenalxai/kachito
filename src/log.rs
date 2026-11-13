@@ -69,6 +69,31 @@ impl LogSink for StderrSink {
 /// The cap for the state-directory file. One line records when it is reached.
 pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineKind {
+    Info,
+    Warn,
+    Command,
+    CommandFailed,
+    PropertyWrite,
+    PropertyFailed,
+    Mpv,
+}
+
+impl LineKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Command => "command",
+            Self::CommandFailed => "command failed",
+            Self::PropertyWrite => "property write",
+            Self::PropertyFailed => "property write failed",
+            Self::Mpv => "mpv",
+        }
+    }
+}
+
 struct FileSink {
     file: Option<std::fs::File>,
     written: u64,
@@ -80,7 +105,6 @@ pub struct RunLog {
     file: std::sync::Mutex<FileSink>,
     sink: Option<std::sync::Arc<dyn LogSink>>,
     limit: u64,
-    last_failure: std::sync::Mutex<Option<String>>,
 }
 
 impl RunLog {
@@ -101,7 +125,6 @@ impl RunLog {
             }),
             sink: None,
             limit: MAX_FILE_BYTES,
-            last_failure: std::sync::Mutex::new(None),
         }
     }
 
@@ -138,7 +161,6 @@ impl RunLog {
             }),
             sink: config.stderr.then_some(sink),
             limit,
-            last_failure: std::sync::Mutex::new(None),
         };
         if let Some(error) = open_error {
             log.warn(format!("run log file unavailable: {error}"));
@@ -147,34 +169,36 @@ impl RunLog {
     }
 
     pub fn info(&self, message: impl AsRef<str>) {
-        self.write("info", message.as_ref());
+        self.write(LineKind::Info, message.as_ref());
     }
 
     pub fn warn(&self, message: impl AsRef<str>) {
-        self.write("warn", message.as_ref());
+        self.write(LineKind::Warn, message.as_ref());
     }
 
     pub fn command(&self, args: &[&str]) {
-        self.write("command", &args.join(" "));
+        self.write(LineKind::Command, &args.join(" "));
     }
 
-    pub fn command_failed(&self, args: &[&str], error: &str) {
-        let failure = format!("{}: {error}", args.join(" "));
-        self.write("command failed", &failure);
-        *self.last_failure.lock().unwrap() = Some(failure);
+    pub fn command_failed(&self, failure: &str) {
+        self.write(LineKind::CommandFailed, failure);
     }
 
-    pub fn mpv(&self, level: &str, prefix: &str, text: &str) {
+    pub fn property_write(&self, name: &str, value: &str) {
+        self.write(LineKind::PropertyWrite, &format!("{name} = {value}"));
+    }
+
+    pub fn property_failed(&self, failure: &str) {
+        self.write(LineKind::PropertyFailed, failure);
+    }
+
+    pub fn record_mpv_message(&self, level: &str, prefix: &str, text: &str) {
         let text = text.trim_end();
-        self.write("mpv", &format!("{level} {prefix}: {text}"));
+        self.write(LineKind::Mpv, &format!("{level} {prefix}: {text}"));
     }
 
-    pub fn take_failure(&self) -> Option<String> {
-        self.last_failure.lock().unwrap().take()
-    }
-
-    fn write(&self, level: &str, message: &str) {
-        let line = format!("{level}: {message}");
+    fn write(&self, kind: LineKind, message: &str) {
+        let line = format!("{}: {message}", kind.label());
         let cap = self.write_file(&line);
         if let Some(sink) = &self.sink {
             sink.write_line(&line);
@@ -281,7 +305,10 @@ mod tests {
         log.info("one");
         log.warn("two");
         log.command(&["seek", "1.000", "absolute"]);
-        log.command_failed(&["set", "volume", "NaN"], "invalid parameter");
+        log.command_failed("seek 1.000 absolute: invalid parameter");
+        log.property_write("volume", "NaN");
+        log.property_failed("volume = NaN: invalid parameter");
+        log.record_mpv_message("warn", "cplayer", "a warning");
 
         let file = std::fs::read_to_string(&path).unwrap();
         let captured = sink.lines();
@@ -289,7 +316,10 @@ mod tests {
         assert!(file.contains("info: one"));
         assert!(file.contains("warn: two"));
         assert!(file.contains("command: seek 1.000 absolute"));
-        assert!(file.contains("command failed: set volume NaN: invalid parameter"));
+        assert!(file.contains("command failed: seek 1.000 absolute: invalid parameter"));
+        assert!(file.contains("property write: volume = NaN"));
+        assert!(file.contains("property write failed: volume = NaN: invalid parameter"));
+        assert!(file.contains("mpv: warn cplayer: a warning"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -344,29 +374,6 @@ mod tests {
             "stderr keeps receiving lines after the file cap"
         );
         let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn a_failure_is_stored_and_taken_once() {
-        let (log, _sink, path) = testing::log_to_file("failure");
-        assert_eq!(log.take_failure(), None);
-        log.command_failed(&["set", "speed", "0"], "invalid parameter");
-        assert_eq!(
-            log.take_failure().as_deref(),
-            Some("set speed 0: invalid parameter")
-        );
-        assert_eq!(log.take_failure(), None);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn a_failure_is_stored_when_both_sinks_are_off() {
-        let log = RunLog::disabled();
-        log.command_failed(&["set", "pause", "yes"], "rejected");
-        assert_eq!(
-            log.take_failure().as_deref(),
-            Some("set pause yes: rejected")
-        );
     }
 }
 
