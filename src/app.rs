@@ -9,12 +9,10 @@ use rune::{
     SurfaceFit, Transition, Tx, Waker, col, el, icon, row, text,
 };
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 const SPEEDS: &[f32] = &[0.5, 1.0, 1.25, 1.5, 2.0];
 const HIDE_AFTER: f64 = 2.5;
 const SKIP: f64 = 10.0;
-const PREVIEW_INTERVAL: Duration = Duration::from_millis(40);
 const SCRUB_THRESHOLD: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +36,6 @@ struct App {
     transport_hovered: bool,
     activity: bool,
     last_activity: f64,
-    last_preview: Option<Instant>,
     drop_hover: bool,
     title_source: Option<PathBuf>,
 }
@@ -74,7 +71,6 @@ impl App {
             transport_hovered: false,
             activity: false,
             last_activity: 0.0,
-            last_preview: None,
             drop_hover: false,
             title_source: None,
         }
@@ -125,25 +121,19 @@ impl App {
         let time = f64::from(fraction.clamp(0.0, 1.0)) * duration;
         session.seek(time);
         session.timeline_mut().set_position(time);
-        self.last_preview = None;
         self.touch();
     }
 
     fn preview_fraction(&mut self, fraction: f32) {
-        let Some(session) = &mut self.session else {
+        let Some(duration) = self.session.as_ref().and_then(|session| session.duration()) else {
             return;
         };
-        let Some(duration) = session.duration() else {
-            return;
-        };
-        let time = f64::from(fraction.clamp(0.0, 1.0)) * duration;
-        session.timeline_mut().set_position(time);
-        let now = Instant::now();
-        let due = self
-            .last_preview
-            .is_none_or(|last| now.duration_since(last) >= PREVIEW_INTERVAL);
-        if due {
-            self.last_preview = Some(now);
+        self.preview_to(f64::from(fraction.clamp(0.0, 1.0)) * duration);
+    }
+
+    fn preview_to(&mut self, time: f64) {
+        if let Some(session) = &mut self.session {
+            session.timeline_mut().set_position(time);
             session.seek_preview(time);
         }
         self.touch();
@@ -153,7 +143,6 @@ impl App {
         if let Some(session) = &mut self.session {
             session.set_scrubbing(true);
         }
-        self.last_preview = None;
         self.touch();
     }
 
@@ -162,7 +151,6 @@ impl App {
             session.seek(time);
             session.timeline_mut().set_position(time);
         }
-        self.last_preview = None;
         self.touch();
     }
 
@@ -176,7 +164,6 @@ impl App {
         let time = (session.timeline().position() + delta).clamp(0.0, duration);
         session.seek(time);
         session.timeline_mut().set_position(time);
-        self.last_preview = None;
         self.touch();
     }
 
@@ -812,6 +799,10 @@ fn transport(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
 }
 
 fn seek_bar(app: &App, fraction: f32, duration: f64, theme: &Palette) -> El {
+    let seeking = app
+        .session
+        .as_ref()
+        .is_some_and(|session| session.is_seeking());
     el().key("seek")
         .w_full()
         .h(20.0)
@@ -842,7 +833,17 @@ fn seek_bar(app: &App, fraction: f32, duration: f64, theme: &Palette) -> El {
                         .radius(2.0)
                         .fill(theme.accent),
                 )
-                .child(el().w(10.0).h(10.0).radius(5.0).fill(theme.accent))
+                .child(
+                    el().key("seek-handle")
+                        .w(10.0)
+                        .h(10.0)
+                        .radius(5.0)
+                        .fill(if seeking {
+                            theme.accent.alpha(0.55)
+                        } else {
+                            theme.accent
+                        }),
+                )
                 .child(
                     el().grow((1.0 - fraction).max(0.001))
                         .h(4.0)
@@ -1328,7 +1329,9 @@ fn range_bar(timeline: &crate::timeline::Timeline, theme: &Palette) -> El {
             match drag.data as i32 {
                 1 => app.set_in(time),
                 2 => app.set_out(time),
-                _ => app.seek_to(time),
+                _ if matches!(drag.phase, Phase::Up) => app.seek_to(time),
+                _ if matches!(drag.phase, Phase::Down) => {}
+                _ => app.preview_to(time),
             }
         })
         .role("slider")
@@ -1460,6 +1463,7 @@ mod tests {
         last_seek: Option<f64>,
         last_preview_seek: Option<f64>,
         preview_seeks: usize,
+        seeking: bool,
         volume: Option<f32>,
         speed: Option<f32>,
         opened: Option<PathBuf>,
@@ -1479,6 +1483,7 @@ mod tests {
                 last_seek: None,
                 last_preview_seek: None,
                 preview_seeks: 0,
+                seeking: false,
                 volume: None,
                 speed: None,
                 opened: None,
@@ -1516,6 +1521,9 @@ mod tests {
             let mut log = self.log.lock().unwrap();
             log.last_preview_seek = Some(seconds);
             log.preview_seeks += 1;
+        }
+        fn is_seeking(&self) -> bool {
+            self.log.lock().unwrap().seeking
         }
         fn set_volume(&mut self, volume: f32) {
             self.log.lock().unwrap().volume = Some(volume);
@@ -2209,6 +2217,62 @@ mod tests {
     }
 
     #[test]
+    fn the_seek_handle_dims_while_the_engine_seeks() {
+        let (mut app, log) = app_with_fake();
+        session_mut(&mut app)
+            .timeline_mut()
+            .set_duration(10.0, 1.0 / 60.0);
+        log.lock().unwrap().seeking = true;
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+
+        let fill = |runtime: &Runtime<App>| {
+            runtime
+                .elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some("seek-handle"))
+                .expect("the seek handle")
+                .fill
+        };
+        let palette = ui::palette();
+        assert_eq!(fill(&runtime), palette.accent.alpha(0.55));
+
+        log.lock().unwrap().seeking = false;
+        runtime.pointer_move(10.0, 10.0);
+        for _ in 0..60 {
+            runtime.frame(1.0 / 60.0);
+        }
+        assert!(fill(&runtime).a > 0.99);
+    }
+
+    #[test]
+    fn the_export_range_body_previews_and_then_seeks_exactly() {
+        let (mut app, log) = app_with_fake();
+        session_mut(&mut app)
+            .timeline_mut()
+            .set_duration(10.0, 1.0 / 60.0);
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.frame(0.0);
+        click(&mut runtime, "export-toggle");
+        runtime.frame(0.2);
+
+        let [x, y, w, h] = rect(&runtime, "range");
+        let y = y + h / 2.0;
+        runtime.pointer_down(x + w * 0.2, y);
+        runtime.frame(1.0 / 60.0);
+        runtime.pointer_move(x + w * 0.6, y);
+        runtime.frame(1.0 / 60.0);
+        runtime.pointer_up(x + w * 0.6, y);
+        runtime.frame(1.0 / 60.0);
+
+        let preview = log.lock().unwrap().last_preview_seek.expect("a preview");
+        assert!((preview - 6.0).abs() < 1e-4);
+        let exact = log.lock().unwrap().last_seek.expect("an exact seek");
+        assert!((exact - 6.0).abs() < 1e-4);
+    }
+
+    #[test]
     fn the_seek_bar_follows_the_timeline_not_the_engine_during_a_scrub() {
         let (mut app, log) = app_with_fake();
         log.lock().unwrap().position = 0.0;
@@ -2255,19 +2319,71 @@ mod tests {
     }
 
     #[test]
-    fn preview_seeks_are_throttled_but_the_timeline_still_moves() {
+    fn preview_requests_keep_the_latest_target_while_the_engine_seeks() {
         let (mut app, log) = app_with_fake();
-        let playback = session_mut(&mut app);
-        playback.timeline_mut().set_duration(10.0, 1.0 / 60.0);
+        session_mut(&mut app)
+            .timeline_mut()
+            .set_duration(10.0, 1.0 / 60.0);
+        log.lock().unwrap().seeking = true;
 
-        app.last_preview = Some(Instant::now());
-        app.preview_fraction(0.5);
+        app.preview_fraction(0.2);
+        app.preview_fraction(0.4);
+        app.preview_fraction(0.6);
         assert_eq!(log.lock().unwrap().preview_seeks, 0);
-        assert_eq!(session(&app).timeline().position(), 5.0);
+        assert!((session(&app).timeline().position() - 6.0).abs() < 1e-4);
 
-        app.last_preview = None;
-        app.preview_fraction(0.5);
+        log.lock().unwrap().seeking = false;
+        let mut tx = Tx::default();
+        session_mut(&mut app).poll(&mut tx);
         assert_eq!(log.lock().unwrap().preview_seeks, 1);
+        let preview = log.lock().unwrap().last_preview_seek.expect("a preview");
+        assert!((preview - 6.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_release_onto_the_landed_frame_skips_the_exact_seek() {
+        let (mut app, log) = app_with_fake();
+        session_mut(&mut app)
+            .timeline_mut()
+            .set_duration(10.0, 1.0 / 60.0);
+        log.lock().unwrap().position = 5.0;
+        session_mut(&mut app).set_scrubbing(true);
+
+        session_mut(&mut app).seek(5.0);
+        assert_eq!(log.lock().unwrap().last_seek, None);
+
+        let mut tx = Tx::default();
+        session_mut(&mut app).poll(&mut tx);
+        assert!((session(&app).timeline().position() - 5.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_busy_engine_keeps_the_release_seek_pending() {
+        let (mut app, log) = app_with_fake();
+        session_mut(&mut app)
+            .timeline_mut()
+            .set_duration(10.0, 1.0 / 60.0);
+        {
+            let mut log = log.lock().unwrap();
+            log.position = 5.0;
+            log.seeking = true;
+        }
+        let session = session_mut(&mut app);
+        session.set_scrubbing(true);
+        session.seek(5.0);
+        assert!(session.is_scrubbing());
+
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert!(
+            session.is_scrubbing(),
+            "the busy engine cleared the release seek"
+        );
+
+        log.lock().unwrap().seeking = false;
+        session.poll(&mut tx);
+        assert!(!session.is_scrubbing());
+        assert!((session.timeline().position() - 5.0).abs() < 1e-4);
     }
 
     #[test]
@@ -2277,6 +2393,23 @@ mod tests {
         runtime.frame(0.0);
 
         click(&mut runtime, "seek");
+
+        assert_eq!(log.lock().unwrap().last_preview_seek, None);
+        assert_eq!(log.lock().unwrap().last_seek, Some(5.0));
+    }
+
+    #[test]
+    fn a_click_on_the_export_range_body_does_not_preview() {
+        let (mut app, log) = app_with_fake();
+        session_mut(&mut app)
+            .timeline_mut()
+            .set_duration(10.0, 1.0 / 60.0);
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.frame(0.0);
+        click(&mut runtime, "export-toggle");
+        runtime.frame(0.2);
+
+        click(&mut runtime, "range");
 
         assert_eq!(log.lock().unwrap().last_preview_seek, None);
         assert_eq!(log.lock().unwrap().last_seek, Some(5.0));
