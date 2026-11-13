@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libmpv, ffmpeg and Vulkan
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg \
+            libmpv-dev \
+            libvulkan1 \
+            mesa-vulkan-drivers \
+            pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Choose the software Vulkan driver
+        id: vulkan
+        run: |
+          driver=""
+          if [ -d /usr/share/vulkan/icd.d ]; then
+            driver="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
+          fi
+          if [ -n "$driver" ]; then
+            echo "VK_DRIVER_FILES=$driver" >> "$GITHUB_ENV"
+            echo "VK_ICD_FILENAMES=$driver" >> "$GITHUB_ENV"
+            echo "Headless snapshot driver: $driver" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::No software Vulkan driver found; skipping the headless snapshot test."
+            echo "Headless snapshot skipped: the runner has no software Vulkan driver (lavapipe)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Run the test suite
+        run: |
+          if [ "${{ steps.vulkan.outputs.skipped }}" = "true" ]; then
+            cargo test -- --skip a_headless_snap_contains_a_video_frame
+          else
+            cargo test
+          fi

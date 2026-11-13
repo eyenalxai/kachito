@@ -7,6 +7,9 @@ license = "MIT"
 [dependencies]
 rune = { git = "https://github.com/anomalyco/rune", rev = "f18ead891aba2437674cd8c54e238287cceb8b3a", features = ["native-file-dialog"] }
 
+[build-dependencies]
+pkg-config = "0.3"
+
 [dev-dependencies]
 png = "0.18"
 
