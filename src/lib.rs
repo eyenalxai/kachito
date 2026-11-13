@@ -1,6 +1,7 @@
 pub mod app;
 pub mod engine;
 pub mod export;
+pub mod log;
 pub mod session;
 pub mod timeline;
 pub mod ui;

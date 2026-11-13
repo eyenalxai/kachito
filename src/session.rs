@@ -2,9 +2,11 @@
 
 use crate::engine::{PlaybackState, PlayerEngine, Track, TrackKind};
 use crate::export::{AudioSelection, ExportJob, ExportMode, ExportRequest, ExportState};
+use crate::log::RunLog;
 use crate::timeline::Timeline;
 use rune::Tx;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) const SUPPORTED: &[&str] = &["mkv", "mp4", "m4v", "mov", "webm"];
@@ -18,6 +20,7 @@ pub enum TracksState {
 
 pub struct PlaybackSession {
     engine: Box<dyn PlayerEngine>,
+    log: Arc<RunLog>,
     source: Option<PathBuf>,
     awaiting_source: Option<PathBuf>,
     tracks: TracksState,
@@ -27,12 +30,15 @@ pub struct PlaybackSession {
     preview_target: Option<f64>,
     export: Option<ExportJob>,
     export_error: Option<String>,
+    command_notice: Option<String>,
+    command_notice_shown: bool,
 }
 
 impl PlaybackSession {
-    pub fn new(engine: Box<dyn PlayerEngine>) -> Self {
+    pub fn new(engine: Box<dyn PlayerEngine>, log: Arc<RunLog>) -> Self {
         Self {
             engine,
+            log,
             source: None,
             awaiting_source: None,
             tracks: TracksState::Unloaded,
@@ -42,6 +48,8 @@ impl PlaybackSession {
             preview_target: None,
             export: None,
             export_error: None,
+            command_notice: None,
+            command_notice_shown: false,
         }
     }
 
@@ -62,6 +70,9 @@ impl PlaybackSession {
         }
         let awaiting = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
         self.engine.open(&path)?;
+        self.engine.take_command_failure();
+        self.command_notice = None;
+        self.command_notice_shown = false;
         self.awaiting_source = Some(awaiting);
         Ok(())
     }
@@ -124,7 +135,10 @@ impl PlaybackSession {
     pub fn error(&self) -> Option<String> {
         match self.engine.state() {
             PlaybackState::Failed(error) => Some(error),
-            _ => self.export_error.clone(),
+            _ => self
+                .command_notice
+                .clone()
+                .or_else(|| self.export_error.clone()),
         }
     }
 
@@ -295,7 +309,8 @@ impl PlaybackSession {
 
     pub fn poll(&mut self, tx: &mut Tx) -> bool {
         let state = self.engine.state();
-        let mut changed = self.confirm_open(&state);
+        let mut changed = self.observe_command_failure();
+        changed |= self.confirm_open(&state);
         let playback_ready = self.awaiting_source.is_none()
             && !matches!(&state, PlaybackState::Loading | PlaybackState::Failed(_));
         if playback_ready {
@@ -342,6 +357,22 @@ impl PlaybackSession {
             changed = true;
         }
         changed
+    }
+
+    fn observe_command_failure(&mut self) -> bool {
+        let Some(failure) = self.engine.take_command_failure() else {
+            return false;
+        };
+        if self.command_notice_shown {
+            return false;
+        }
+        self.command_notice_shown = true;
+        self.log
+            .info(format!("notice: rejected command: {failure}"));
+        self.command_notice = Some(format!(
+            "The player could not apply that command: {failure}"
+        ));
+        true
     }
 
     pub(crate) fn confirm_open(&mut self, state: &PlaybackState) -> bool {
@@ -413,8 +444,19 @@ impl PlaybackSession {
         source: PathBuf,
         tracks: TracksState,
     ) -> Self {
+        Self::with_source_and_log(engine, source, tracks, Arc::new(RunLog::disabled()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_source_and_log(
+        engine: Box<dyn PlayerEngine>,
+        source: PathBuf,
+        tracks: TracksState,
+        log: Arc<RunLog>,
+    ) -> Self {
         Self {
             engine,
+            log,
             source: Some(source),
             awaiting_source: None,
             tracks,
@@ -424,6 +466,8 @@ impl PlaybackSession {
             preview_target: None,
             export: None,
             export_error: None,
+            command_notice: None,
+            command_notice_shown: false,
         }
     }
 

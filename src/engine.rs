@@ -1,5 +1,6 @@
 //! Playback through libmpv, behind a small seam the UI can fake in tests.
 
+use crate::log::RunLog;
 use rune::native_surface::{ByteFrame, ColorInfo, Format};
 use rune::{NativeSurface, Waker};
 use std::ffi::{CStr, CString, c_char, c_int, c_ulong, c_void};
@@ -102,6 +103,8 @@ pub trait PlayerEngine: Send {
     fn select_subtitle(&mut self, id: Option<i64>) -> Result<(), String>;
     /// Installs the app waker for playback state changes and surface pushes.
     fn set_waker(&self, waker: Waker);
+    /// Takes the most recent rejected command, once, for the one-notice rule.
+    fn take_command_failure(&mut self) -> Option<String>;
 }
 
 pub struct MpvEngine {
@@ -123,8 +126,8 @@ impl MpvEngine {
     }
 
     /// `headless` keeps audio off so tests do not open a device.
-    pub fn new(headless: bool) -> Result<Self, String> {
-        let core = Arc::new(Core::new(headless)?);
+    pub fn new(headless: bool, log: Arc<RunLog>) -> Result<Self, String> {
+        let core = Arc::new(Core::new(headless, log)?);
         let surface = NativeSurface::new();
         let stop = Arc::new(AtomicBool::new(false));
         let (ready, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -223,6 +226,9 @@ impl PlayerEngine for MpvEngine {
         self.core.set_waker(waker.clone());
         self.surface.set_waker(waker);
     }
+    fn take_command_failure(&mut self) -> Option<String> {
+        self.core.take_failure()
+    }
 }
 
 impl Drop for MpvEngine {
@@ -236,6 +242,7 @@ impl Drop for MpvEngine {
 
 struct Core {
     handle: *mut mpv::Handle,
+    log: Arc<RunLog>,
     state: Mutex<PlaybackState>,
     ready_reported: AtomicBool,
     waker: Mutex<Option<Waker>>,
@@ -249,14 +256,15 @@ unsafe impl Send for Core {}
 unsafe impl Sync for Core {}
 
 impl Core {
-    fn new(headless: bool) -> Result<Self, String> {
+    fn new(headless: bool, log: Arc<RunLog>) -> Result<Self, String> {
         unsafe {
             check_client_api_version(u64::from(mpv::mpv_client_api_version()))?;
             let handle = mpv::mpv_create();
             if handle.is_null() {
+                log.warn("mpv could not create a player");
                 return Err("libmpv could not create a player".into());
             }
-            let options: &[(&str, &str)] = &[
+            let mut options: Vec<(&str, &str)> = vec![
                 ("vo", "libmpv"),
                 ("idle", "yes"),
                 ("keep-open", "yes"),
@@ -267,27 +275,39 @@ impl Core {
                 ("input-default-bindings", "no"),
                 ("input-vo-keyboard", "no"),
             ];
-            for (name, value) in options {
+            let hwdec = if headless { "no" } else { "auto-safe" };
+            options.push(("hwdec", hwdec));
+            if headless {
+                options.push(("ao", "null"));
+            }
+            for (name, value) in &options {
                 if let Err(error) = set_option(handle, name, value) {
+                    log.warn(format!("option failed: {name}={value}: {error}"));
                     mpv::mpv_terminate_destroy(handle);
                     return Err(error);
                 }
             }
-            let hwdec = if headless { "no" } else { "auto-safe" };
-            if let Err(error) = set_option(handle, "hwdec", hwdec) {
-                mpv::mpv_terminate_destroy(handle);
-                return Err(error);
-            }
-            if headless && let Err(error) = set_option(handle, "ao", "null") {
-                mpv::mpv_terminate_destroy(handle);
-                return Err(error);
-            }
+            let summary = options
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            log.info(format!("options: {summary}"));
             if let Err(error) = check(mpv::mpv_initialize(handle), "libmpv initialize") {
+                log.warn(format!("startup failed: {error}"));
                 mpv::mpv_terminate_destroy(handle);
                 return Err(error);
             }
-            Ok(Self {
+            let warn = CString::new("warn").unwrap();
+            if let Err(error) = check(
+                mpv::mpv_request_log_messages(handle, warn.as_ptr()),
+                "request log messages",
+            ) {
+                log.warn(format!("could not request mpv log messages: {error}"));
+            }
+            let core = Self {
                 handle,
+                log,
                 state: Mutex::new(PlaybackState::Empty),
                 ready_reported: AtomicBool::new(false),
                 waker: Mutex::new(None),
@@ -295,7 +315,15 @@ impl Core {
                 frames: AtomicU64::new(0),
                 #[cfg(test)]
                 last_seek_flags: Mutex::new(None),
-            })
+            };
+            let version = core
+                .get_string("mpv-version")
+                .unwrap_or_else(|| "unknown".into());
+            core.log.info(format!("mpv version: {version}"));
+            let api = mpv::mpv_client_api_version();
+            core.log
+                .info(format!("mpv client API: {}.{}", api >> 16, api & 0xffff));
+            Ok(core)
         }
     }
 
@@ -320,6 +348,7 @@ impl Core {
 
     fn open(&self, path: &Path) -> Result<(), String> {
         let path = path.to_str().ok_or("the file path is not valid UTF-8")?;
+        self.log.info(format!("load: {path}"));
         self.set_state(PlaybackState::Loading);
         match self.command(&["loadfile", path]) {
             Ok(()) => Ok(()),
@@ -328,6 +357,10 @@ impl Core {
                 Err(error)
             }
         }
+    }
+
+    fn take_failure(&self) -> Option<String> {
+        self.log.take_failure()
     }
 
     fn current_path(&self) -> Option<PathBuf> {
@@ -530,18 +563,13 @@ impl Core {
     }
 
     fn set_int(&self, name: &str, value: i64) -> Result<(), String> {
-        let name = CString::new(name).unwrap();
         let mut value = value;
-        check(
-            unsafe {
-                mpv::mpv_set_property(
-                    self.handle,
-                    name.as_ptr(),
-                    mpv::FORMAT_INT64,
-                    &mut value as *mut i64 as *mut c_void,
-                )
-            },
-            "set property",
+        let text = value.to_string();
+        self.record_property(
+            name,
+            &text,
+            mpv::FORMAT_INT64,
+            &mut value as *mut i64 as *mut c_void,
         )
     }
 
@@ -556,13 +584,38 @@ impl Core {
                 break;
             }
             match id {
+                mpv::EVENT_LOG_MESSAGE => {
+                    let data = unsafe { (*event).data };
+                    if data.is_null() {
+                        continue;
+                    }
+                    let message = unsafe { &*(data as *const mpv::EventLogMessage) };
+                    if message.log_level > mpv::LOG_LEVEL_WARN {
+                        continue;
+                    }
+                    self.log.mpv(
+                        &text_at(message.level),
+                        &text_at(message.prefix),
+                        &text_at(message.text),
+                    );
+                }
                 mpv::EVENT_FILE_LOADED => self.set_state(PlaybackState::Ready),
                 mpv::EVENT_END_FILE => {
                     let data = unsafe { (*event).data };
                     if data.is_null() {
+                        self.log.info("end of file: unknown");
                         self.set_state(PlaybackState::Failed("the file ended unexpectedly".into()));
                     } else {
                         let end = unsafe { &*(data as *const mpv::EventEndFile) };
+                        let reason = end_reason(end.reason);
+                        if end.reason == mpv::END_FILE_REASON_ERROR {
+                            self.log.info(format!(
+                                "end of file: {reason}: {}",
+                                error_string(end.error)
+                            ));
+                        } else {
+                            self.log.info(format!("end of file: {reason}"));
+                        }
                         if end.reason == mpv::END_FILE_REASON_ERROR {
                             self.set_state(PlaybackState::Failed(error_string(end.error)));
                         } else if end.reason == mpv::END_FILE_REASON_EOF {
@@ -578,48 +631,67 @@ impl Core {
     }
 
     fn command(&self, args: &[&str]) -> Result<(), String> {
-        let strings: Vec<CString> = args
+        self.log.command(args);
+        let strings: Vec<CString> = match args
             .iter()
             .map(|arg| CString::new(*arg))
             .collect::<Result<_, _>>()
-            .map_err(|_| "an argument contains a NUL byte".to_string())?;
+        {
+            Ok(strings) => strings,
+            Err(_) => {
+                let error = "an argument contains a NUL byte";
+                self.log.command_failed(args, error);
+                return Err(format!("{}: {error}", args.join(" ")));
+            }
+        };
         let mut pointers: Vec<*const c_char> = strings.iter().map(|arg| arg.as_ptr()).collect();
         pointers.push(ptr::null());
-        check(
-            unsafe { mpv::mpv_command(self.handle, pointers.as_ptr()) },
-            args[0],
-        )
+        let code = unsafe { mpv::mpv_command(self.handle, pointers.as_ptr()) };
+        self.finish(args, code)
+    }
+
+    fn finish(&self, args: &[&str], code: c_int) -> Result<(), String> {
+        if code >= 0 {
+            return Ok(());
+        }
+        let error = error_string(code);
+        self.log.command_failed(args, &error);
+        Err(format!("{}: {error}", args.join(" ")))
+    }
+
+    fn record_property(
+        &self,
+        name: &str,
+        text: &str,
+        format: c_int,
+        data: *mut c_void,
+    ) -> Result<(), String> {
+        let args = ["set", name, text];
+        self.log.command(&args);
+        let name = CString::new(name).unwrap();
+        let code = unsafe { mpv::mpv_set_property(self.handle, name.as_ptr(), format, data) };
+        self.finish(&args, code)
     }
 
     fn set_double(&self, name: &str, value: f64) -> Result<(), String> {
-        let name = CString::new(name).unwrap();
         let mut value = value;
-        check(
-            unsafe {
-                mpv::mpv_set_property(
-                    self.handle,
-                    name.as_ptr(),
-                    mpv::FORMAT_DOUBLE,
-                    &mut value as *mut f64 as *mut c_void,
-                )
-            },
-            "set property",
+        let text = format!("{value}");
+        self.record_property(
+            name,
+            &text,
+            mpv::FORMAT_DOUBLE,
+            &mut value as *mut f64 as *mut c_void,
         )
     }
 
     fn set_flag(&self, name: &str, value: bool) -> Result<(), String> {
-        let name = CString::new(name).unwrap();
         let mut value: c_int = c_int::from(value);
-        check(
-            unsafe {
-                mpv::mpv_set_property(
-                    self.handle,
-                    name.as_ptr(),
-                    mpv::FORMAT_FLAG,
-                    &mut value as *mut c_int as *mut c_void,
-                )
-            },
-            "set property",
+        let text = if value != 0 { "yes" } else { "no" };
+        self.record_property(
+            name,
+            text,
+            mpv::FORMAT_FLAG,
+            &mut value as *mut c_int as *mut c_void,
         )
     }
 
@@ -803,6 +875,26 @@ fn check(code: c_int, what: &str) -> Result<(), String> {
     Err(format!("{what}: {}", error_string(code)))
 }
 
+fn end_reason(reason: c_int) -> String {
+    match reason {
+        mpv::END_FILE_REASON_EOF => "eof".into(),
+        mpv::END_FILE_REASON_STOP => "stop".into(),
+        mpv::END_FILE_REASON_QUIT => "quit".into(),
+        mpv::END_FILE_REASON_ERROR => "error".into(),
+        mpv::END_FILE_REASON_REDIRECT => "redirect".into(),
+        other => format!("unknown ({other})"),
+    }
+}
+
+fn text_at(pointer: *const c_char) -> String {
+    if pointer.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(pointer) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn error_string(code: c_int) -> String {
     unsafe { CStr::from_ptr(mpv::mpv_error_string(code)) }
         .to_string_lossy()
@@ -833,6 +925,13 @@ mod mpv {
         pub error: c_int,
     }
     #[repr(C)]
+    pub struct EventLogMessage {
+        pub prefix: *const c_char,
+        pub level: *const c_char,
+        pub text: *const c_char,
+        pub log_level: c_int,
+    }
+    #[repr(C)]
     pub struct Param {
         pub type_: c_int,
         pub data: *mut c_void,
@@ -859,10 +958,16 @@ mod mpv {
     }
 
     pub const EVENT_NONE: c_int = 0;
+    pub const EVENT_LOG_MESSAGE: c_int = 2;
     pub const EVENT_END_FILE: c_int = 7;
     pub const EVENT_FILE_LOADED: c_int = 8;
     pub const END_FILE_REASON_EOF: c_int = 0;
+    pub const END_FILE_REASON_STOP: c_int = 2;
+    pub const END_FILE_REASON_QUIT: c_int = 3;
     pub const END_FILE_REASON_ERROR: c_int = 4;
+    pub const END_FILE_REASON_REDIRECT: c_int = 5;
+
+    pub const LOG_LEVEL_WARN: c_int = 30;
 
     pub const FORMAT_STRING: c_int = 1;
     pub const FORMAT_FLAG: c_int = 3;
@@ -892,6 +997,8 @@ mod mpv {
         ) -> c_int;
         pub fn mpv_initialize(ctx: *mut Handle) -> c_int;
         pub fn mpv_command(ctx: *mut Handle, args: *const *const c_char) -> c_int;
+        pub fn mpv_request_log_messages(ctx: *mut Handle, min_level: *const c_char) -> c_int;
+        pub fn mpv_client_api_version() -> c_ulong;
         pub fn mpv_set_property(
             ctx: *mut Handle,
             name: *const c_char,
@@ -997,9 +1104,154 @@ mod tests {
         tracks
     }
 
+    fn wait_for_ended(engine: &MpvEngine) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while engine.state() != PlaybackState::Ended && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(engine.state(), PlaybackState::Ended);
+    }
+
+    fn quiet() -> Arc<RunLog> {
+        Arc::new(RunLog::disabled())
+    }
+
+    fn engine() -> MpvEngine {
+        MpvEngine::new(true, quiet()).unwrap()
+    }
+
+    #[test]
+    fn the_run_log_records_the_mpv_version_and_options() {
+        let (log, sink, path) = crate::log::testing::log_to_file("engine-startup");
+        let engine = MpvEngine::new(true, log).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("mpv version: "), "{text}");
+        assert!(text.contains("options: "), "{text}");
+        assert!(text.contains("vo=libmpv"), "{text}");
+        assert!(text.contains("ao=null"), "{text}");
+        assert_eq!(sink.lines(), text.lines().collect::<Vec<_>>());
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_rejected_command_is_logged_with_its_name_and_arguments() {
+        let (log, _sink, path) = crate::log::testing::log_to_file("engine-rejected");
+        let mut engine = MpvEngine::new(true, log).unwrap();
+        let error = engine
+            .core
+            .command(&["seek", "not-a-time", "absolute"])
+            .unwrap_err();
+        assert!(error.contains("seek"), "{error}");
+        let failure = engine.take_command_failure().expect("a stored failure");
+        assert!(
+            failure.starts_with("seek not-a-time absolute: "),
+            "{failure}"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("command: seek not-a-time absolute"), "{text}");
+        assert!(
+            text.contains("command failed: seek not-a-time absolute: "),
+            "{text}"
+        );
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejected_volume_and_speed_commands_are_recorded() {
+        let (log, _sink, path) = crate::log::testing::log_to_file("engine-properties");
+        let engine = MpvEngine::new(true, log).unwrap();
+        let volume_error = engine.core.set_double("volume", f64::NAN).unwrap_err();
+        assert!(volume_error.contains("volume"), "{volume_error}");
+        let speed_error = engine.core.set_double("speed", 0.0).unwrap_err();
+        assert!(speed_error.contains("speed"), "{speed_error}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("command failed: set volume NaN"), "{text}");
+        assert!(text.contains("command failed: set speed 0"), "{text}");
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn user_commands_are_recorded_with_their_arguments() {
+        let (log, _sink, path) = crate::log::testing::log_to_file("engine-user");
+        let mut engine = MpvEngine::new(true, log).unwrap();
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_frame(&engine);
+        engine.toggle();
+        engine.set_volume(0.4);
+        engine.set_speed(1.25);
+        engine.seek_preview(0.5);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("command: set pause "), "{text}");
+        assert!(text.contains("command: set volume 40"), "{text}");
+        assert!(text.contains("command: set speed 1.25"), "{text}");
+        assert!(
+            text.contains("command: seek 0.500 absolute+exact"),
+            "{text}"
+        );
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_run_log_records_the_end_of_file_reason() {
+        let (log, _sink, path) = crate::log::testing::log_to_file("engine-eof");
+        let mut engine = MpvEngine::new(true, log).unwrap();
+        engine.core.set_flag("keep-open", false).unwrap();
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_ended(&engine);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("end of file: eof"), "{text}");
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mpv_log_messages_are_mirrored_to_both_sinks() {
+        let (log, sink, path) = crate::log::testing::log_to_file("engine-mpv");
+        let mut engine = MpvEngine::new(true, log).unwrap();
+        let dir = std::env::temp_dir().join(format!("kachito-engine-mpv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let corrupt = dir.join("corrupt.mkv");
+        std::fs::write(&corrupt, b"not a video").unwrap();
+        engine.open(&corrupt).unwrap();
+        wait_for_error(&engine);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.lines().any(|line| line.starts_with("mpv:")), "{text}");
+        assert_eq!(sink.lines(), text.lines().collect::<Vec<_>>());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn playback_writes_no_per_frame_log_lines() {
+        let (log, _sink, path) = crate::log::testing::log_to_file("engine-frames");
+        let mut engine = MpvEngine::new(true, log).unwrap();
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_frame_count(&engine, 2);
+        let before = our_lines(&path);
+        wait_for_frame_count(&engine, engine.frames() + 1);
+        thread::sleep(Duration::from_millis(100));
+        let after = our_lines(&path);
+        assert_eq!(before, after, "the frame path wrote to the run log");
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn our_lines(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("mpv:"))
+            .count()
+    }
+
     #[test]
     fn opens_an_mp4_file_and_pushes_a_frame() {
-        let mut engine = MpvEngine::new(true).unwrap();
+        let mut engine = engine();
         engine.open(&fixture("rgbw.mp4")).unwrap();
         wait_for_frame(&engine);
         assert!(
@@ -1011,7 +1263,7 @@ mod tests {
 
     #[test]
     fn opens_an_mkv_file_and_pushes_a_frame() {
-        let mut engine = MpvEngine::new(true).unwrap();
+        let mut engine = engine();
         engine.open(&fixture("rgbw.mkv")).unwrap();
         wait_for_frame(&engine);
         assert!(
@@ -1023,7 +1275,7 @@ mod tests {
 
     #[test]
     fn the_engine_reports_a_loaded_state_after_a_frame() {
-        let mut engine = MpvEngine::new(true).unwrap();
+        let mut engine = engine();
         assert_eq!(engine.state(), PlaybackState::Empty);
         engine.open(&fixture("rgbw.mkv")).unwrap();
         wait_for_frame(&engine);
@@ -1032,7 +1284,7 @@ mod tests {
 
     #[test]
     fn the_engine_reports_the_frame_duration() {
-        let mut engine = MpvEngine::new(true).unwrap();
+        let mut engine = engine();
         engine.open(&fixture("tracks.mkv")).unwrap();
         wait_for_frame(&engine);
         let frame_duration = engine.frame_duration().expect("a source frame duration");
@@ -1044,7 +1296,7 @@ mod tests {
 
     #[test]
     fn a_seek_wakes_the_surface_without_a_state_change() {
-        let mut engine = MpvEngine::new(true).unwrap();
+        let mut engine = engine();
         let wakes = Arc::new(AtomicUsize::new(0));
         let counter = wakes.clone();
         engine.set_waker(Arc::new(move || {
@@ -1079,7 +1331,7 @@ mod tests {
 
     #[test]
     fn a_preview_seek_lands_on_the_requested_frame() {
-        let mut engine = MpvEngine::new(true).unwrap();
+        let mut engine = engine();
         engine.open(&fixture("rgbw.mkv")).unwrap();
         wait_for_frame(&engine);
 
@@ -1101,7 +1353,7 @@ mod tests {
 
     #[test]
     fn a_release_after_a_preview_keeps_the_preview_frame() {
-        let mut engine = MpvEngine::new(true).unwrap();
+        let mut engine = engine();
         engine.open(&fixture("rgbw.mkv")).unwrap();
         wait_for_frame(&engine);
         engine.toggle();
@@ -1128,7 +1380,7 @@ mod tests {
 
     #[test]
     fn a_preview_seek_pushes_a_frame_without_changing_state() {
-        let mut engine = MpvEngine::new(true).unwrap();
+        let mut engine = engine();
         engine.open(&fixture("rgbw.mkv")).unwrap();
         wait_for_frame(&engine);
 
@@ -1148,14 +1400,14 @@ mod tests {
 
     #[test]
     fn a_missing_file_sets_an_error() {
-        let mut engine = MpvEngine::new(true).unwrap();
+        let mut engine = engine();
         let _ = engine.open(Path::new("/definitely/not/here.mkv"));
         wait_for_error(&engine);
     }
 
     #[test]
     fn lists_and_selects_audio_and_subtitle_tracks() {
-        let mut engine = MpvEngine::new(true).unwrap();
+        let mut engine = engine();
         engine.open(&fixture("tracks.mkv")).unwrap();
         let tracks = wait_for_tracks(&engine);
         let audio: Vec<&Track> = tracks
