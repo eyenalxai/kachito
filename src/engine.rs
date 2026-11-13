@@ -2,7 +2,7 @@
 
 use rune::native_surface::{ByteFrame, ColorInfo, Format};
 use rune::{NativeSurface, Waker};
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_ulong, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +14,24 @@ use std::time::Duration;
 
 pub const VIDEO_WIDTH: i32 = 1280;
 pub const VIDEO_HEIGHT: i32 = 720;
+
+/// The libmpv client API major this build is written against.
+pub const CLIENT_API_MAJOR: u32 = 2;
+
+/// Accepts a libmpv client API version only when its major matches this build.
+///
+/// `mpv_client_api_version` packs the major in the high 16 bits and the minor in
+/// the low 16 bits.
+pub fn check_client_api_version(version: u64) -> Result<(), String> {
+    let found = (version >> 16) as u32;
+    if found == CLIENT_API_MAJOR {
+        return Ok(());
+    }
+    let minor = (version & 0xffff) as u32;
+    Err(format!(
+        "libmpv client API {found}.{minor} is not supported: found major {found}, expected major {CLIENT_API_MAJOR}. Install a libmpv that provides client API {CLIENT_API_MAJOR}.x."
+    ))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrackKind {
@@ -233,6 +251,7 @@ unsafe impl Sync for Core {}
 impl Core {
     fn new(headless: bool) -> Result<Self, String> {
         unsafe {
+            check_client_api_version(u64::from(mpv::mpv_client_api_version()))?;
             let handle = mpv::mpv_create();
             if handle.is_null() {
                 return Err("libmpv could not create a player".into());
@@ -863,8 +882,8 @@ mod mpv {
 
     pub const UPDATE_FRAME: u64 = 1;
 
-    #[link(name = "mpv")]
     unsafe extern "C" {
+        pub fn mpv_client_api_version() -> c_ulong;
         pub fn mpv_create() -> *mut Handle;
         pub fn mpv_set_option_string(
             ctx: *mut Handle,
@@ -906,6 +925,23 @@ mod mpv {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn a_matching_client_api_major_is_accepted() {
+        assert_eq!(check_client_api_version((2 << 16) | 5), Ok(()));
+    }
+
+    #[test]
+    fn a_mismatched_client_api_major_names_both_majors() {
+        let error = check_client_api_version(3 << 16).unwrap_err();
+        assert!(error.contains("found major 3"), "{error}");
+        assert!(error.contains("expected major 2"), "{error}");
+    }
+
+    #[test]
+    fn the_installed_libmpv_matches_the_client_api_major() {
+        check_client_api_version(u64::from(unsafe { mpv::mpv_client_api_version() })).unwrap();
+    }
 
     fn fixture(name: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
