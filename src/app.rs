@@ -9,10 +9,13 @@ use rune::{
     SurfaceFit, Transition, Tx, Waker, col, el, icon, row, text,
 };
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 const SPEEDS: &[f32] = &[0.5, 1.0, 1.25, 1.5, 2.0];
 const HIDE_AFTER: f64 = 2.5;
 const SKIP: f64 = 10.0;
+const PREVIEW_INTERVAL: Duration = Duration::from_millis(40);
+const SCRUB_THRESHOLD: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Menu {
@@ -35,6 +38,7 @@ struct App {
     transport_hovered: bool,
     activity: bool,
     last_activity: f64,
+    last_preview: Option<Instant>,
     drop_hover: bool,
     title_source: Option<PathBuf>,
 }
@@ -70,6 +74,7 @@ impl App {
             transport_hovered: false,
             activity: false,
             last_activity: 0.0,
+            last_preview: None,
             drop_hover: false,
             title_source: None,
         }
@@ -120,6 +125,35 @@ impl App {
         let time = f64::from(fraction.clamp(0.0, 1.0)) * duration;
         session.seek(time);
         session.timeline_mut().set_position(time);
+        self.last_preview = None;
+        self.touch();
+    }
+
+    fn preview_fraction(&mut self, fraction: f32) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let Some(duration) = session.duration() else {
+            return;
+        };
+        let time = f64::from(fraction.clamp(0.0, 1.0)) * duration;
+        session.timeline_mut().set_position(time);
+        let now = Instant::now();
+        let due = self
+            .last_preview
+            .is_none_or(|last| now.duration_since(last) >= PREVIEW_INTERVAL);
+        if due {
+            self.last_preview = Some(now);
+            session.seek_preview(time);
+        }
+        self.touch();
+    }
+
+    fn begin_scrub(&mut self) {
+        if let Some(session) = &mut self.session {
+            session.set_scrubbing(true);
+        }
+        self.last_preview = None;
         self.touch();
     }
 
@@ -128,6 +162,7 @@ impl App {
             session.seek(time);
             session.timeline_mut().set_position(time);
         }
+        self.last_preview = None;
         self.touch();
     }
 
@@ -138,9 +173,10 @@ impl App {
         let Some(duration) = session.duration() else {
             return;
         };
-        let time = (session.position() + delta).clamp(0.0, duration);
+        let time = (session.timeline().position() + delta).clamp(0.0, duration);
         session.seek(time);
         session.timeline_mut().set_position(time);
+        self.last_preview = None;
         self.touch();
     }
 
@@ -709,7 +745,7 @@ fn error_banner(error: &str, theme: &Palette) -> El {
 
 fn transport(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
     let duration = session.duration().unwrap_or(0.0);
-    let position = session.position();
+    let position = session.timeline().position();
     let fraction = if duration > 0.0 {
         (position / duration).clamp(0.0, 1.0) as f32
     } else {
@@ -780,8 +816,16 @@ fn seek_bar(app: &App, fraction: f32, duration: f64, theme: &Palette) -> El {
         .w_full()
         .h(20.0)
         .on_drag(|app: &mut App, drag: &mut Drag, _: &mut Tx| {
-            if drag.w > 0.0 {
-                app.seek_fraction(drag.x / drag.w);
+            if drag.w <= 0.0 {
+                return;
+            }
+            match drag.phase {
+                Phase::Down => app.begin_scrub(),
+                Phase::Move if drag.dx.abs() > SCRUB_THRESHOLD => {
+                    app.preview_fraction(drag.x / drag.w);
+                }
+                Phase::Move => {}
+                Phase::Up => app.seek_fraction(drag.x / drag.w),
             }
         })
         .role("slider")
@@ -811,7 +855,7 @@ fn seek_bar(app: &App, fraction: f32, duration: f64, theme: &Palette) -> El {
 fn app_position(app: &App) -> f64 {
     app.session
         .as_ref()
-        .map(|session| session.position())
+        .map(|session| session.timeline().position())
         .unwrap_or(0.0)
 }
 
@@ -1414,6 +1458,8 @@ mod tests {
         tracks_result: Option<Result<Vec<Track>, String>>,
         tracks_reads: usize,
         last_seek: Option<f64>,
+        last_preview_seek: Option<f64>,
+        preview_seeks: usize,
         volume: Option<f32>,
         speed: Option<f32>,
         opened: Option<PathBuf>,
@@ -1431,6 +1477,8 @@ mod tests {
                 tracks_result: None,
                 tracks_reads: 0,
                 last_seek: None,
+                last_preview_seek: None,
+                preview_seeks: 0,
                 volume: None,
                 speed: None,
                 opened: None,
@@ -1463,6 +1511,11 @@ mod tests {
         }
         fn seek(&mut self, seconds: f64) {
             self.log.lock().unwrap().last_seek = Some(seconds);
+        }
+        fn seek_preview(&mut self, seconds: f64) {
+            let mut log = self.log.lock().unwrap();
+            log.last_preview_seek = Some(seconds);
+            log.preview_seeks += 1;
         }
         fn set_volume(&mut self, volume: f32) {
             self.log.lock().unwrap().volume = Some(volume);
@@ -2134,6 +2187,99 @@ mod tests {
         });
         runtime.frame(0.5);
         assert!(runtime.find("export-tray").is_none());
+    }
+
+    #[test]
+    fn dragging_the_seek_bar_previews_and_then_seeks_exactly() {
+        let (app, log) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.frame(0.0);
+
+        let [x, y, w, h] = rect(&runtime, "seek");
+        let y = y + h / 2.0;
+        runtime.pointer_down(x + w * 0.1, y);
+        runtime.frame(1.0 / 60.0);
+        runtime.pointer_move(x + w * 0.5, y);
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(log.lock().unwrap().last_preview_seek, Some(5.0));
+
+        runtime.pointer_up(x + w * 0.5, y);
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(log.lock().unwrap().last_seek, Some(5.0));
+    }
+
+    #[test]
+    fn the_seek_bar_follows_the_timeline_not_the_engine_during_a_scrub() {
+        let (mut app, log) = app_with_fake();
+        log.lock().unwrap().position = 0.0;
+        let session = session_mut(&mut app);
+        session.timeline_mut().set_duration(10.0, 1.0 / 60.0);
+        session.timeline_mut().set_position(5.0);
+        session.set_scrubbing(true);
+
+        assert_eq!(app_position(&app), 5.0);
+    }
+
+    #[test]
+    fn a_scrub_keeps_the_timeline_position_while_the_engine_lags() {
+        let (mut app, log) = app_with_fake();
+        log.lock().unwrap().position = 0.0;
+        let session = session_mut(&mut app);
+        session.timeline_mut().set_duration(10.0, 1.0 / 60.0);
+        session.timeline_mut().set_position(5.0);
+        session.set_scrubbing(true);
+
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert_eq!(session.timeline().position(), 5.0);
+
+        session.seek(5.0);
+        session.poll(&mut tx);
+        assert_eq!(
+            session.timeline().position(),
+            5.0,
+            "the preview position must survive the exact seek"
+        );
+
+        log.lock().unwrap().position = 5.0;
+        session.poll(&mut tx);
+        assert_eq!(session.timeline().position(), 5.0);
+
+        log.lock().unwrap().position = 0.0;
+        session.poll(&mut tx);
+        assert_eq!(
+            session.timeline().position(),
+            0.0,
+            "sync resumes after the exact seek lands"
+        );
+    }
+
+    #[test]
+    fn preview_seeks_are_throttled_but_the_timeline_still_moves() {
+        let (mut app, log) = app_with_fake();
+        let playback = session_mut(&mut app);
+        playback.timeline_mut().set_duration(10.0, 1.0 / 60.0);
+
+        app.last_preview = Some(Instant::now());
+        app.preview_fraction(0.5);
+        assert_eq!(log.lock().unwrap().preview_seeks, 0);
+        assert_eq!(session(&app).timeline().position(), 5.0);
+
+        app.last_preview = None;
+        app.preview_fraction(0.5);
+        assert_eq!(log.lock().unwrap().preview_seeks, 1);
+    }
+
+    #[test]
+    fn a_click_on_the_seek_bar_does_not_preview() {
+        let (app, log) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.frame(0.0);
+
+        click(&mut runtime, "seek");
+
+        assert_eq!(log.lock().unwrap().last_preview_seek, None);
+        assert_eq!(log.lock().unwrap().last_seek, Some(5.0));
     }
 
     #[test]

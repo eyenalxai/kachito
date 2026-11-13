@@ -67,6 +67,7 @@ pub trait PlayerEngine: Send {
     fn open(&mut self, path: &Path) -> Result<(), String>;
     fn toggle(&mut self);
     fn seek(&mut self, seconds: f64);
+    fn seek_preview(&mut self, seconds: f64);
     fn set_volume(&mut self, volume: f32);
     fn set_speed(&mut self, speed: f32);
     fn position(&self) -> f64;
@@ -93,6 +94,11 @@ impl MpvEngine {
     #[cfg(test)]
     fn frames(&self) -> u64 {
         self.core.frames.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn last_seek_flags(&self) -> Option<String> {
+        self.core.last_seek_flags.lock().unwrap().clone()
     }
 
     /// `headless` keeps audio off so tests do not open a device.
@@ -153,6 +159,9 @@ impl PlayerEngine for MpvEngine {
     fn seek(&mut self, seconds: f64) {
         self.core.seek(seconds);
     }
+    fn seek_preview(&mut self, seconds: f64) {
+        self.core.seek_preview(seconds);
+    }
     fn set_volume(&mut self, volume: f32) {
         self.core.set_volume(volume);
     }
@@ -208,6 +217,23 @@ struct Core {
     waker: Mutex<Option<Waker>>,
     #[cfg(test)]
     frames: AtomicU64,
+    #[cfg(test)]
+    last_seek_flags: Mutex<Option<String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeekMode {
+    Exact,
+    Keyframe,
+}
+
+impl SeekMode {
+    fn flags(self) -> &'static str {
+        match self {
+            Self::Exact => "absolute+exact",
+            Self::Keyframe => "absolute+keyframes",
+        }
+    }
 }
 
 unsafe impl Send for Core {}
@@ -257,6 +283,8 @@ impl Core {
                 waker: Mutex::new(None),
                 #[cfg(test)]
                 frames: AtomicU64::new(0),
+                #[cfg(test)]
+                last_seek_flags: Mutex::new(None),
             })
         }
     }
@@ -340,11 +368,27 @@ impl Core {
         if !seconds.is_finite() {
             return;
         }
-        let seconds = seconds.max(0.0);
-        let _ = self.command(&["seek", &format!("{seconds:.3}"), "absolute+exact"]);
+        self.seek_with(seconds, SeekMode::Exact);
         let mut state = self.state.lock().unwrap();
         if matches!(*state, PlaybackState::Ended) {
             *state = PlaybackState::Paused;
+        }
+    }
+
+    fn seek_preview(&self, seconds: f64) {
+        if !seconds.is_finite() {
+            return;
+        }
+        self.seek_with(seconds, SeekMode::Keyframe);
+    }
+
+    fn seek_with(&self, seconds: f64, mode: SeekMode) {
+        let seconds = seconds.max(0.0);
+        let flags = mode.flags();
+        let _ = self.command(&["seek", &format!("{seconds:.3}"), flags]);
+        #[cfg(test)]
+        {
+            *self.last_seek_flags.lock().unwrap() = Some(flags.to_string());
         }
     }
 
@@ -988,6 +1032,7 @@ mod tests {
         let wakes_before = wakes.load(Ordering::Relaxed);
 
         engine.seek(0.5);
+        assert_eq!(engine.last_seek_flags().as_deref(), Some("absolute+exact"));
         wait_for_frame_count(&engine, frames + 1);
 
         assert_eq!(
@@ -999,6 +1044,29 @@ mod tests {
             wakes.load(Ordering::Relaxed) > wakes_before,
             "the surface push after a seek did not wake the app"
         );
+    }
+
+    #[test]
+    fn a_preview_seek_pushes_a_frame_without_changing_state() {
+        let mut engine = MpvEngine::new(true).unwrap();
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_frame(&engine);
+
+        engine.toggle();
+        thread::sleep(Duration::from_millis(100));
+        // Consume the one-shot Ready so the comparison measures a real transition.
+        let _ = engine.state();
+        let state_before = engine.state();
+        let frames = engine.frames();
+
+        engine.seek_preview(0.5);
+        assert_eq!(
+            engine.last_seek_flags().as_deref(),
+            Some("absolute+keyframes")
+        );
+        wait_for_frame_count(&engine, frames + 1);
+
+        assert_eq!(engine.state(), state_before);
     }
 
     #[test]

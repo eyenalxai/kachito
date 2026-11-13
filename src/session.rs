@@ -22,6 +22,8 @@ pub struct PlaybackSession {
     awaiting_source: Option<PathBuf>,
     tracks: TracksState,
     timeline: Timeline,
+    scrubbing: bool,
+    pending_seek: Option<f64>,
     export: Option<ExportJob>,
     export_error: Option<String>,
 }
@@ -34,6 +36,8 @@ impl PlaybackSession {
             awaiting_source: None,
             tracks: TracksState::Unloaded,
             timeline: Timeline::new(),
+            scrubbing: false,
+            pending_seek: None,
             export: None,
             export_error: None,
         }
@@ -124,17 +128,39 @@ impl PlaybackSession {
     }
 
     pub fn seek(&mut self, seconds: f64) {
+        if !seconds.is_finite() {
+            return;
+        }
+        if !self.engine.state().is_loaded() {
+            self.scrubbing = false;
+            self.pending_seek = None;
+            return;
+        }
+        let seconds = match self.engine.duration() {
+            Some(duration) => seconds.clamp(0.0, duration),
+            None => seconds.max(0.0),
+        };
+        self.scrubbing = true;
+        self.pending_seek = Some(seconds);
+        self.engine.seek(seconds);
+    }
+
+    pub fn seek_preview(&mut self, seconds: f64) {
         if self.engine.state().is_loaded() {
-            self.engine.seek(seconds);
+            self.engine.seek_preview(seconds);
+        }
+    }
+
+    pub fn set_scrubbing(&mut self, scrubbing: bool) {
+        self.scrubbing = scrubbing;
+        if scrubbing {
+            self.pending_seek = None;
         }
     }
 
     pub fn seek_fraction(&mut self, fraction: f32) {
-        if self.engine.state().is_loaded()
-            && let Some(duration) = self.engine.duration()
-        {
-            self.engine
-                .seek(f64::from(fraction.clamp(0.0, 1.0)) * duration);
+        if let Some(duration) = self.engine.duration() {
+            self.seek(f64::from(fraction.clamp(0.0, 1.0)) * duration);
         }
     }
 
@@ -231,10 +257,20 @@ impl PlaybackSession {
                 self.timeline.set_duration(duration, frame_duration);
                 changed = true;
             }
-            let position = self.engine.position();
-            if (self.timeline.position() - position).abs() > 0.01 {
-                self.timeline.set_position(position);
-                changed = true;
+            if let Some(target) = self.pending_seek {
+                let tolerance = self.engine.frame_duration().unwrap_or(0.05).max(0.05);
+                let landed = (self.engine.position() - target).abs() <= tolerance;
+                if landed || matches!(&state, PlaybackState::Failed(_) | PlaybackState::Empty) {
+                    self.pending_seek = None;
+                    self.scrubbing = false;
+                }
+            }
+            if !self.scrubbing {
+                let position = self.engine.position();
+                if (self.timeline.position() - position).abs() > 0.01 {
+                    self.timeline.set_position(position);
+                    changed = true;
+                }
             }
             changed |= self.load_tracks(&state);
         }
@@ -290,6 +326,8 @@ impl PlaybackSession {
             self.source = Some(path);
             self.tracks = TracksState::Unloaded;
             self.timeline = Timeline::new();
+            self.scrubbing = false;
+            self.pending_seek = None;
             self.export = None;
             self.export_error = None;
         }
@@ -323,6 +361,8 @@ impl PlaybackSession {
             awaiting_source: None,
             tracks,
             timeline: Timeline::new(),
+            scrubbing: false,
+            pending_seek: None,
             export: None,
             export_error: None,
         }
