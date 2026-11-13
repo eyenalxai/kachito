@@ -23,13 +23,13 @@ pub const CLIENT_API_MAJOR: u32 = 2;
 /// `mpv_client_api_version` packs the major in the high 16 bits and the minor in
 /// the low 16 bits.
 pub fn check_client_api_version(version: u64) -> Result<(), String> {
-    let found = (version >> 16) as u32;
-    if found == CLIENT_API_MAJOR {
+    let found_major = (version >> 16) as u32;
+    if found_major == CLIENT_API_MAJOR {
         return Ok(());
     }
     let minor = (version & 0xffff) as u32;
     Err(format!(
-        "libmpv client API {found}.{minor} is not supported: found major {found}, expected major {CLIENT_API_MAJOR}. Install a libmpv that provides client API {CLIENT_API_MAJOR}.x."
+        "libmpv client API {found_major}.{minor} is not supported: found major {found_major}, expected major {CLIENT_API_MAJOR}. Install a libmpv that provides client API {CLIENT_API_MAJOR}.x."
     ))
 }
 
