@@ -6,10 +6,13 @@ use rune::{NativeSurface, Waker};
 use std::ffi::{CStr, CString, c_char, c_int, c_ulong, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, AtomicUsize};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicU64;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -18,6 +21,21 @@ pub const VIDEO_HEIGHT: i32 = 720;
 
 /// The libmpv client API major this build is written against.
 pub const CLIENT_API_MAJOR: u32 = 2;
+
+/// Exit waits this long for the render thread to free its context.
+const RENDER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The UI waits this long for the event thread to answer a synchronous
+/// command. A stalled event thread must not block the UI forever.
+const REQUEST_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The event thread blocks in the event API for this long so a keep-open end
+/// of file, which emits no event, is still observed.
+const EVENT_WAIT_SECONDS: f64 = 0.1;
+
+/// A frame delivers no completed draw for this many pushes before the surface
+/// is treated as hidden.
+const UNDRAWN_PUSH_LIMIT: u64 = 3;
 
 /// Accepts a libmpv client API version only when its major matches this build.
 ///
@@ -65,7 +83,6 @@ impl Track {
 pub enum PlaybackState {
     Empty,
     Loading,
-    Ready,
     Playing,
     Paused,
     Ended,
@@ -74,10 +91,59 @@ pub enum PlaybackState {
 
 impl PlaybackState {
     pub fn is_loaded(&self) -> bool {
-        matches!(
-            self,
-            Self::Ready | Self::Playing | Self::Paused | Self::Ended
-        )
+        matches!(self, Self::Playing | Self::Paused | Self::Ended)
+    }
+
+    /// The explicit edges of the playback state machine. A same-state
+    /// transition is a no-op so a repeated event cannot flap the state.
+    fn allows(&self, next: &Self) -> bool {
+        if self == next {
+            return true;
+        }
+        match (self, next) {
+            (_, Self::Loading) => true,
+            (_, Self::Failed(_)) => !matches!(self, Self::Failed(_)),
+            (Self::Loading, Self::Playing | Self::Paused | Self::Ended | Self::Empty) => true,
+            (Self::Playing, Self::Paused | Self::Ended | Self::Empty) => true,
+            (Self::Paused, Self::Playing | Self::Ended | Self::Empty) => true,
+            (Self::Ended, Self::Playing | Self::Paused | Self::Empty) => true,
+            (Self::Failed(_), Self::Empty) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Whether three more frames were pushed than the surface completed draws.
+fn skip_software_render(submitted: u64, completed: u64) -> bool {
+    submitted.saturating_sub(completed) >= UNDRAWN_PUSH_LIMIT
+}
+
+/// The software render target. `bgra` carries a defined alpha; `bgr0` leaves it
+/// undefined, so the fallback fills it in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SoftwareFormat {
+    name: &'static [u8],
+    alpha_pass: bool,
+}
+
+impl SoftwareFormat {
+    const BGRA: Self = Self {
+        name: b"bgra\0",
+        alpha_pass: false,
+    };
+    const BGR0: Self = Self {
+        name: b"bgr0\0",
+        alpha_pass: true,
+    };
+
+    fn label(self) -> &'static str {
+        if self.alpha_pass { "bgr0" } else { "bgra" }
+    }
+
+    /// A format change is allowed only when libmpv rejects the target itself.
+    /// Any other render error is not a format problem and keeps `bgra`.
+    fn fallback(self, code: c_int) -> Option<Self> {
+        (self == Self::BGRA && code == mpv::ERROR_UNSUPPORTED).then_some(Self::BGR0)
     }
 }
 
@@ -129,17 +195,148 @@ pub trait PlayerEngine: Send {
     fn take_command_failure(&mut self) -> Option<String>;
 }
 
+/// Commands that change playback state run on the event thread, which owns the
+/// state machine. Synchronous commands answer when the event thread is done so
+/// the UI reads the transition on its next poll.
+enum Request {
+    Open {
+        path: PathBuf,
+        reply: SyncSender<Result<(), String>>,
+    },
+    Toggle {
+        reply: SyncSender<()>,
+    },
+    Seek {
+        seconds: f64,
+        preview: bool,
+        reply: SyncSender<()>,
+    },
+    Shutdown,
+}
+
+/// The condition variable the render update callback signals. The callback
+/// only touches this value; it never calls into mpv.
+struct RenderWake {
+    pending: Mutex<bool>,
+    ready: Condvar,
+}
+
+impl RenderWake {
+    fn new() -> Self {
+        Self {
+            pending: Mutex::new(false),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn notify(&self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *pending = true;
+        self.ready.notify_one();
+    }
+
+    /// Blocks until the update callback signals or shutdown starts.
+    fn wait(&self, stop: &AtomicBool) -> bool {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while !*pending && !stop.load(Ordering::Relaxed) {
+            pending = self
+                .ready
+                .wait(pending)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        let ready = *pending;
+        *pending = false;
+        ready && !stop.load(Ordering::Relaxed)
+    }
+}
+
+extern "C" fn render_update_callback(ctx: *mut c_void) {
+    // The render contract forbids any mpv call from this callback.
+    let wake = unsafe { &*(ctx as *const RenderWake) };
+    wake.notify();
+}
+
+struct RenderThread {
+    core: Option<Arc<Core>>,
+    stop: Arc<AtomicBool>,
+    wake: Arc<RenderWake>,
+    done: Receiver<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RenderThread {
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.wake.notify();
+    }
+
+    /// Waits for the render thread to free its context.
+    ///
+    /// A thread that misses the deadline is left detached, and its reference
+    /// to the core is leaked: the thread may still be inside
+    /// `mpv_render_context_render` or `mpv_render_context_free`, and destroying
+    /// the handle under it would be a use-after-free. The handle then lives
+    /// until process exit, which is the safe outcome.
+    fn join(&mut self, timeout: Duration, log: &RunLog) -> bool {
+        match self.done.recv_timeout(timeout) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+                let _ = self.core.take();
+                true
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                log.warn(format!(
+                    "render thread did not stop within {:.1} s; keeping the player handle alive until the process exits",
+                    timeout.as_secs_f64()
+                ));
+                // SAFETY: The detached thread still owns the render context
+                // and may call into this handle. Leaking the Arc keeps
+                // `Core::drop` from running `mpv_terminate_destroy` while
+                // that is possible.
+                if let Some(core) = self.core.take() {
+                    std::mem::forget(core);
+                }
+                false
+            }
+        }
+    }
+}
+
+impl Drop for RenderThread {
+    fn drop(&mut self) {
+        // A thread that was never joined (for example because the event thread
+        // panicked) is in the same position as a timed-out join.
+        if self.handle.is_some()
+            && let Some(core) = self.core.take()
+        {
+            std::mem::forget(core);
+        }
+    }
+}
+
 pub struct MpvEngine {
     core: Arc<Core>,
     surface: NativeSurface,
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    requests: std::sync::mpsc::Sender<Request>,
+    event_thread: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    frames: Arc<AtomicU64>,
+    #[cfg(test)]
+    test_draws: Arc<AtomicU64>,
 }
 
 impl MpvEngine {
     #[cfg(test)]
     fn frames(&self) -> u64 {
-        self.core.frames.load(Ordering::Relaxed)
+        self.frames.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -147,66 +344,192 @@ impl MpvEngine {
         self.core.last_seek_flags.lock().unwrap().clone()
     }
 
+    /// Simulates a completed draw for engine tests, which have no Rune window.
+    #[cfg(test)]
+    fn note_draw(&self) {
+        self.test_draws.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// `headless` keeps audio off so tests do not open a device.
     pub fn new(headless: bool, log: Arc<RunLog>) -> Result<Self, String> {
-        let core = Arc::new(Core::new(headless, log)?);
+        let core = Arc::new(Core::new(headless, log.clone())?);
         let surface = NativeSurface::new();
-        let stop = Arc::new(AtomicBool::new(false));
-        let (ready, ready_rx) = std::sync::mpsc::sync_channel(1);
-        let thread = {
-            let core = core.clone();
+        let wake = Arc::new(RenderWake::new());
+        let render_stop = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let frames = Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
+        let test_draws = Arc::new(AtomicU64::new(0));
+
+        let (render_ready, render_ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (render_done, render_done_rx) = std::sync::mpsc::sync_channel(1);
+        let callback_ctx = Arc::as_ptr(&wake) as usize;
+        let render_handle = {
             let surface = surface.clone();
-            let stop = stop.clone();
+            let wake = wake.clone();
+            let stop = render_stop.clone();
+            let log = log.clone();
+            #[cfg(test)]
+            let frames = frames.clone();
+            #[cfg(test)]
+            let test_draws = test_draws.clone();
+            let handle = core.handle as usize;
             thread::Builder::new()
-                .name("kachito-mpv".into())
+                .name("kachito-render".into())
                 .spawn(move || {
-                    let render = match unsafe { create_render(core.handle) } {
-                        Ok(render) => {
-                            let _ = ready.send(Ok(()));
-                            render
-                        }
+                    let render = match unsafe { create_render(handle as *mut mpv::Handle) } {
+                        Ok(render) => render,
                         Err(error) => {
-                            let _ = ready.send(Err(error));
+                            let _ = render_ready.send(Err(error));
                             return;
                         }
                     };
-                    RenderContext(render).run(core, surface, stop);
+                    unsafe {
+                        mpv::mpv_render_context_set_update_callback(
+                            render,
+                            Some(render_update_callback),
+                            callback_ctx as *mut c_void,
+                        )
+                    };
+                    let _ = render_ready.send(Ok(()));
+                    {
+                        let mut renderer = Renderer {
+                            render: RenderContext(render),
+                            surface,
+                            stop,
+                            wake,
+                            log,
+                            #[cfg(test)]
+                            frames,
+                            buffer: Vec::new(),
+                            frame_id: 0,
+                            pushed: 0,
+                            completed_seen: 0,
+                            format: SoftwareFormat::BGRA,
+                            render_error_logged: false,
+                            #[cfg(test)]
+                            test_draws,
+                        };
+                        renderer.run();
+                    }
+                    let _ = render_done.send(());
                 })
-                .map_err(|error| format!("could not start the playback thread: {error}"))?
+                .map_err(|error| format!("could not start the render thread: {error}"))?
         };
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                core,
-                surface,
-                stop,
-                thread: Some(thread),
-            }),
+
+        let mut render_thread = RenderThread {
+            core: Some(core.clone()),
+            stop: render_stop,
+            wake: wake.clone(),
+            done: render_done_rx,
+            handle: Some(render_handle),
+        };
+        match render_ready_rx.recv() {
+            Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                stop.store(true, Ordering::Relaxed);
-                let _ = thread.join();
-                Err(error)
+                let _ = render_thread.handle.take().map(JoinHandle::join);
+                return Err(error);
             }
             Err(_) => {
-                stop.store(true, Ordering::Relaxed);
-                let _ = thread.join();
-                Err("the playback thread stopped before it was ready".into())
+                let _ = render_thread.handle.take().map(JoinHandle::join);
+                return Err("the render thread stopped before it was ready".into());
             }
+        }
+
+        let (requests, requests_rx) = std::sync::mpsc::channel();
+        let event_core = core.clone();
+        let stop_events = render_thread.stop.clone();
+        let wake_events = render_thread.wake.clone();
+        let event_thread = match thread::Builder::new()
+            .name("kachito-events".into())
+            .spawn(move || run_event_loop(event_core, requests_rx, render_thread))
+        {
+            Ok(thread) => thread,
+            Err(error) => {
+                stop_events.store(true, Ordering::Relaxed);
+                wake_events.notify();
+                return Err(format!("could not start the event thread: {error}"));
+            }
+        };
+
+        Ok(Self {
+            core,
+            surface,
+            requests,
+            event_thread: Some(event_thread),
+            #[cfg(test)]
+            frames,
+            #[cfg(test)]
+            test_draws,
+        })
+    }
+
+    fn wake_event_thread(&self) {
+        unsafe { mpv::mpv_wakeup(self.core.handle) };
+    }
+
+    /// Waits for one synchronous command to answer. A timeout is a logged
+    /// failure rather than an unbounded UI stall.
+    fn wait_for_reply<T>(&self, done: Receiver<T>, what: &str) -> Result<T, String> {
+        match done.recv_timeout(REQUEST_REPLY_TIMEOUT) {
+            Ok(reply) => Ok(reply),
+            Err(RecvTimeoutError::Timeout) => {
+                let error = format!(
+                    "the playback event thread did not answer {what} within {:.1} s",
+                    REQUEST_REPLY_TIMEOUT.as_secs_f64()
+                );
+                self.core.log.failure(&error);
+                Err(error)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let error = format!("the playback event thread stopped before answering {what}");
+                self.core.log.failure(&error);
+                Err(error)
+            }
+        }
+    }
+
+    fn seek_on_event_thread(&mut self, seconds: f64, preview: bool) {
+        let (reply, done) = std::sync::mpsc::sync_channel(1);
+        if self
+            .requests
+            .send(Request::Seek {
+                seconds,
+                preview,
+                reply,
+            })
+            .is_ok()
+        {
+            self.wake_event_thread();
+            let _ = self.wait_for_reply(done, "seek");
         }
     }
 }
 
 impl PlayerEngine for MpvEngine {
     fn open(&mut self, path: &Path) -> Result<(), String> {
-        self.core.open(path)
+        let (reply, done) = std::sync::mpsc::sync_channel(1);
+        self.requests
+            .send(Request::Open {
+                path: path.to_path_buf(),
+                reply,
+            })
+            .map_err(|_| "the playback event thread is not running".to_string())?;
+        self.wake_event_thread();
+        self.wait_for_reply(done, "open")?
     }
     fn toggle(&mut self) {
-        self.core.toggle();
+        let (reply, done) = std::sync::mpsc::sync_channel(1);
+        if self.requests.send(Request::Toggle { reply }).is_ok() {
+            self.wake_event_thread();
+            let _ = self.wait_for_reply(done, "toggle");
+        }
     }
     fn seek(&mut self, seconds: f64) {
-        self.core.seek(seconds);
+        self.seek_on_event_thread(seconds, false);
     }
     fn seek_preview(&mut self, seconds: f64) {
-        self.core.seek_preview(seconds);
+        self.seek_on_event_thread(seconds, true);
     }
     fn is_seeking(&self) -> bool {
         self.core.is_seeking()
@@ -255,8 +578,9 @@ impl PlayerEngine for MpvEngine {
 
 impl Drop for MpvEngine {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
+        let _ = self.requests.send(Request::Shutdown);
+        self.wake_event_thread();
+        if let Some(thread) = self.event_thread.take() {
             let _ = thread.join();
         }
     }
@@ -266,16 +590,21 @@ struct Core {
     handle: *mut mpv::Handle,
     log: Arc<RunLog>,
     state: Mutex<PlaybackState>,
-    ready_reported: AtomicBool,
     end_reported: AtomicBool,
     failure: Mutex<Option<String>>,
     waker: Mutex<Option<Waker>>,
     #[cfg(test)]
-    frames: AtomicU64,
+    pause_reads: AtomicUsize,
     #[cfg(test)]
     last_seek_flags: Mutex<Option<String>>,
 }
 
+// SAFETY: The two-thread split makes this load-bearing. The event thread and
+// the UI thread call libmpv through the same handle; libmpv's client API is
+// thread-safe, and every mutable field is behind a mutex or an atomic, so no
+// Rust-level data race is possible. The handle outlives both threads because
+// `Core::drop` runs only after the render thread has freed its context (see
+// the comment on that impl).
 unsafe impl Send for Core {}
 unsafe impl Sync for Core {}
 
@@ -335,12 +664,11 @@ impl Core {
                 handle,
                 log,
                 state: Mutex::new(PlaybackState::Empty),
-                ready_reported: AtomicBool::new(false),
                 end_reported: AtomicBool::new(false),
                 failure: Mutex::new(None),
                 waker: Mutex::new(None),
                 #[cfg(test)]
-                frames: AtomicU64::new(0),
+                pause_reads: AtomicUsize::new(0),
                 #[cfg(test)]
                 last_seek_flags: Mutex::new(None),
             };
@@ -366,23 +694,40 @@ impl Core {
         }
     }
 
-    fn set_state(&self, state: PlaybackState) {
-        if matches!(&state, PlaybackState::Ready) {
-            self.ready_reported.store(false, Ordering::Relaxed);
+    /// Applies one explicit state transition. An edge outside the machine is
+    /// ignored and logged, and the old state stays in place.
+    fn transition(&self, next: PlaybackState) -> bool {
+        let next_label = format!("{next:?}");
+        let rejected = {
+            let mut state = self.state.lock().unwrap();
+            if !state.allows(&next) {
+                Some(state.clone())
+            } else if *state == next {
+                return false;
+            } else {
+                *state = next;
+                None
+            }
+        };
+        if let Some(previous) = rejected {
+            self.log.warn(format!(
+                "ignored playback transition: {previous:?} -> {next_label}"
+            ));
+            return false;
         }
-        *self.state.lock().unwrap() = state;
         self.wake();
+        true
     }
 
     fn open(&self, path: &Path) -> Result<(), String> {
         let bytes = path_bytes(path);
         self.log.info(format!("load: {}", path.to_string_lossy()));
         self.end_reported.store(false, Ordering::Relaxed);
-        self.set_state(PlaybackState::Loading);
+        self.transition(PlaybackState::Loading);
         match self.command_bytes(&[b"loadfile".as_slice(), bytes.as_slice()]) {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.set_state(PlaybackState::Failed(error.clone()));
+                self.transition(PlaybackState::Failed(error.clone()));
                 Err(error)
             }
         }
@@ -393,43 +738,42 @@ impl Core {
     }
 
     fn state(&self) -> PlaybackState {
-        let state = self.state.lock().unwrap().clone();
-        match state {
-            PlaybackState::Ready => {
-                if !self.ready_reported.swap(true, Ordering::Relaxed) {
-                    PlaybackState::Ready
-                } else if self.get_flag("pause").unwrap_or(true) {
-                    PlaybackState::Paused
-                } else {
-                    PlaybackState::Playing
-                }
-            }
-            PlaybackState::Playing | PlaybackState::Paused => {
-                if self.get_flag("pause").unwrap_or(true) {
-                    PlaybackState::Paused
-                } else {
-                    PlaybackState::Playing
-                }
-            }
-            other => other,
-        }
+        self.state.lock().unwrap().clone()
+    }
+
+    fn on_file_loaded(&self) {
+        // One pause read decides the stored state; a state query never reads it.
+        let paused = self.get_flag("pause").unwrap_or(false);
+        let next = if paused {
+            PlaybackState::Paused
+        } else {
+            PlaybackState::Playing
+        };
+        self.transition(next);
     }
 
     fn set_paused(&self, paused: bool) {
-        let ended = matches!(*self.state.lock().unwrap(), PlaybackState::Ended);
-        if !paused && ended {
-            self.seek(0.0);
+        if !paused && matches!(self.state(), PlaybackState::Ended) {
+            self.seek_exact(0.0);
         }
-        let _ = self.set_flag("pause", paused);
+        if self.set_flag("pause", paused).is_ok() {
+            let next = if paused {
+                PlaybackState::Paused
+            } else {
+                PlaybackState::Playing
+            };
+            self.transition(next);
+        }
     }
 
     fn toggle(&self) {
-        if matches!(*self.state.lock().unwrap(), PlaybackState::Ended) {
-            self.set_paused(false);
-            return;
+        match self.state() {
+            PlaybackState::Playing => self.set_paused(true),
+            PlaybackState::Paused | PlaybackState::Ended => self.set_paused(false),
+            other => self
+                .log
+                .warn(format!("ignored toggle in playback state {other:?}")),
         }
-        let paused = self.get_flag("pause").unwrap_or(false);
-        self.set_paused(!paused);
     }
 
     fn seek(&self, seconds: f64) {
@@ -437,9 +781,8 @@ impl Core {
             return;
         }
         self.seek_exact(seconds);
-        let mut state = self.state.lock().unwrap();
-        if matches!(*state, PlaybackState::Ended) {
-            *state = PlaybackState::Paused;
+        if matches!(self.state(), PlaybackState::Ended) {
+            self.transition(PlaybackState::Paused);
         }
     }
 
@@ -598,75 +941,91 @@ impl Core {
         )
     }
 
-    fn drain_events(&self) {
-        loop {
-            let event = unsafe { mpv::mpv_wait_event(self.handle, 0.0) };
-            if event.is_null() {
-                break;
+    /// Handles one event on the event thread. Returns true when the event asks
+    /// the event loop to stop.
+    fn handle_event(&self, event: *const mpv::Event) -> bool {
+        let id = unsafe { (*event).event_id };
+        match id {
+            mpv::EVENT_NONE => {}
+            mpv::EVENT_SHUTDOWN => {
+                self.log.info("mpv shut down");
+                return true;
             }
-            let id = unsafe { (*event).event_id };
-            if id == mpv::EVENT_NONE {
-                break;
+            mpv::EVENT_LOG_MESSAGE => {
+                let data = unsafe { (*event).data };
+                if data.is_null() {
+                    return false;
+                }
+                let message = unsafe { &*(data as *const mpv::EventLogMessage) };
+                if message.log_level > mpv::LOG_LEVEL_WARN {
+                    return false;
+                }
+                self.log.record_mpv_message(
+                    &text_at(message.level),
+                    &text_at(message.prefix),
+                    &text_at(message.text),
+                );
             }
-            match id {
-                mpv::EVENT_LOG_MESSAGE => {
-                    let data = unsafe { (*event).data };
-                    if data.is_null() {
-                        continue;
-                    }
-                    let message = unsafe { &*(data as *const mpv::EventLogMessage) };
-                    if message.log_level > mpv::LOG_LEVEL_WARN {
-                        continue;
-                    }
-                    self.log.record_mpv_message(
-                        &text_at(message.level),
-                        &text_at(message.prefix),
-                        &text_at(message.text),
-                    );
-                }
-                mpv::EVENT_FILE_LOADED => self.set_state(PlaybackState::Ready),
-                mpv::EVENT_END_FILE => {
-                    let data = unsafe { (*event).data };
-                    if data.is_null() {
-                        self.log_end_of_file("unknown");
-                        self.set_state(PlaybackState::Failed("the file ended unexpectedly".into()));
-                    } else {
-                        let end = unsafe { &*(data as *const mpv::EventEndFile) };
-                        let reason = end_reason(end.reason);
-                        if end.reason == mpv::END_FILE_REASON_ERROR {
-                            self.log_end_of_file(&format!("{reason}: {}", error_string(end.error)));
-                        } else {
-                            self.log_end_of_file(&reason);
-                        }
-                        if end.reason == mpv::END_FILE_REASON_ERROR {
-                            self.set_state(PlaybackState::Failed(error_string(end.error)));
-                        } else if end.reason == mpv::END_FILE_REASON_EOF {
-                            self.set_state(PlaybackState::Ended);
-                        } else {
-                            self.set_state(PlaybackState::Empty);
-                        }
-                    }
-                }
-                _ => {}
+            mpv::EVENT_FILE_LOADED => self.on_file_loaded(),
+            mpv::EVENT_END_FILE => self.on_end_file(unsafe { (*event).data }),
+            mpv::EVENT_QUEUE_OVERFLOW => self.on_queue_overflow(),
+            _ => {}
+        }
+        false
+    }
+
+    fn on_end_file(&self, data: *mut c_void) {
+        if data.is_null() {
+            self.log_end_of_file("unknown");
+            self.transition(PlaybackState::Failed("the file ended unexpectedly".into()));
+            return;
+        }
+        let end = unsafe { &*(data as *const mpv::EventEndFile) };
+        let reason = end_reason(end.reason);
+        if end.reason == mpv::END_FILE_REASON_ERROR {
+            self.log_end_of_file(&format!("{reason}: {}", error_string(end.error)));
+        } else {
+            self.log_end_of_file(&reason);
+        }
+        match end.reason {
+            mpv::END_FILE_REASON_EOF => {
+                self.transition(PlaybackState::Ended);
+            }
+            mpv::END_FILE_REASON_ERROR => {
+                self.transition(PlaybackState::Failed(error_string(end.error)));
+            }
+            // A stop or quit says nothing about the new file; wait for the next
+            // event and keep the state that is already stored.
+            mpv::END_FILE_REASON_STOP | mpv::END_FILE_REASON_QUIT => {}
+            _ => {
+                self.transition(PlaybackState::Empty);
             }
         }
-        self.observe_natural_eof();
+    }
+
+    fn on_queue_overflow(&self) {
+        self.log.failure(
+            "event queue overflow: events were dropped before they reached the player state",
+        );
+        if matches!(self.state(), PlaybackState::Playing) {
+            // Pause first: `set_paused` stores Paused only after the write
+            // succeeds, so a rejected pause leaves the state at Playing where
+            // playback actually is.
+            self.set_paused(true);
+        }
     }
 
     /// With keep-open, a natural end pauses at the last frame and emits no
     /// END_FILE event, so the eof-reached property is the only signal.
     fn observe_natural_eof(&self) {
-        let state = self.state.lock().unwrap().clone();
-        if !matches!(
-            state,
-            PlaybackState::Ready | PlaybackState::Playing | PlaybackState::Paused
-        ) {
+        let state = self.state();
+        if !matches!(state, PlaybackState::Playing | PlaybackState::Paused) {
             return;
         }
         if self.get_flag("eof-reached").unwrap_or(false) {
             if !self.end_reported.swap(true, Ordering::Relaxed) {
                 self.log.info("end of file: eof");
-                self.set_state(PlaybackState::Ended);
+                self.transition(PlaybackState::Ended);
             }
         } else {
             self.end_reported.store(false, Ordering::Relaxed);
@@ -803,6 +1162,10 @@ impl Core {
     }
 
     fn get_flag(&self, name: &str) -> Option<bool> {
+        #[cfg(test)]
+        if name == "pause" {
+            self.pause_reads.fetch_add(1, Ordering::Relaxed);
+        }
         let name = CString::new(name).unwrap();
         let mut value: c_int = 0;
         let result = unsafe {
@@ -819,12 +1182,82 @@ impl Core {
 
 impl Drop for Core {
     fn drop(&mut self) {
+        // SAFETY: This runs only when every `Arc<Core>` is gone. A render
+        // thread that was not joined leaks its Arc in `RenderThread::join` or
+        // `RenderThread::drop`, so the handle cannot be destroyed while that
+        // thread may still call into it.
         unsafe { mpv::mpv_terminate_destroy(self.handle) };
+    }
+}
+
+fn run_event_loop(core: Arc<Core>, requests: Receiver<Request>, mut render: RenderThread) {
+    'events: loop {
+        loop {
+            match requests.try_recv() {
+                Ok(Request::Shutdown) => break 'events,
+                Ok(request) => core.handle_request(request),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break 'events,
+            }
+        }
+
+        // Block in the event API. A queued command calls mpv_wakeup, which makes
+        // this return with EVENT_NONE so the next pass can run the command. The
+        // timeout rechecks the keep-open EOF flag, which emits no event.
+        let mut event = unsafe { mpv::mpv_wait_event(core.handle, EVENT_WAIT_SECONDS) };
+        while !event.is_null() {
+            let id = unsafe { (*event).event_id };
+            if id == mpv::EVENT_NONE {
+                break;
+            }
+            if core.handle_event(event) {
+                break 'events;
+            }
+            event = unsafe { mpv::mpv_wait_event(core.handle, 0.0) };
+        }
+        core.observe_natural_eof();
+    }
+
+    // Shutdown: tell the core to quit, then let the render thread free its
+    // context before this thread returns and the engine destroys the handle.
+    let _ = core.command(&["quit"]);
+    render.stop();
+    render.join(RENDER_JOIN_TIMEOUT, &core.log);
+}
+
+impl Core {
+    fn handle_request(&self, request: Request) {
+        match request {
+            Request::Open { path, reply } => {
+                let _ = reply.send(self.open(&path));
+            }
+            Request::Toggle { reply } => {
+                self.toggle();
+                let _ = reply.send(());
+            }
+            Request::Seek {
+                seconds,
+                preview,
+                reply,
+            } => {
+                if preview {
+                    self.seek_preview(seconds);
+                } else {
+                    self.seek(seconds);
+                }
+                let _ = reply.send(());
+            }
+            Request::Shutdown => {}
+        }
     }
 }
 
 struct RenderContext(*mut mpv::Render);
 
+// SAFETY: The render contract requires every render-context call on one
+// thread. The context is created on the render thread and freed there when
+// `Renderer` drops; it is never shared, so moving the wrapper between threads
+// cannot race. `Sync` is deliberately not implemented.
 unsafe impl Send for RenderContext {}
 
 impl Drop for RenderContext {
@@ -833,37 +1266,100 @@ impl Drop for RenderContext {
     }
 }
 
-impl RenderContext {
-    fn run(&self, core: Arc<Core>, surface: NativeSurface, stop: Arc<AtomicBool>) {
-        let size = (VIDEO_WIDTH * VIDEO_HEIGHT * 4) as usize;
-        let mut buffer = vec![0u8; size];
-        let mut id = 0u64;
-        while !stop.load(Ordering::Relaxed) {
-            core.drain_events();
-            let flags = unsafe { mpv::mpv_render_context_update(self.0) };
-            if flags & mpv::UPDATE_FRAME != 0 {
-                if self.render_frame(&mut buffer).is_ok() {
-                    opaque(&mut buffer);
-                    let bytes = std::mem::take(&mut buffer);
-                    if surface.push_bytes(frame(bytes), id).is_ok() {
-                        id += 1;
-                        #[cfg(test)]
-                        core.frames.fetch_add(1, Ordering::Relaxed);
-                    }
-                    buffer = vec![0u8; size];
-                }
-                unsafe { mpv::mpv_render_context_report_swap(self.0) };
-            } else {
-                thread::sleep(Duration::from_millis(1));
+struct Renderer {
+    render: RenderContext,
+    surface: NativeSurface,
+    stop: Arc<AtomicBool>,
+    wake: Arc<RenderWake>,
+    log: Arc<RunLog>,
+    #[cfg(test)]
+    frames: Arc<AtomicU64>,
+    buffer: Vec<u8>,
+    frame_id: u64,
+    pushed: u64,
+    completed_seen: u64,
+    format: SoftwareFormat,
+    render_error_logged: bool,
+    #[cfg(test)]
+    test_draws: Arc<AtomicU64>,
+}
+
+impl Renderer {
+    fn run(&mut self) {
+        self.buffer = vec![0u8; frame_size()];
+        while self.wake.wait(&self.stop) {
+            let flags = unsafe { mpv::mpv_render_context_update(self.render.0) };
+            if flags & mpv::UPDATE_FRAME == 0 {
+                continue;
+            }
+            let completed = self.completed_draws();
+            if completed > self.completed_seen {
+                // One completed draw resets the visibility window.
+                self.completed_seen = completed;
+                self.pushed = completed;
+            }
+            if skip_software_render(self.pushed, self.completed_seen) {
+                self.skip_frame();
+            } else if let Err(error) = self.render_frame_and_push() {
+                self.log_render_error_once(error);
+            }
+            // The immediate swap report stays next to the render call.
+            unsafe { mpv::mpv_render_context_report_swap(self.render.0) };
+        }
+    }
+
+    fn completed_draws(&self) -> u64 {
+        let completed = self.surface.counts().1;
+        #[cfg(test)]
+        {
+            completed + self.test_draws.load(Ordering::Relaxed)
+        }
+        #[cfg(not(test))]
+        {
+            completed
+        }
+    }
+
+    fn render_frame_and_push(&mut self) -> Result<(), String> {
+        match self.render_frame(self.format) {
+            Ok(()) => self.push_frame(),
+            Err(error) => {
+                let Some(fallback) = self.format.fallback(error.code) else {
+                    return Err(error.to_string());
+                };
+                self.log.warn(format!(
+                    "software render format {} rejected: {error}; falling back to {} with the alpha pass",
+                    self.format.label(),
+                    fallback.label()
+                ));
+                self.format = fallback;
+                self.render_frame(self.format)
+                    .map_err(|error| error.to_string())?;
+                self.push_frame()
             }
         }
     }
 
-    fn render_frame(&self, buffer: &mut [u8]) -> Result<(), String> {
+    fn push_frame(&mut self) -> Result<(), String> {
+        if self.format.alpha_pass {
+            opaque(&mut self.buffer);
+        }
+        let bytes = std::mem::take(&mut self.buffer);
+        let result = self.surface.push_bytes(frame(bytes), self.frame_id);
+        self.buffer = vec![0u8; frame_size()];
+        result?;
+        self.frame_id += 1;
+        self.pushed += 1;
+        #[cfg(test)]
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn skip_frame(&mut self) {
         let mut size = [VIDEO_WIDTH, VIDEO_HEIGHT];
         let mut stride = (VIDEO_WIDTH * 4) as usize;
         let block: c_int = 0;
-        let format = b"bgr0\0";
+        let mut skip: c_int = 1;
         let mut params = [
             mpv::Param {
                 type_: mpv::PARAM_SW_SIZE,
@@ -871,7 +1367,7 @@ impl RenderContext {
             },
             mpv::Param {
                 type_: mpv::PARAM_SW_FORMAT,
-                data: format.as_ptr() as *mut c_void,
+                data: self.format.name.as_ptr() as *mut c_void,
             },
             mpv::Param {
                 type_: mpv::PARAM_SW_STRIDE,
@@ -879,7 +1375,47 @@ impl RenderContext {
             },
             mpv::Param {
                 type_: mpv::PARAM_SW_POINTER,
-                data: buffer.as_mut_ptr() as *mut c_void,
+                data: self.buffer.as_mut_ptr() as *mut c_void,
+            },
+            mpv::Param {
+                type_: mpv::PARAM_BLOCK_FOR_TARGET_TIME,
+                data: &block as *const c_int as *mut c_void,
+            },
+            mpv::Param {
+                type_: mpv::PARAM_SKIP_RENDERING,
+                data: &mut skip as *mut c_int as *mut c_void,
+            },
+            mpv::Param {
+                type_: mpv::PARAM_INVALID,
+                data: ptr::null_mut(),
+            },
+        ];
+        let code = unsafe { mpv::mpv_render_context_render(self.render.0, params.as_mut_ptr()) };
+        if let Err(error) = check_render(code, "libmpv skip render") {
+            self.log_render_error_once(error);
+        }
+    }
+
+    fn render_frame(&mut self, format: SoftwareFormat) -> Result<(), RenderError> {
+        let mut size = [VIDEO_WIDTH, VIDEO_HEIGHT];
+        let mut stride = (VIDEO_WIDTH * 4) as usize;
+        let block: c_int = 0;
+        let mut params = [
+            mpv::Param {
+                type_: mpv::PARAM_SW_SIZE,
+                data: size.as_mut_ptr() as *mut c_void,
+            },
+            mpv::Param {
+                type_: mpv::PARAM_SW_FORMAT,
+                data: format.name.as_ptr() as *mut c_void,
+            },
+            mpv::Param {
+                type_: mpv::PARAM_SW_STRIDE,
+                data: &mut stride as *mut usize as *mut c_void,
+            },
+            mpv::Param {
+                type_: mpv::PARAM_SW_POINTER,
+                data: self.buffer.as_mut_ptr() as *mut c_void,
             },
             mpv::Param {
                 type_: mpv::PARAM_BLOCK_FOR_TARGET_TIME,
@@ -890,11 +1426,23 @@ impl RenderContext {
                 data: ptr::null_mut(),
             },
         ];
-        check(
-            unsafe { mpv::mpv_render_context_render(self.0, params.as_mut_ptr()) },
+        check_render(
+            unsafe { mpv::mpv_render_context_render(self.render.0, params.as_mut_ptr()) },
             "libmpv render",
         )
     }
+
+    /// Render failures can repeat every frame, so only the first one is logged.
+    fn log_render_error_once(&mut self, error: impl std::fmt::Display) {
+        if !self.render_error_logged {
+            self.render_error_logged = true;
+            self.log.warn(format!("software render failed: {error}"));
+        }
+    }
+}
+
+fn frame_size() -> usize {
+    (VIDEO_WIDTH * VIDEO_HEIGHT * 4) as usize
 }
 
 fn opaque(buffer: &mut [u8]) {
@@ -926,11 +1474,34 @@ unsafe fn create_render(handle: *mut mpv::Handle) -> Result<*mut mpv::Render, St
         },
     ];
     let mut render = ptr::null_mut();
-    check(
+    check_render(
         unsafe { mpv::mpv_render_context_create(&mut render, handle, params.as_mut_ptr()) },
         "libmpv render context",
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     Ok(render)
+}
+
+/// A rejected render call that keeps the libmpv code, so the format fallback
+/// can tell a rejected target from every other failure.
+struct RenderError {
+    what: &'static str,
+    code: c_int,
+}
+
+impl std::fmt::Display for RenderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: libmpv error {}", self.what, self.code)
+    }
+}
+
+/// A render-thread-safe error check. It must not call `mpv_error_string` or any
+/// other non-render client API function.
+fn check_render(code: c_int, what: &'static str) -> Result<(), RenderError> {
+    if code >= 0 {
+        return Ok(());
+    }
+    Err(RenderError { what, code })
 }
 
 unsafe fn set_option(ctx: *mut mpv::Handle, name: &str, value: &str) -> Result<(), String> {
@@ -1032,9 +1603,11 @@ mod mpv {
     }
 
     pub const EVENT_NONE: c_int = 0;
+    pub const EVENT_SHUTDOWN: c_int = 1;
     pub const EVENT_LOG_MESSAGE: c_int = 2;
     pub const EVENT_END_FILE: c_int = 7;
     pub const EVENT_FILE_LOADED: c_int = 8;
+    pub const EVENT_QUEUE_OVERFLOW: c_int = 24;
     pub const END_FILE_REASON_EOF: c_int = 0;
     pub const END_FILE_REASON_STOP: c_int = 2;
     pub const END_FILE_REASON_QUIT: c_int = 3;
@@ -1042,6 +1615,10 @@ mod mpv {
     pub const END_FILE_REASON_REDIRECT: c_int = 5;
 
     pub const LOG_LEVEL_WARN: c_int = 30;
+
+    pub const ERROR_UNSUPPORTED: c_int = -18;
+    #[cfg(test)]
+    pub const ERROR_INVALID_PARAMETER: c_int = -4;
 
     pub const FORMAT_STRING: c_int = 1;
     pub const FORMAT_FLAG: c_int = 3;
@@ -1053,6 +1630,7 @@ mod mpv {
 
     pub const PARAM_API_TYPE: c_int = 1;
     pub const PARAM_BLOCK_FOR_TARGET_TIME: c_int = 12;
+    pub const PARAM_SKIP_RENDERING: c_int = 13;
     pub const PARAM_SW_SIZE: c_int = 17;
     pub const PARAM_SW_FORMAT: c_int = 18;
     pub const PARAM_SW_STRIDE: c_int = 19;
@@ -1085,6 +1663,7 @@ mod mpv {
             data: *mut c_void,
         ) -> c_int;
         pub fn mpv_wait_event(ctx: *mut Handle, timeout: f64) -> *mut Event;
+        pub fn mpv_wakeup(ctx: *mut Handle);
         pub fn mpv_error_string(error: c_int) -> *const c_char;
         pub fn mpv_free(data: *mut c_void);
         pub fn mpv_free_node_contents(node: *mut Node);
@@ -1094,13 +1673,17 @@ mod mpv {
             ctx: *mut Handle,
             params: *mut Param,
         ) -> c_int;
+        pub fn mpv_render_context_set_update_callback(
+            ctx: *mut Render,
+            callback: Option<extern "C" fn(*mut c_void)>,
+            callback_ctx: *mut c_void,
+        );
         pub fn mpv_render_context_update(ctx: *mut Render) -> u64;
         pub fn mpv_render_context_render(ctx: *mut Render, params: *mut Param) -> c_int;
         pub fn mpv_render_context_report_swap(ctx: *mut Render);
         pub fn mpv_render_context_free(ctx: *mut Render);
     }
 }
-
 fn path_bytes(path: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     path.as_os_str().as_bytes().to_vec()
@@ -1114,6 +1697,7 @@ fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
     use std::time::Instant;
 
     #[test]
@@ -1142,6 +1726,8 @@ mod tests {
     fn wait_for_frame_count(engine: &MpvEngine, target: u64) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while engine.frames() < target && Instant::now() < deadline {
+            // These tests have no Rune window, so mark the surface visible.
+            engine.note_draw();
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
@@ -1154,6 +1740,43 @@ mod tests {
 
     fn wait_for_frame(engine: &MpvEngine) {
         wait_for_frame_count(engine, 1);
+    }
+
+    fn wait_for_pushes(engine: &MpvEngine, target: u64) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.frames() < target && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            engine.frames() >= target,
+            "libmpv pushed {} frames, wanted {target}: {:?}",
+            engine.frames(),
+            engine.state()
+        );
+    }
+
+    fn wait_for_loaded(engine: &MpvEngine) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !engine.state().is_loaded() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(engine.state().is_loaded(), "{:?}", engine.state());
+    }
+
+    fn wait_for_paused(engine: &MpvEngine) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.state() != PlaybackState::Paused && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.state(), PlaybackState::Paused);
+    }
+
+    fn wait_for_seek_flags(engine: &MpvEngine, wanted: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.last_seek_flags().as_deref() != Some(wanted) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.last_seek_flags().as_deref(), Some(wanted));
     }
 
     fn wait_for_error(engine: &MpvEngine) {
@@ -1287,6 +1910,7 @@ mod tests {
         engine.open(&fixture("rgbw.mkv")).unwrap();
         wait_for_frame(&engine);
         engine.toggle();
+        wait_for_paused(&engine);
         engine.set_volume(0.4);
         engine.set_speed(1.25);
         engine.seek_preview(0.5);
@@ -1419,6 +2043,7 @@ mod tests {
         assert_eq!(engine.state(), PlaybackState::Empty);
         engine.open(&fixture("rgbw.mkv")).unwrap();
         wait_for_frame(&engine);
+        wait_for_loaded(&engine);
         assert!(engine.state().is_loaded(), "{:?}", engine.state());
     }
 
@@ -1447,15 +2072,14 @@ mod tests {
 
         // Pause so the next frame is the seek's, and let an in-flight frame land.
         engine.toggle();
+        wait_for_paused(&engine);
         thread::sleep(Duration::from_millis(100));
-        // Consume the one-shot Ready so the comparison measures a real transition.
-        let _ = engine.state();
         let state_before = engine.state();
         let frames = engine.frames();
         let wakes_before = wakes.load(Ordering::Relaxed);
 
         engine.seek(0.5);
-        assert_eq!(engine.last_seek_flags().as_deref(), Some("absolute+exact"));
+        wait_for_seek_flags(&engine, "absolute+exact");
         wait_for_frame_count(&engine, frames + 1);
 
         assert_eq!(
@@ -1476,12 +2100,14 @@ mod tests {
         wait_for_frame(&engine);
 
         engine.toggle();
+        wait_for_paused(&engine);
         thread::sleep(Duration::from_millis(150));
         let frames = engine.frames();
 
         // rgbw.mkv has keyframes at 0.0, 0.5 and 0.75 s. 0.25 s is between
         // the first two keyframes, so a keyframe seek cannot show it.
         engine.seek_preview(0.25);
+        wait_for_seek_flags(&engine, "absolute+exact");
         wait_for_frame_count(&engine, frames + 1);
 
         let landed = engine.position();
@@ -1497,6 +2123,7 @@ mod tests {
         engine.open(&fixture("rgbw.mkv")).unwrap();
         wait_for_frame(&engine);
         engine.toggle();
+        wait_for_paused(&engine);
         thread::sleep(Duration::from_millis(150));
 
         engine.seek_preview(0.25);
@@ -1525,14 +2152,13 @@ mod tests {
         wait_for_frame(&engine);
 
         engine.toggle();
+        wait_for_paused(&engine);
         thread::sleep(Duration::from_millis(100));
-        // Consume the one-shot Ready so the comparison measures a real transition.
-        let _ = engine.state();
         let state_before = engine.state();
         let frames = engine.frames();
 
         engine.seek_preview(0.5);
-        assert_eq!(engine.last_seek_flags().as_deref(), Some("absolute+exact"));
+        wait_for_seek_flags(&engine, "absolute+exact");
         wait_for_frame_count(&engine, frames + 1);
 
         assert_eq!(engine.state(), state_before);
@@ -1564,5 +2190,207 @@ mod tests {
         engine.select_audio(audio[1].id).unwrap();
         engine.select_subtitle(Some(subtitle.id)).unwrap();
         engine.select_subtitle(None).unwrap();
+    }
+
+    #[test]
+    fn the_visibility_skip_waits_for_three_undrawn_pushes() {
+        assert!(!skip_software_render(0, 0));
+        assert!(!skip_software_render(2, 0));
+        assert!(skip_software_render(3, 0));
+        assert!(skip_software_render(9, 0));
+    }
+
+    #[test]
+    fn a_completed_draw_resets_the_visibility_skip() {
+        assert!(!skip_software_render(3, 1));
+        assert!(skip_software_render(4, 1));
+        assert!(!skip_software_render(3, 3));
+        assert!(skip_software_render(6, 3));
+    }
+
+    #[test]
+    fn bgra_is_the_primary_target_without_the_alpha_pass() {
+        assert_eq!(SoftwareFormat::BGRA.label(), "bgra");
+        assert!(!SoftwareFormat::BGRA.alpha_pass);
+        assert_eq!(SoftwareFormat::BGRA.name, b"bgra\0");
+    }
+
+    #[test]
+    fn a_rejected_bgra_falls_back_to_bgr0_with_the_alpha_pass() {
+        assert_eq!(
+            SoftwareFormat::BGRA.fallback(mpv::ERROR_UNSUPPORTED),
+            Some(SoftwareFormat::BGR0)
+        );
+        assert_eq!(SoftwareFormat::BGR0.label(), "bgr0");
+        assert!(SoftwareFormat::BGR0.alpha_pass);
+        assert_eq!(SoftwareFormat::BGR0.fallback(mpv::ERROR_UNSUPPORTED), None);
+    }
+
+    #[test]
+    fn a_non_unsupported_render_error_keeps_bgra() {
+        assert_eq!(
+            SoftwareFormat::BGRA.fallback(mpv::ERROR_INVALID_PARAMETER),
+            None,
+            "only a rejected format is allowed to change the target"
+        );
+        assert_eq!(SoftwareFormat::BGRA.label(), "bgra");
+    }
+
+    #[test]
+    fn the_alpha_pass_makes_every_pixel_opaque() {
+        let mut buffer = vec![0u8; 8];
+        opaque(&mut buffer);
+        assert_eq!(buffer, [0, 0, 0, 255, 0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_hidden_surface_stops_after_three_undrawn_pushes_and_resumes_on_a_draw() {
+        let mut engine = engine();
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_pushes(&engine, 3);
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(
+            engine.frames(),
+            3,
+            "a hidden surface must stop converting after three undrawn pushes"
+        );
+
+        engine.note_draw();
+        wait_for_frame_count(&engine, 4);
+    }
+
+    #[test]
+    fn the_file_loaded_event_reads_pause_once_and_stores_the_state() {
+        let engine = engine();
+        let before = engine.core.pause_reads.load(Ordering::Relaxed);
+        assert!(engine.core.transition(PlaybackState::Loading));
+        engine.core.on_file_loaded();
+        assert_eq!(
+            engine.core.pause_reads.load(Ordering::Relaxed) - before,
+            1,
+            "the file-loaded event must read pause exactly once"
+        );
+        assert_eq!(engine.core.state(), PlaybackState::Playing);
+
+        engine.core.set_flag("pause", true).unwrap();
+        assert!(engine.core.transition(PlaybackState::Loading));
+        engine.core.on_file_loaded();
+        assert_eq!(
+            engine.core.pause_reads.load(Ordering::Relaxed) - before,
+            2,
+            "the second file-loaded event reads pause once too"
+        );
+        assert_eq!(engine.core.state(), PlaybackState::Paused);
+    }
+
+    #[test]
+    fn the_state_query_reads_no_properties() {
+        let mut engine = engine();
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_frame(&engine);
+        wait_for_loaded(&engine);
+        let before = engine.core.pause_reads.load(Ordering::Relaxed);
+        for _ in 0..20 {
+            let _ = engine.state();
+        }
+        assert_eq!(
+            engine.core.pause_reads.load(Ordering::Relaxed),
+            before,
+            "the state query must not read pause"
+        );
+    }
+
+    #[test]
+    fn an_illegal_transition_is_ignored_and_logged() {
+        let (log, _sink, path) = crate::log::testing::log_to_file("engine-transition");
+        let engine = MpvEngine::new(true, log).unwrap();
+        assert_eq!(engine.core.state(), PlaybackState::Empty);
+        assert!(!engine.core.transition(PlaybackState::Playing));
+        assert_eq!(engine.core.state(), PlaybackState::Empty);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("ignored playback transition: Empty -> Playing"),
+            "{text}"
+        );
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_queue_overflow_is_a_failure_and_pauses_playback() {
+        let (log, _sink, path) = crate::log::testing::log_to_file("engine-overflow");
+        let engine = MpvEngine::new(true, log).unwrap();
+        assert!(engine.core.transition(PlaybackState::Loading));
+        assert!(engine.core.transition(PlaybackState::Playing));
+        engine.core.on_queue_overflow();
+        assert_eq!(engine.core.state(), PlaybackState::Paused);
+        assert_eq!(
+            engine.core.get_flag("pause"),
+            Some(true),
+            "the player must be paused before the state says Paused"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("failure: event queue overflow"),
+            "overflow needs a failure record, not a warning: {text}"
+        );
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn end_file_stop_and_quit_keep_the_current_state() {
+        let engine = engine();
+        assert!(engine.core.transition(PlaybackState::Loading));
+        assert!(engine.core.transition(PlaybackState::Playing));
+
+        let stop = mpv::EventEndFile {
+            reason: mpv::END_FILE_REASON_STOP,
+            error: 0,
+        };
+        engine.core.on_end_file(&stop as *const _ as *mut c_void);
+        assert_eq!(engine.core.state(), PlaybackState::Playing);
+
+        let quit = mpv::EventEndFile {
+            reason: mpv::END_FILE_REASON_QUIT,
+            error: 0,
+        };
+        engine.core.on_end_file(&quit as *const _ as *mut c_void);
+        assert_eq!(engine.core.state(), PlaybackState::Playing);
+    }
+
+    #[test]
+    fn a_render_join_times_out_and_keeps_the_core_alive() {
+        let (log, _sink, path) = crate::log::testing::log_to_file("engine-render-timeout");
+        let core = Arc::new(Core::new(true, quiet()).unwrap());
+        let core_ref = Arc::downgrade(&core);
+        let (done, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(500));
+            let _ = done.send(());
+        });
+        let mut render = RenderThread {
+            core: Some(core.clone()),
+            stop: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new(RenderWake::new()),
+            done: done_rx,
+            handle: Some(handle),
+        };
+        let started = Instant::now();
+        assert!(!render.join(Duration::from_millis(20), &log));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the join must return at its deadline"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("render thread did not stop within"), "{text}");
+
+        drop(render);
+        drop(core);
+        assert!(
+            core_ref.upgrade().is_some(),
+            "a detached render thread may still use the handle, so the core must stay alive"
+        );
+        let _ = std::fs::remove_file(path);
     }
 }
