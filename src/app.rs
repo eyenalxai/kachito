@@ -1750,6 +1750,51 @@ mod tests {
     }
 
     #[test]
+    fn a_stuck_preview_clears_at_five_seconds_and_restores_the_engine_position() {
+        let (mut app, log, clock) = app_with_fake_and_clock();
+        let session = session_mut(&mut app);
+        session.timeline_mut().set_duration(10.0, 1.0 / 60.0);
+        session.timeline_mut().set_position(5.0);
+
+        session.seek_preview(5.0);
+        assert_eq!(log.lock().unwrap().preview_seeks, 1);
+        {
+            let mut log = log.lock().unwrap();
+            log.seeking = true;
+            log.position = 2.0;
+        }
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert!(session.is_scrubbing());
+        assert!(format!("{tx:?}").contains("16ms"), "{tx:?}");
+
+        clock.advance(Duration::from_millis(4_999));
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert!(
+            session.is_scrubbing(),
+            "the preview cleared before the deadline"
+        );
+        assert!(format!("{tx:?}").contains("16ms"), "{tx:?}");
+
+        clock.advance(Duration::from_millis(1));
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert!(
+            !session.is_scrubbing(),
+            "the stuck preview stayed pending past the deadline"
+        );
+        assert_eq!(session.timeline().position(), 2.0);
+        assert!(!format!("{tx:?}").contains("16ms"), "{tx:?}");
+        let notice = session.error().expect("one notice");
+        assert!(notice.contains("seek"), "{notice}");
+
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert_eq!(session.error().as_deref(), Some(notice.as_str()));
+    }
+
+    #[test]
     fn a_stuck_seek_expires_after_the_engine_fails() {
         let (mut app, log, clock) = app_with_fake_and_clock();
         let session = session_mut(&mut app);

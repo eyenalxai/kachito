@@ -31,6 +31,13 @@ struct PendingSeek {
     requested_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PendingPreview {
+    target: f64,
+    requested_at: Instant,
+    issued: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TracksState {
     Unloaded,
@@ -157,7 +164,7 @@ pub struct PlaybackSession {
     timeline: Timeline,
     scrubbing: bool,
     pending_seek: Option<PendingSeek>,
-    preview_target: Option<f64>,
+    pending_preview: Option<PendingPreview>,
     export: Option<ExportJob>,
     notices: Notices,
 }
@@ -182,7 +189,7 @@ impl PlaybackSession {
             timeline: Timeline::new(),
             scrubbing: false,
             pending_seek: None,
-            preview_target: None,
+            pending_preview: None,
             export: None,
             notices: Notices::default(),
         }
@@ -294,11 +301,11 @@ impl PlaybackSession {
         let Some(seconds) = self.clamp_target(seconds, &state) else {
             self.scrubbing = false;
             self.pending_seek = None;
-            self.preview_target = None;
+            self.pending_preview = None;
             return;
         };
         let from_preview = self.scrubbing;
-        self.preview_target = None;
+        self.pending_preview = None;
         let settled = from_preview
             && matches!(state, PlaybackState::Paused | PlaybackState::Playing)
             && !self.engine.is_seeking()
@@ -327,7 +334,11 @@ impl PlaybackSession {
         // A new drag supersedes a final seek that has not landed.
         self.scrubbing = true;
         self.pending_seek = None;
-        self.preview_target = Some(seconds);
+        self.pending_preview = Some(PendingPreview {
+            target: seconds,
+            requested_at: self.clock.now(),
+            issued: false,
+        });
         if !self.engine.is_seeking() {
             self.issue_preview();
         }
@@ -348,15 +359,21 @@ impl PlaybackSession {
     }
 
     fn issue_preview(&mut self) {
-        if let Some(target) = self.preview_target.take() {
-            self.engine.seek_preview(target);
+        let Some(preview) = self.pending_preview.as_mut() else {
+            return;
+        };
+        if preview.issued {
+            return;
         }
+        let target = preview.target;
+        preview.issued = true;
+        self.engine.seek_preview(target);
     }
 
     pub fn set_scrubbing(&mut self, scrubbing: bool) {
         self.scrubbing = scrubbing;
         self.pending_seek = None;
-        self.preview_target = None;
+        self.pending_preview = None;
     }
 
     pub fn seek_fraction(&mut self, fraction: f32) {
@@ -472,6 +489,7 @@ impl PlaybackSession {
             changed = true;
         }
         changed |= self.resolve_pending_seek(&state, playback_ready);
+        changed |= self.resolve_pending_preview(&state, playback_ready);
         self.notices.resolve();
         changed |= self.error() != previous_notice;
         if playback_ready {
@@ -508,6 +526,13 @@ impl PlaybackSession {
                 .saturating_duration_since(pending.requested_at);
             tx.wake_after(SEEK_DEADLINE.saturating_sub(elapsed));
         }
+        if let Some(preview) = self.pending_preview {
+            let elapsed = self
+                .clock
+                .now()
+                .saturating_duration_since(preview.requested_at);
+            tx.wake_after(SEEK_DEADLINE.saturating_sub(elapsed));
+        }
         changed
     }
 
@@ -532,17 +557,46 @@ impl PlaybackSession {
         {
             return false;
         }
+        self.expire_seek(pending.target)
+    }
+
+    fn resolve_pending_preview(&mut self, state: &PlaybackState, playback_ready: bool) -> bool {
+        let Some(preview) = self.pending_preview else {
+            return false;
+        };
+        if preview.issued {
+            let landed = playback_ready
+                && state.is_loaded()
+                && !self.engine.is_seeking()
+                && (self.engine.position() - preview.target).abs() <= self.seek_tolerance();
+            if landed {
+                self.pending_preview = None;
+                return false;
+            }
+        }
+        if self
+            .clock
+            .now()
+            .saturating_duration_since(preview.requested_at)
+            < SEEK_DEADLINE
+        {
+            return false;
+        }
+        self.expire_seek(preview.target)
+    }
+
+    fn expire_seek(&mut self, target: f64) -> bool {
         let position = self.engine.position();
         self.pending_seek = None;
+        self.pending_preview = None;
         self.scrubbing = false;
-        self.preview_target = None;
         self.timeline.set_position(position);
         self.notices.record_seek(
             "The seek did not finish in time. Playback continues from the current position.".into(),
         );
         self.log.warn(format!(
             "notice: seek deadline: target {:.3}s, position {:.3}s",
-            pending.target, position
+            target, position
         ));
         true
     }
@@ -601,7 +655,7 @@ impl PlaybackSession {
             self.timeline = Timeline::new();
             self.scrubbing = false;
             self.pending_seek = None;
-            self.preview_target = None;
+            self.pending_preview = None;
             self.export = None;
             self.notices.export = None;
             self.notices.seek = None;
@@ -667,7 +721,7 @@ impl PlaybackSession {
             timeline: Timeline::new(),
             scrubbing: false,
             pending_seek: None,
-            preview_target: None,
+            pending_preview: None,
             export: None,
             notices: Notices::default(),
         }
