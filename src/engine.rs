@@ -191,6 +191,11 @@ pub trait PlayerEngine: Send {
     fn select_subtitle(&mut self, id: Option<i64>) -> Result<(), String>;
     /// Installs the app waker for playback state changes and surface pushes.
     fn set_waker(&self, waker: Waker);
+    /// Sets pause explicitly. The startup sequence uses this before a load.
+    fn set_paused(&mut self, paused: bool) -> Result<(), String>;
+    /// Takes the pending frame-start signal. True after the first video reconfig
+    /// or the first frame the render thread pushes since it was last taken.
+    fn take_first_frame(&mut self) -> bool;
     /// Takes the most recent rejected command, once, for the one-notice rule.
     fn take_command_failure(&mut self) -> Option<String>;
 }
@@ -210,6 +215,10 @@ enum Request {
         seconds: f64,
         preview: bool,
         reply: SyncSender<()>,
+    },
+    Pause {
+        paused: bool,
+        reply: SyncSender<Result<(), String>>,
     },
     Shutdown,
 }
@@ -353,6 +362,7 @@ impl MpvEngine {
     /// `headless` keeps audio off so tests do not open a device.
     pub fn new(headless: bool, log: Arc<RunLog>) -> Result<Self, String> {
         let core = Arc::new(Core::new(headless, log.clone())?);
+        let first_frame = core.first_frame.clone();
         let surface = NativeSurface::new();
         let wake = Arc::new(RenderWake::new());
         let render_stop = Arc::new(AtomicBool::new(false));
@@ -369,6 +379,7 @@ impl MpvEngine {
             let wake = wake.clone();
             let stop = render_stop.clone();
             let log = log.clone();
+            let first_frame = first_frame.clone();
             #[cfg(test)]
             let frames = frames.clone();
             #[cfg(test)]
@@ -399,6 +410,7 @@ impl MpvEngine {
                             stop,
                             wake,
                             log,
+                            first_frame,
                             #[cfg(test)]
                             frames,
                             buffer: Vec::new(),
@@ -571,6 +583,17 @@ impl PlayerEngine for MpvEngine {
         self.core.set_waker(waker.clone());
         self.surface.set_waker(waker);
     }
+    fn set_paused(&mut self, paused: bool) -> Result<(), String> {
+        let (reply, done) = std::sync::mpsc::sync_channel(1);
+        self.requests
+            .send(Request::Pause { paused, reply })
+            .map_err(|_| "the playback event thread is not running".to_string())?;
+        self.wake_event_thread();
+        self.wait_for_reply(done, "pause")?
+    }
+    fn take_first_frame(&mut self) -> bool {
+        self.core.take_first_frame()
+    }
     fn take_command_failure(&mut self) -> Option<String> {
         self.core.failure.lock().unwrap().take()
     }
@@ -591,6 +614,7 @@ struct Core {
     log: Arc<RunLog>,
     state: Mutex<PlaybackState>,
     end_reported: AtomicBool,
+    first_frame: Arc<AtomicBool>,
     failure: Mutex<Option<String>>,
     waker: Mutex<Option<Waker>>,
     #[cfg(test)]
@@ -625,6 +649,10 @@ impl Core {
                 ("video-timing-offset", "0"),
                 ("osd-level", "0"),
                 ("osc", "no"),
+                ("ytdl", "no"),
+                ("load-scripts", "no"),
+                ("load-stats-overlay", "no"),
+                ("load-osd-console", "no"),
                 ("input-default-bindings", "no"),
                 ("input-vo-keyboard", "no"),
             ];
@@ -665,6 +693,7 @@ impl Core {
                 log,
                 state: Mutex::new(PlaybackState::Empty),
                 end_reported: AtomicBool::new(false),
+                first_frame: Arc::new(AtomicBool::new(false)),
                 failure: Mutex::new(None),
                 waker: Mutex::new(None),
                 #[cfg(test)]
@@ -723,6 +752,7 @@ impl Core {
         let bytes = path_bytes(path);
         self.log.info(format!("load: {}", path.to_string_lossy()));
         self.end_reported.store(false, Ordering::Relaxed);
+        self.first_frame.store(false, Ordering::Relaxed);
         self.transition(PlaybackState::Loading);
         match self.command_bytes(&[b"loadfile".as_slice(), bytes.as_slice()]) {
             Ok(()) => Ok(()),
@@ -752,11 +782,12 @@ impl Core {
         self.transition(next);
     }
 
-    fn set_paused(&self, paused: bool) {
+    fn set_paused(&self, paused: bool) -> Result<(), String> {
         if !paused && matches!(self.state(), PlaybackState::Ended) {
             self.seek_exact(0.0);
         }
-        if self.set_flag("pause", paused).is_ok() {
+        self.set_flag("pause", paused)?;
+        if self.state().is_loaded() || matches!(self.state(), PlaybackState::Loading) {
             let next = if paused {
                 PlaybackState::Paused
             } else {
@@ -764,12 +795,21 @@ impl Core {
             };
             self.transition(next);
         }
+        Ok(())
+    }
+
+    fn take_first_frame(&self) -> bool {
+        self.first_frame.swap(false, Ordering::Relaxed)
     }
 
     fn toggle(&self) {
         match self.state() {
-            PlaybackState::Playing => self.set_paused(true),
-            PlaybackState::Paused | PlaybackState::Ended => self.set_paused(false),
+            PlaybackState::Playing => {
+                let _ = self.set_paused(true);
+            }
+            PlaybackState::Paused | PlaybackState::Ended => {
+                let _ = self.set_paused(false);
+            }
             other => self
                 .log
                 .warn(format!("ignored toggle in playback state {other:?}")),
@@ -967,6 +1007,7 @@ impl Core {
                 );
             }
             mpv::EVENT_FILE_LOADED => self.on_file_loaded(),
+            mpv::EVENT_VIDEO_RECONFIG => self.first_frame.store(true, Ordering::Relaxed),
             mpv::EVENT_END_FILE => self.on_end_file(unsafe { (*event).data }),
             mpv::EVENT_QUEUE_OVERFLOW => self.on_queue_overflow(),
             _ => {}
@@ -1011,7 +1052,7 @@ impl Core {
             // Pause first: `set_paused` stores Paused only after the write
             // succeeds, so a rejected pause leaves the state at Playing where
             // playback actually is.
-            self.set_paused(true);
+            let _ = self.set_paused(true);
         }
     }
 
@@ -1247,6 +1288,9 @@ impl Core {
                 }
                 let _ = reply.send(());
             }
+            Request::Pause { paused, reply } => {
+                let _ = reply.send(self.set_paused(paused));
+            }
             Request::Shutdown => {}
         }
     }
@@ -1272,6 +1316,7 @@ struct Renderer {
     stop: Arc<AtomicBool>,
     wake: Arc<RenderWake>,
     log: Arc<RunLog>,
+    first_frame: Arc<AtomicBool>,
     #[cfg(test)]
     frames: Arc<AtomicU64>,
     buffer: Vec<u8>,
@@ -1350,6 +1395,7 @@ impl Renderer {
         result?;
         self.frame_id += 1;
         self.pushed += 1;
+        self.first_frame.store(true, Ordering::Relaxed);
         #[cfg(test)]
         self.frames.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1607,6 +1653,7 @@ mod mpv {
     pub const EVENT_LOG_MESSAGE: c_int = 2;
     pub const EVENT_END_FILE: c_int = 7;
     pub const EVENT_FILE_LOADED: c_int = 8;
+    pub const EVENT_VIDEO_RECONFIG: c_int = 17;
     pub const EVENT_QUEUE_OVERFLOW: c_int = 24;
     pub const END_FILE_REASON_EOF: c_int = 0;
     pub const END_FILE_REASON_STOP: c_int = 2;
@@ -1838,6 +1885,58 @@ mod tests {
         assert_eq!(sink.lines(), text.lines().collect::<Vec<_>>());
         drop(engine);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn built_in_script_loaders_and_auto_loaded_scripts_are_off() {
+        let engine = engine();
+        for name in [
+            "load-scripts",
+            "osc",
+            "ytdl",
+            "load-stats-overlay",
+            "load-osd-console",
+        ] {
+            assert_eq!(
+                engine.core.get_flag(name),
+                Some(false),
+                "{name} must be off before initialization"
+            );
+        }
+    }
+
+    #[test]
+    fn a_video_reconfig_signals_the_frame_start() {
+        let mut engine = engine();
+        let event = mpv::Event {
+            event_id: mpv::EVENT_VIDEO_RECONFIG,
+            error: 0,
+            reply_userdata: 0,
+            data: ptr::null_mut(),
+        };
+        assert!(!engine.core.handle_event(&event));
+        assert!(engine.take_first_frame());
+        assert!(!engine.take_first_frame());
+    }
+
+    #[test]
+    fn an_explicit_pause_before_load_holds_until_the_first_frame() {
+        let mut engine = engine();
+        engine.set_paused(true).unwrap();
+        assert_eq!(engine.core.get_flag("pause"), Some(true));
+        assert_eq!(engine.state(), PlaybackState::Empty);
+
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_frame(&engine);
+        assert_eq!(engine.state(), PlaybackState::Paused);
+        assert!(engine.take_first_frame());
+
+        engine.set_paused(false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.state() != PlaybackState::Playing && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.state(), PlaybackState::Playing);
     }
 
     #[test]

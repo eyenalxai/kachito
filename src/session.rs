@@ -165,6 +165,9 @@ pub struct PlaybackSession {
     scrubbing: bool,
     pending_seek: Option<PendingSeek>,
     pending_preview: Option<PendingPreview>,
+    /// True while the engine holds a pause this session set before a load. A
+    /// user toggle relinquishes it, and the first frame clears it.
+    startup_pause: bool,
     export: Option<ExportJob>,
     notices: Notices,
 }
@@ -190,6 +193,7 @@ impl PlaybackSession {
             scrubbing: false,
             pending_seek: None,
             pending_preview: None,
+            startup_pause: false,
             export: None,
             notices: Notices::default(),
         }
@@ -211,10 +215,25 @@ impl PlaybackSession {
             return Err(format!("{} is not a readable video file.", path.display()));
         }
         let awaiting = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+        // Pause before the load so picture and sound start together. Only the
+        // first video reconfig or the first pushed frame clears this pause,
+        // and only while it is still automatic.
+        let paused = self.engine.set_paused(true);
+        if let Err(error) = &paused {
+            self.log
+                .warn(format!("startup pause was not applied: {error}"));
+        }
+        // An automatic pause is not a user command, so its rejection is not a
+        // notice. The run log keeps the engine's property failure.
+        self.engine.take_command_failure();
         let opened = self.engine.open(&path);
         // A rejected loadfile is the engine failure, not a command notice.
         self.engine.take_command_failure();
+        if let Err(error) = &opened {
+            self.log.failure(format!("load failed: {error}"));
+        }
         opened?;
+        self.startup_pause = paused.is_ok();
         self.notices.reset_command();
         self.notices.reset_engine();
         self.awaiting_source = Some(awaiting);
@@ -289,6 +308,9 @@ impl PlaybackSession {
 
     pub fn toggle(&mut self) {
         if self.engine.state().is_loaded() {
+            // A user toggle owns the pause from here; the first frame must not
+            // clear what the user chose.
+            self.startup_pause = false;
             self.engine.toggle();
         }
     }
@@ -472,8 +494,9 @@ impl PlaybackSession {
 
     pub fn poll(&mut self, tx: &mut Tx) -> bool {
         let previous_notice = self.error();
+        let mut changed = self.clear_startup_pause();
         let state = self.engine.state();
-        let mut changed = self.notices.take_changed();
+        changed |= self.notices.take_changed();
         changed |= self.notices.observe_engine(&state);
         changed |= self.observe_command_failure();
         changed |= self.confirm_open(&state);
@@ -534,6 +557,24 @@ impl PlaybackSession {
             tx.wake_after(SEEK_DEADLINE.saturating_sub(elapsed));
         }
         changed
+    }
+
+    fn clear_startup_pause(&mut self) -> bool {
+        // Consume the signal even when a user took the pause over, so a stale
+        // first frame cannot clear the next file's startup pause.
+        let first_frame = self.engine.take_first_frame();
+        if !self.startup_pause || !first_frame {
+            return false;
+        }
+        self.startup_pause = false;
+        match self.engine.set_paused(false) {
+            Ok(()) => true,
+            Err(error) => {
+                self.log
+                    .warn(format!("automatic pause was not cleared: {error}"));
+                false
+            }
+        }
     }
 
     fn resolve_pending_seek(&mut self, state: &PlaybackState, playback_ready: bool) -> bool {
@@ -719,6 +760,7 @@ impl PlaybackSession {
             scrubbing: false,
             pending_seek: None,
             pending_preview: None,
+            startup_pause: false,
             export: None,
             notices: Notices::default(),
         }

@@ -249,11 +249,8 @@ fn run(
 ) {
     let duration = request.duration();
     let temp = temp_output(&request.output);
-    let mut command = Command::new("ffmpeg");
-    command
-        .args(request.command_to(&temp))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = export_command(&request, &temp);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -353,6 +350,17 @@ fn run(
     }
 }
 
+/// Builds the ffmpeg process behind the export priority wrapper.
+fn export_command(request: &ExportRequest, output: &Path) -> Command {
+    let mut command = Command::new("nice");
+    command
+        .arg("-n")
+        .arg("10")
+        .arg("ffmpeg")
+        .args(request.command_to(output));
+    command
+}
+
 fn set_state(state: &Arc<Mutex<ExportState>>, next: ExportState) {
     *state.lock().unwrap() = next;
 }
@@ -449,6 +457,35 @@ mod tests {
         assert!(!command.iter().any(|arg| arg == "0:s:0"));
         assert!(command.contains(&"libx264".into()));
         assert!(command.contains(&"out.mkv".into()));
+    }
+
+    #[test]
+    fn both_export_modes_spawn_through_nice() {
+        for (mode, codec) in [(ExportMode::Fast, "copy"), (ExportMode::Precise, "libx264")] {
+            let request = ExportRequest::new(
+                PathBuf::from("in.mkv"),
+                0.0,
+                2.0,
+                AudioSelection::default(),
+                1.0 / 60.0,
+                mode,
+                PathBuf::from("out.mkv"),
+            )
+            .unwrap();
+            let command = export_command(&request, Path::new("out.mkv"));
+            assert_eq!(command.get_program(), std::ffi::OsStr::new("nice"));
+            let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
+            assert_eq!(
+                &args[..3],
+                [
+                    OsString::from("-n"),
+                    OsString::from("10"),
+                    OsString::from("ffmpeg")
+                ],
+                "{args:?}"
+            );
+            assert!(args.iter().any(|arg| arg == codec), "{args:?}");
+        }
     }
 
     #[test]
