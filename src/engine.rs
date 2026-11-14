@@ -2430,8 +2430,9 @@ mod tests {
     #[test]
     fn a_seek_command_marks_the_snapshot_seeking_before_the_observation() {
         let core = Core::new(true, quiet()).unwrap();
-        // `vo=libmpv` needs a render context before it will load a file.
-        let render = unsafe { create_render(core.handle) }.unwrap();
+        // `vo=libmpv` needs a render context before it will load a file. The
+        // guard frees it on unwind, before `Core::drop` terminates the handle.
+        let _render = RenderContext(unsafe { create_render(core.handle) }.unwrap());
         core.open(&fixture("rgbw.mkv")).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut loaded = false;
@@ -2446,8 +2447,6 @@ mod tests {
         core.seek_exact(0.5);
         let seeking = core.snapshot().seeking;
         let failure = core.failure.lock().unwrap().clone();
-        // Free the context before any assertion unwinds into `Core::drop`.
-        unsafe { mpv::mpv_render_context_free(render) };
         assert!(
             seeking,
             "the seek command did not mark the snapshot seeking: {failure:?}"

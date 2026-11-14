@@ -351,9 +351,9 @@ fn setup(app: &mut App, waker: Waker) {
 
 fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
-    let clock_visible = app.transport_visible && !app.export_open;
+    let timeline_visible = app.transport_visible || app.export_open;
     if let Some(session) = &mut app.session {
-        changed |= session.poll(tx, clock_visible);
+        changed |= session.poll(tx, timeline_visible);
         let source = session.source().map(|path| path.to_path_buf());
         if app.title_source != source {
             tx.set_title(format!("{} — Kachito", file_title(source.as_deref())));
@@ -1757,6 +1757,23 @@ mod tests {
         dir
     }
 
+    fn settle(runtime: &mut Runtime<App>) {
+        let mut stable = 0;
+        for _ in 0..600 {
+            let commits = runtime.stats.commits;
+            runtime.frame(1.0 / 60.0);
+            if runtime.stats.commits == commits {
+                stable += 1;
+                if stable == 5 {
+                    return;
+                }
+            } else {
+                stable = 0;
+            }
+        }
+        panic!("the view never settled");
+    }
+
     #[test]
     fn a_hidden_transport_does_not_request_the_clock_wake() {
         let (mut app, log) = app_with_fake();
@@ -1821,7 +1838,47 @@ mod tests {
     }
 
     #[test]
-    fn a_running_export_rebuilds_when_the_duration_refreshes() {
+    fn an_open_export_tray_rebuilds_when_the_duration_refreshes() {
+        let (mut app, log) = app_with_fake();
+        log.lock().unwrap().state = PlaybackState::Paused;
+        app.title_source = Some(PathBuf::from("test.mkv"));
+        app.transport_visible = false;
+        app.export_open = true;
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        settle(&mut runtime);
+        assert!(
+            runtime.find("export-tray").is_some(),
+            "the export tray is not open"
+        );
+
+        let commits = runtime.stats.commits;
+        log.lock().unwrap().duration = 12.0;
+        runtime.frame(1.0 / 60.0);
+        assert!(
+            runtime.stats.commits > commits,
+            "the open export tray missed the new duration"
+        );
+    }
+
+    #[test]
+    fn a_hidden_seek_transition_does_not_rebuild_the_view() {
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        let mut tx = Tx::default();
+        session.poll(&mut tx, false);
+
+        log.lock().unwrap().seeking = true;
+        let mut tx = Tx::default();
+        assert!(
+            !session.poll(&mut tx, false),
+            "the hidden seek handle rebuilt the view"
+        );
+        assert!(session.is_seeking(), "the snapshot missed the seek");
+    }
+
+    #[test]
+    fn a_running_export_with_a_closed_tray_does_not_rebuild_for_a_clock_refresh() {
         let (mut app, log) = app_with_fake();
         let session = session_mut(&mut app);
         session.set_export(Some(ExportJob::with_state(ExportState::Running {
@@ -1831,12 +1888,18 @@ mod tests {
         session.poll(&mut tx, false);
 
         log.lock().unwrap().duration = 12.0;
+        log.lock().unwrap().frame_duration = 1.0 / 24.0;
         let mut tx = Tx::default();
         assert!(
-            session.poll(&mut tx, false),
-            "the running export missed the new duration"
+            !session.poll(&mut tx, false),
+            "the running export rebuilt for a clock refresh"
         );
         assert_eq!(session.timeline().duration(), 12.0);
+        assert!((session.timeline().frame_duration() - 1.0 / 24.0).abs() < 1e-9);
+        assert!(
+            format!("{tx:?}").contains("100ms"),
+            "the running export stopped waking for progress: {tx:?}"
+        );
     }
 
     #[test]
@@ -1852,6 +1915,25 @@ mod tests {
             !session.poll(&mut tx, false),
             "an idle export rebuilt the view"
         );
+        assert!(!format!("{tx:?}").contains("100ms"), "{tx:?}");
+    }
+
+    #[test]
+    fn a_hidden_transport_with_an_idle_export_does_not_rebuild() {
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        session.set_export(Some(ExportJob::with_state(ExportState::Finished)));
+        let mut tx = Tx::default();
+        session.poll(&mut tx, false);
+
+        log.lock().unwrap().duration = 12.0;
+        log.lock().unwrap().frame_duration = 1.0 / 24.0;
+        let mut tx = Tx::default();
+        assert!(
+            !session.poll(&mut tx, false),
+            "the hidden transport rebuilt with an idle export"
+        );
+        assert_eq!(session.timeline().duration(), 12.0);
         assert!(!format!("{tx:?}").contains("100ms"), "{tx:?}");
     }
 

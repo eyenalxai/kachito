@@ -548,10 +548,10 @@ impl PlaybackSession {
         self.notices.record_export(error);
     }
 
-    /// Runs one UI poll against the engine snapshot. `clock_visible` is true
-    /// only while the transport (or another visible clock) is on screen, so a
-    /// hidden transport updates the timeline without rebuilding the view.
-    pub fn poll(&mut self, tx: &mut Tx, clock_visible: bool) -> bool {
+    /// Runs one UI poll against the engine snapshot. `timeline_visible` is true
+    /// while the transport or the export tray is on screen, so a hidden
+    /// timeline updates without rebuilding the view.
+    pub fn poll(&mut self, tx: &mut Tx, timeline_visible: bool) -> bool {
         let previous_notice = self.error();
         let snapshot = self.engine.snapshot();
         let state = snapshot.state.clone();
@@ -567,12 +567,13 @@ impl PlaybackSession {
         }
         if self.reported_seeking != snapshot.seeking {
             self.reported_seeking = snapshot.seeking;
-            changed = true;
+            // The seek handle is only on screen with the timeline, so a
+            // transition while hidden updates the reported value silently.
+            changed |= timeline_visible;
         }
 
         let playback_ready = self.awaiting_source.is_none()
             && !matches!(&state, PlaybackState::Loading | PlaybackState::Failed(_));
-        let export_running = matches!(self.export_state(), Some(ExportState::Running { .. }));
         if playback_ready
             && let Some(frame_duration) = snapshot.frame_duration
             && let Some(duration) = snapshot.duration
@@ -581,8 +582,8 @@ impl PlaybackSession {
         {
             self.timeline.set_duration(duration, frame_duration);
             // The timeline itself must stay current, but its duration is only
-            // on screen in the transport clock or the running export tray.
-            changed |= clock_visible || export_running;
+            // on screen in the transport clock or the export tray.
+            changed |= timeline_visible;
         }
         changed |= self.resolve_pending_seek(&snapshot, playback_ready);
         changed |= self.resolve_pending_preview(&snapshot, playback_ready);
@@ -598,9 +599,9 @@ impl PlaybackSession {
             }
             if !self.scrubbing && (self.timeline.position() - snapshot.position).abs() > 0.01 {
                 self.timeline.set_position(snapshot.position);
-                // A hidden clock still keeps the timeline current, but it does
-                // not ask the view to rebuild for a value it does not show.
-                changed |= clock_visible;
+                // A hidden timeline still keeps its position current, but it
+                // does not ask the view to rebuild for a value it does not show.
+                changed |= timeline_visible;
             }
             if snapshot.tracks.is_some() {
                 changed |= self.sync_tracks(snapshot.tracks.as_ref());
@@ -619,7 +620,7 @@ impl PlaybackSession {
         } else if self.reported_export.take().is_some() {
             changed = true;
         }
-        if matches!(&state, PlaybackState::Playing) && clock_visible {
+        if matches!(&state, PlaybackState::Playing) && timeline_visible {
             tx.wake_after(Duration::from_millis(100));
         }
         if let Some(pending) = self.pending_seek {
