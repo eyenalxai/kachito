@@ -83,17 +83,24 @@ impl PlaybackState {
 
 /// A command or property write whose arguments name its log line and failure.
 enum Action<'a> {
-    Command(&'a [&'a str]),
+    Command(&'a [&'a [u8]]),
     Property { name: &'a str, value: &'a str },
 }
 
 impl Action<'_> {
     fn describe(&self) -> String {
         match self {
-            Self::Command(args) => args.join(" "),
+            Self::Command(args) => lossy_text(args),
             Self::Property { name, value } => format!("{name} = {value}"),
         }
     }
+}
+
+fn lossy_text(args: &[&[u8]]) -> String {
+    args.iter()
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// What the UI needs from a playback backend.
@@ -368,11 +375,11 @@ impl Core {
     }
 
     fn open(&self, path: &Path) -> Result<(), String> {
-        let path = path.to_str().ok_or("the file path is not valid UTF-8")?;
-        self.log.info(format!("load: {path}"));
+        let bytes = path_bytes(path);
+        self.log.info(format!("load: {}", path.to_string_lossy()));
         self.end_reported.store(false, Ordering::Relaxed);
         self.set_state(PlaybackState::Loading);
-        match self.command(&["loadfile", path]) {
+        match self.command_bytes(&[b"loadfile".as_slice(), bytes.as_slice()]) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.set_state(PlaybackState::Failed(error.clone()));
@@ -382,7 +389,7 @@ impl Core {
     }
 
     fn current_path(&self) -> Option<PathBuf> {
-        self.get_string("path").map(PathBuf::from)
+        self.get_path("path")
     }
 
     fn state(&self) -> PlaybackState {
@@ -673,20 +680,30 @@ impl Core {
     }
 
     fn command(&self, args: &[&str]) -> Result<(), String> {
-        self.log.command(args);
+        let args: Vec<&[u8]> = args.iter().map(|arg| arg.as_bytes()).collect();
+        self.command_bytes(&args)
+    }
+
+    fn command_bytes(&self, args: &[&[u8]]) -> Result<(), String> {
+        let text = lossy_text(args);
+        self.log.command(&[text.as_str()]);
         let action = Action::Command(args);
-        let strings: Vec<CString> = match args
-            .iter()
-            .map(|arg| CString::new(*arg))
-            .collect::<Result<_, _>>()
-        {
+        self.run_command(args.iter().copied(), &action)
+    }
+
+    fn run_command<'a>(
+        &self,
+        args: impl Iterator<Item = &'a [u8]>,
+        action: &Action,
+    ) -> Result<(), String> {
+        let strings: Vec<CString> = match args.map(CString::new).collect::<Result<_, _>>() {
             Ok(strings) => strings,
-            Err(_) => return self.record_failure(&action, "an argument contains a NUL byte"),
+            Err(_) => return self.record_failure(action, "an argument contains a NUL byte"),
         };
         let mut pointers: Vec<*const c_char> = strings.iter().map(|arg| arg.as_ptr()).collect();
         pointers.push(ptr::null());
         let code = unsafe { mpv::mpv_command(self.handle, pointers.as_ptr()) };
-        self.record_if_failed(&action, code)
+        self.record_if_failed(action, code)
     }
 
     /// Logs and stores a failure when the return code is negative.
@@ -743,7 +760,7 @@ impl Core {
         )
     }
 
-    fn get_string(&self, name: &str) -> Option<String> {
+    fn get_bytes(&self, name: &str) -> Option<Vec<u8>> {
         let name = CString::new(name).unwrap();
         let mut value: *mut c_char = ptr::null_mut();
         let result = unsafe {
@@ -757,9 +774,18 @@ impl Core {
         if result < 0 || value.is_null() {
             return None;
         }
-        let text = unsafe { CStr::from_ptr(value).to_string_lossy().into_owned() };
+        let bytes = unsafe { CStr::from_ptr(value) }.to_bytes().to_vec();
         unsafe { mpv::mpv_free(value as *mut c_void) };
-        Some(text)
+        Some(bytes)
+    }
+
+    fn get_string(&self, name: &str) -> Option<String> {
+        self.get_bytes(name)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn get_path(&self, name: &str) -> Option<PathBuf> {
+        self.get_bytes(name).map(path_from_bytes)
     }
 
     fn get_double(&self, name: &str) -> Option<f64> {
@@ -1075,6 +1101,16 @@ mod mpv {
     }
 }
 
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1353,6 +1389,28 @@ mod tests {
             "{:?}",
             engine.surface().last_error()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opens_a_non_utf8_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("kachito-engine-non-utf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join(OsString::from_vec(b"source-\xff.mkv".to_vec()));
+        std::fs::copy(fixture("rgbw.mkv"), &source).unwrap();
+
+        let mut engine = engine();
+        engine.open(&source).unwrap();
+        wait_for_frame(&engine);
+        assert_eq!(engine.current_path().as_deref(), Some(source.as_path()));
+        assert!(engine.state().is_loaded(), "{:?}", engine.state());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1455,9 +1455,11 @@ mod tests {
     use super::*;
     use crate::engine::PlayerEngine;
     use crate::export::ExportJob;
+    use crate::session::Clock;
     use crate::timeline::{DEFAULT_FRAME, Timeline};
     use rune::{Env, Mods, Runtime};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     struct FakeLog {
         state: PlaybackState,
@@ -1604,6 +1606,29 @@ mod tests {
         }
     }
 
+    struct ManualClock {
+        now: Mutex<Instant>,
+    }
+
+    impl ManualClock {
+        fn new() -> Self {
+            Self {
+                now: Mutex::new(Instant::now()),
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            let mut now = self.now.lock().unwrap();
+            *now += duration;
+        }
+    }
+
+    impl Clock for ManualClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap()
+        }
+    }
+
     fn app_with_fake() -> (App, Arc<Mutex<FakeLog>>) {
         let log = Arc::new(Mutex::new(FakeLog::default()));
         let engine = Fake {
@@ -1617,6 +1642,23 @@ mod tests {
             TracksState::Loaded(tracks),
         );
         (App::with_session(Some(session)), log)
+    }
+
+    fn app_with_fake_and_clock() -> (App, Arc<Mutex<FakeLog>>, Arc<ManualClock>) {
+        let log = Arc::new(Mutex::new(FakeLog::default()));
+        let clock = Arc::new(ManualClock::new());
+        let engine = Fake {
+            surface: rune::NativeSurface::new(),
+            log: log.clone(),
+        };
+        let tracks = engine.tracks().expect("the fake track list");
+        let session = PlaybackSession::with_source_and_clock(
+            Box::new(engine),
+            PathBuf::from("test.mkv"),
+            TracksState::Loaded(tracks),
+            clock.clone(),
+        );
+        (App::with_session(Some(session)), log, clock)
     }
 
     fn session(app: &App) -> &PlaybackSession {
@@ -1661,6 +1703,293 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_stuck_seek_clears_at_five_seconds_and_restores_the_engine_position() {
+        let (mut app, log, clock) = app_with_fake_and_clock();
+        let session = session_mut(&mut app);
+        session.timeline_mut().set_duration(10.0, 1.0 / 60.0);
+        session.timeline_mut().set_position(5.0);
+        {
+            let mut log = log.lock().unwrap();
+            log.seeking = true;
+            log.position = 2.0;
+        }
+
+        session.seek(5.0);
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert!(session.is_scrubbing());
+        assert!(format!("{tx:?}").contains("16ms"), "{tx:?}");
+
+        clock.advance(Duration::from_millis(4_999));
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert!(
+            session.is_scrubbing(),
+            "the seek cleared before the deadline"
+        );
+        assert!(format!("{tx:?}").contains("16ms"), "{tx:?}");
+
+        clock.advance(Duration::from_millis(1));
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert!(
+            !session.is_scrubbing(),
+            "the stuck seek stayed pending past the deadline"
+        );
+        assert_eq!(session.timeline().position(), 2.0);
+        assert!(!format!("{tx:?}").contains("16ms"), "{tx:?}");
+        let notice = session.error().expect("one notice");
+        assert!(notice.contains("seek"), "{notice}");
+
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert_eq!(session.error().as_deref(), Some(notice.as_str()));
+    }
+
+    #[test]
+    fn a_stuck_preview_clears_at_five_seconds_and_restores_the_engine_position() {
+        let (mut app, log, clock) = app_with_fake_and_clock();
+        let session = session_mut(&mut app);
+        session.timeline_mut().set_duration(10.0, 1.0 / 60.0);
+        session.timeline_mut().set_position(5.0);
+
+        session.seek_preview(5.0);
+        assert_eq!(log.lock().unwrap().preview_seeks, 1);
+        {
+            let mut log = log.lock().unwrap();
+            log.seeking = true;
+            log.position = 2.0;
+        }
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert!(session.is_scrubbing());
+        assert!(format!("{tx:?}").contains("16ms"), "{tx:?}");
+
+        clock.advance(Duration::from_millis(4_999));
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert!(
+            session.is_scrubbing(),
+            "the preview cleared before the deadline"
+        );
+        assert!(format!("{tx:?}").contains("16ms"), "{tx:?}");
+
+        clock.advance(Duration::from_millis(1));
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert!(
+            !session.is_scrubbing(),
+            "the stuck preview stayed pending past the deadline"
+        );
+        assert_eq!(session.timeline().position(), 2.0);
+        assert!(!format!("{tx:?}").contains("16ms"), "{tx:?}");
+        let notice = session.error().expect("one notice");
+        assert!(notice.contains("seek"), "{notice}");
+
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert_eq!(session.error().as_deref(), Some(notice.as_str()));
+    }
+
+    #[test]
+    fn a_stuck_seek_expires_after_the_engine_fails() {
+        let (mut app, log, clock) = app_with_fake_and_clock();
+        let session = session_mut(&mut app);
+        session.timeline_mut().set_duration(10.0, 1.0 / 60.0);
+        session.timeline_mut().set_position(5.0);
+        {
+            let mut log = log.lock().unwrap();
+            log.seeking = true;
+            log.position = 2.0;
+        }
+        session.seek(5.0);
+        log.lock().unwrap().state = PlaybackState::Failed("the decoder stopped".into());
+
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert!(session.is_scrubbing());
+        assert!(
+            format!("{tx:?}").contains("5s"),
+            "the deadline has no wake: {tx:?}"
+        );
+
+        clock.advance(Duration::from_secs(5));
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+
+        assert!(
+            !session.is_scrubbing(),
+            "the failed engine kept the seek pending"
+        );
+        assert_eq!(session.timeline().position(), 2.0);
+        let notice = session.error().expect("one notice");
+        assert!(notice.contains("did not finish in time"), "{notice}");
+    }
+
+    #[test]
+    fn a_stuck_seek_expires_after_the_engine_goes_empty() {
+        let (mut app, log, clock) = app_with_fake_and_clock();
+        let session = session_mut(&mut app);
+        session.timeline_mut().set_duration(10.0, 1.0 / 60.0);
+        session.timeline_mut().set_position(5.0);
+        {
+            let mut log = log.lock().unwrap();
+            log.seeking = true;
+            log.position = 2.0;
+        }
+        session.seek(5.0);
+        {
+            let mut log = log.lock().unwrap();
+            log.seeking = false;
+            log.position = 0.0;
+            log.state = PlaybackState::Empty;
+        }
+
+        clock.advance(Duration::from_millis(4_999));
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert!(
+            session.is_scrubbing(),
+            "the empty engine cleared the seek before the deadline"
+        );
+
+        clock.advance(Duration::from_millis(1));
+        session.poll(&mut tx);
+        assert!(!session.is_scrubbing());
+        assert_eq!(session.timeline().position(), 0.0);
+        let notice = session.error().expect("one notice");
+        assert!(notice.contains("did not finish in time"), "{notice}");
+    }
+
+    #[test]
+    fn a_seek_deadline_does_not_consume_the_command_notice() {
+        let (mut app, log, clock) = app_with_fake_and_clock();
+        let session = session_mut(&mut app);
+        session.timeline_mut().set_duration(10.0, 1.0 / 60.0);
+        session.timeline_mut().set_position(5.0);
+        {
+            let mut log = log.lock().unwrap();
+            log.seeking = true;
+            log.position = 2.0;
+            log.command_failure = Some("set volume 40: rejected".into());
+        }
+        session.seek(5.0);
+
+        clock.advance(Duration::from_secs(5));
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        let notice = session.error().expect("one notice");
+        assert!(notice.contains("did not finish in time"), "{notice}");
+
+        log.lock().unwrap().command_failure = Some("set speed 2: rejected".into());
+        session.poll(&mut tx);
+        let notice = session.error().expect("one notice");
+        assert!(
+            notice.contains("set speed 2"),
+            "the deadline consumed the command notice: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_seek_deadline_is_logged_once() {
+        let (log, sink, path) = crate::log::testing::log_to_file("seek-deadline");
+        let fake = Arc::new(Mutex::new(FakeLog::default()));
+        let clock = Arc::new(ManualClock::new());
+        let engine = Fake {
+            surface: rune::NativeSurface::new(),
+            log: fake.clone(),
+        };
+        let tracks = engine.tracks().expect("the fake track list");
+        let mut session = PlaybackSession::with_source_clock_and_log(
+            Box::new(engine),
+            PathBuf::from("test.mkv"),
+            TracksState::Loaded(tracks),
+            log,
+            clock.clone(),
+        );
+        session.timeline_mut().set_duration(10.0, 1.0 / 60.0);
+        {
+            let mut fake = fake.lock().unwrap();
+            fake.seeking = true;
+            fake.position = 2.0;
+        }
+        session.seek(5.0);
+        clock.advance(Duration::from_secs(5));
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        session.poll(&mut tx);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("notice: seek deadline").count(), 1, "{text}");
+        assert_eq!(sink.lines(), text.lines().collect::<Vec<_>>());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn selecting_a_track_updates_the_cached_list_without_refetching() {
+        let (app, log) = app_with_fake();
+        assert_eq!(log.lock().unwrap().tracks_reads, 1);
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.frame(0.0);
+
+        click(&mut runtime, "audio-menu");
+        click(&mut runtime, "audio-2");
+        let tracks = match session(&runtime.state).tracks() {
+            TracksState::Loaded(tracks) => tracks,
+            other => panic!("{other:?}"),
+        };
+        assert!(!tracks.iter().find(|track| track.id == 1).unwrap().selected);
+        assert!(tracks.iter().find(|track| track.id == 2).unwrap().selected);
+        assert_eq!(log.lock().unwrap().tracks_reads, 1);
+
+        click(&mut runtime, "subs-menu");
+        click(&mut runtime, "sub-10");
+        let tracks = match session(&runtime.state).tracks() {
+            TracksState::Loaded(tracks) => tracks,
+            other => panic!("{other:?}"),
+        };
+        assert!(tracks.iter().find(|track| track.id == 10).unwrap().selected);
+        assert_eq!(log.lock().unwrap().tracks_reads, 1);
+
+        click(&mut runtime, "subs-menu");
+        click(&mut runtime, "subs-off");
+        let tracks = match session(&runtime.state).tracks() {
+            TracksState::Loaded(tracks) => tracks,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            !tracks
+                .iter()
+                .any(|track| track.selected && track.kind == TrackKind::Subtitle)
+        );
+        assert_eq!(log.lock().unwrap().tracks_reads, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_source_path_opens() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = temp_dir("non-utf8-open");
+        let source = dir.join(OsString::from_vec(b"clip-\xff.mkv".to_vec()));
+        std::fs::write(&source, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        app.open(source.clone());
+        assert_eq!(app.error_text(), None);
+        assert!(session(&app).is_awaiting_source());
+        assert_eq!(
+            log.lock().unwrap().opened.as_deref(),
+            Some(source.as_path())
+        );
+
+        let state = session(&app).state();
+        assert!(session_mut(&mut app).confirm_open(&state));
+        assert_eq!(session(&app).source(), Some(source.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
