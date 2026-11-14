@@ -257,7 +257,7 @@ fn run(
             remove_file(&temp);
             set_state(
                 &state,
-                ExportState::Failed(format!("Could not start ffmpeg: {error}")),
+                ExportState::Failed(format!("Could not start the export process: {error}")),
             );
             return;
         }
@@ -304,7 +304,7 @@ fn run(
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Ok(None) => {}
-            Err(error) => break Err(format!("Could not wait for ffmpeg: {error}")),
+            Err(error) => break Err(format!("Could not wait for the export process: {error}")),
         }
         drop(slot);
         if cancel.load(Ordering::Relaxed) {
@@ -350,7 +350,7 @@ fn run(
     }
 }
 
-/// Builds the ffmpeg process behind the export priority wrapper.
+/// Builds the export process inside the priority wrapper.
 fn export_command(request: &ExportRequest, output: &Path) -> Command {
     let mut command = Command::new("nice");
     command
@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn both_export_modes_spawn_through_nice() {
+    fn both_export_modes_spawn_through_the_priority_wrapper() {
         for (mode, codec) in [(ExportMode::Fast, "copy"), (ExportMode::Precise, "libx264")] {
             let request = ExportRequest::new(
                 PathBuf::from("in.mkv"),

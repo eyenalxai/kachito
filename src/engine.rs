@@ -37,6 +37,23 @@ const EVENT_WAIT_SECONDS: f64 = 0.1;
 /// is treated as hidden.
 const UNDRAWN_PUSH_LIMIT: u64 = 3;
 
+/// Every built-in script loader, auto-loaded script and loader mpv runs
+/// without being asked. All of them are turned off before initialization so a
+/// user config cannot start its own UI, console or scripts. The test iterates
+/// this list, so a new entry cannot miss the startup check.
+const BUILT_IN_SCRIPT_LOADERS: &[&str] = &[
+    "load-scripts",
+    "load-auto-profiles",
+    "load-commands",
+    "load-console",
+    "load-osd-console",
+    "load-positioning",
+    "load-select",
+    "load-stats-overlay",
+    "load-context-menu",
+    "osc",
+];
+
 /// Accepts a libmpv client API version only when its major matches this build.
 ///
 /// `mpv_client_api_version` packs the major in the high 16 bits and the minor in
@@ -195,7 +212,7 @@ pub trait PlayerEngine: Send {
     fn set_paused(&mut self, paused: bool) -> Result<(), String>;
     /// Takes the pending frame-start signal. True after the first video reconfig
     /// or the first frame the render thread pushes since it was last taken.
-    fn take_first_frame(&mut self) -> bool;
+    fn take_frame_start(&mut self) -> bool;
     /// Takes the most recent rejected command, once, for the one-notice rule.
     fn take_command_failure(&mut self) -> Option<String>;
 }
@@ -362,7 +379,7 @@ impl MpvEngine {
     /// `headless` keeps audio off so tests do not open a device.
     pub fn new(headless: bool, log: Arc<RunLog>) -> Result<Self, String> {
         let core = Arc::new(Core::new(headless, log.clone())?);
-        let first_frame = core.first_frame.clone();
+        let frame_start = core.frame_start.clone();
         let surface = NativeSurface::new();
         let wake = Arc::new(RenderWake::new());
         let render_stop = Arc::new(AtomicBool::new(false));
@@ -379,7 +396,7 @@ impl MpvEngine {
             let wake = wake.clone();
             let stop = render_stop.clone();
             let log = log.clone();
-            let first_frame = first_frame.clone();
+            let frame_start = frame_start.clone();
             #[cfg(test)]
             let frames = frames.clone();
             #[cfg(test)]
@@ -410,7 +427,7 @@ impl MpvEngine {
                             stop,
                             wake,
                             log,
-                            first_frame,
+                            frame_start,
                             #[cfg(test)]
                             frames,
                             buffer: Vec::new(),
@@ -591,8 +608,8 @@ impl PlayerEngine for MpvEngine {
         self.wake_event_thread();
         self.wait_for_reply(done, "pause")?
     }
-    fn take_first_frame(&mut self) -> bool {
-        self.core.take_first_frame()
+    fn take_frame_start(&mut self) -> bool {
+        self.core.take_frame_start()
     }
     fn take_command_failure(&mut self) -> Option<String> {
         self.core.failure.lock().unwrap().take()
@@ -614,7 +631,7 @@ struct Core {
     log: Arc<RunLog>,
     state: Mutex<PlaybackState>,
     end_reported: AtomicBool,
-    first_frame: Arc<AtomicBool>,
+    frame_start: Arc<AtomicBool>,
     failure: Mutex<Option<String>>,
     waker: Mutex<Option<Waker>>,
     #[cfg(test)]
@@ -632,6 +649,28 @@ struct Core {
 unsafe impl Send for Core {}
 unsafe impl Sync for Core {}
 
+/// The options set on the handle before `mpv_initialize`. Every built-in
+/// script loader and auto-loaded script is disabled here.
+fn startup_options(headless: bool) -> Vec<(&'static str, &'static str)> {
+    let mut options = vec![
+        ("vo", "libmpv"),
+        ("idle", "yes"),
+        ("keep-open", "yes"),
+        ("video-sync", "audio"),
+        ("video-timing-offset", "0"),
+        ("osd-level", "0"),
+        ("ytdl", "no"),
+        ("input-default-bindings", "no"),
+        ("input-vo-keyboard", "no"),
+    ];
+    options.extend(BUILT_IN_SCRIPT_LOADERS.iter().map(|name| (*name, "no")));
+    options.push(("hwdec", if headless { "no" } else { "auto-safe" }));
+    if headless {
+        options.push(("ao", "null"));
+    }
+    options
+}
+
 impl Core {
     fn new(headless: bool, log: Arc<RunLog>) -> Result<Self, String> {
         unsafe {
@@ -641,26 +680,7 @@ impl Core {
                 log.warn("mpv could not create a player");
                 return Err("libmpv could not create a player".into());
             }
-            let mut options: Vec<(&str, &str)> = vec![
-                ("vo", "libmpv"),
-                ("idle", "yes"),
-                ("keep-open", "yes"),
-                ("video-sync", "audio"),
-                ("video-timing-offset", "0"),
-                ("osd-level", "0"),
-                ("osc", "no"),
-                ("ytdl", "no"),
-                ("load-scripts", "no"),
-                ("load-stats-overlay", "no"),
-                ("load-osd-console", "no"),
-                ("input-default-bindings", "no"),
-                ("input-vo-keyboard", "no"),
-            ];
-            let hwdec = if headless { "no" } else { "auto-safe" };
-            options.push(("hwdec", hwdec));
-            if headless {
-                options.push(("ao", "null"));
-            }
+            let options = startup_options(headless);
             for (name, value) in &options {
                 if let Err(error) = set_option(handle, name, value) {
                     log.warn(format!("option failed: {name}={value}: {error}"));
@@ -693,7 +713,7 @@ impl Core {
                 log,
                 state: Mutex::new(PlaybackState::Empty),
                 end_reported: AtomicBool::new(false),
-                first_frame: Arc::new(AtomicBool::new(false)),
+                frame_start: Arc::new(AtomicBool::new(false)),
                 failure: Mutex::new(None),
                 waker: Mutex::new(None),
                 #[cfg(test)]
@@ -752,7 +772,7 @@ impl Core {
         let bytes = path_bytes(path);
         self.log.info(format!("load: {}", path.to_string_lossy()));
         self.end_reported.store(false, Ordering::Relaxed);
-        self.first_frame.store(false, Ordering::Relaxed);
+        self.frame_start.store(false, Ordering::Relaxed);
         self.transition(PlaybackState::Loading);
         match self.command_bytes(&[b"loadfile".as_slice(), bytes.as_slice()]) {
             Ok(()) => Ok(()),
@@ -798,8 +818,8 @@ impl Core {
         Ok(())
     }
 
-    fn take_first_frame(&self) -> bool {
-        self.first_frame.swap(false, Ordering::Relaxed)
+    fn take_frame_start(&self) -> bool {
+        self.frame_start.swap(false, Ordering::Relaxed)
     }
 
     fn toggle(&self) {
@@ -1007,7 +1027,7 @@ impl Core {
                 );
             }
             mpv::EVENT_FILE_LOADED => self.on_file_loaded(),
-            mpv::EVENT_VIDEO_RECONFIG => self.first_frame.store(true, Ordering::Relaxed),
+            mpv::EVENT_VIDEO_RECONFIG => self.frame_start.store(true, Ordering::Relaxed),
             mpv::EVENT_END_FILE => self.on_end_file(unsafe { (*event).data }),
             mpv::EVENT_QUEUE_OVERFLOW => self.on_queue_overflow(),
             _ => {}
@@ -1316,7 +1336,7 @@ struct Renderer {
     stop: Arc<AtomicBool>,
     wake: Arc<RenderWake>,
     log: Arc<RunLog>,
-    first_frame: Arc<AtomicBool>,
+    frame_start: Arc<AtomicBool>,
     #[cfg(test)]
     frames: Arc<AtomicU64>,
     buffer: Vec<u8>,
@@ -1395,7 +1415,7 @@ impl Renderer {
         result?;
         self.frame_id += 1;
         self.pushed += 1;
-        self.first_frame.store(true, Ordering::Relaxed);
+        self.frame_start.store(true, Ordering::Relaxed);
         #[cfg(test)]
         self.frames.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1888,19 +1908,32 @@ mod tests {
     }
 
     #[test]
-    fn built_in_script_loaders_and_auto_loaded_scripts_are_off() {
-        let engine = engine();
+    fn every_built_in_script_loader_is_off_before_initialization() {
+        // The literal names are the spec: the shared list must carry every
+        // one, and the generated options must carry every entry of the shared
+        // list, so a loader added there cannot miss this test.
         for name in [
             "load-scripts",
-            "osc",
-            "ytdl",
-            "load-stats-overlay",
+            "load-auto-profiles",
+            "load-commands",
+            "load-console",
             "load-osd-console",
+            "load-positioning",
+            "load-select",
+            "load-stats-overlay",
+            "load-context-menu",
+            "osc",
         ] {
-            assert_eq!(
-                engine.core.get_flag(name),
-                Some(false),
-                "{name} must be off before initialization"
+            assert!(
+                BUILT_IN_SCRIPT_LOADERS.contains(&name),
+                "{name} is missing from the script loader list"
+            );
+        }
+        let options = startup_options(true);
+        for name in BUILT_IN_SCRIPT_LOADERS {
+            assert!(
+                options.contains(&(*name, "no")),
+                "{name} must be off before initialization: {options:?}"
             );
         }
     }
@@ -1915,8 +1948,8 @@ mod tests {
             data: ptr::null_mut(),
         };
         assert!(!engine.core.handle_event(&event));
-        assert!(engine.take_first_frame());
-        assert!(!engine.take_first_frame());
+        assert!(engine.take_frame_start());
+        assert!(!engine.take_frame_start());
     }
 
     #[test]
@@ -1929,7 +1962,7 @@ mod tests {
         engine.open(&fixture("rgbw.mkv")).unwrap();
         wait_for_frame(&engine);
         assert_eq!(engine.state(), PlaybackState::Paused);
-        assert!(engine.take_first_frame());
+        assert!(engine.take_frame_start());
 
         engine.set_paused(false).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);

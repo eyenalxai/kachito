@@ -13,6 +13,10 @@ pub(crate) const SUPPORTED: &[&str] = &["mkv", "mp4", "m4v", "mov", "webm"];
 
 const SEEK_DEADLINE: Duration = Duration::from_secs(5);
 
+/// Resume attempts for the automatic pause. A rejected write is retried on
+/// the next poll, but a broken engine must not hold the pause forever.
+const STARTUP_RESUME_ATTEMPTS: u8 = 5;
+
 pub trait Clock: Send + Sync {
     fn now(&self) -> Instant;
 }
@@ -165,9 +169,16 @@ pub struct PlaybackSession {
     scrubbing: bool,
     pending_seek: Option<PendingSeek>,
     pending_preview: Option<PendingPreview>,
-    /// True while the engine holds a pause this session set before a load. A
-    /// user toggle relinquishes it, and the first frame clears it.
+    /// True while the engine holds a pause this session set for the first
+    /// file, before its first frame. A user toggle relinquishes it, and the
+    /// first frame clears it.
     startup_pause: bool,
+    /// True once the engine reported its first frame start. Only an open
+    /// before this point holds the startup pause, so a later open leaves the
+    /// playback pause where the user put it.
+    frame_start_seen: bool,
+    /// Rejected resume writes since the automatic pause was set.
+    startup_resume_attempts: u8,
     export: Option<ExportJob>,
     notices: Notices,
 }
@@ -194,6 +205,8 @@ impl PlaybackSession {
             pending_seek: None,
             pending_preview: None,
             startup_pause: false,
+            frame_start_seen: false,
+            startup_resume_attempts: 0,
             export: None,
             notices: Notices::default(),
         }
@@ -215,17 +228,23 @@ impl PlaybackSession {
             return Err(format!("{} is not a readable video file.", path.display()));
         }
         let awaiting = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
-        // Pause before the load so picture and sound start together. Only the
-        // first video reconfig or the first pushed frame clears this pause,
-        // and only while it is still automatic.
-        let paused = self.engine.set_paused(true);
-        if let Err(error) = &paused {
-            self.log
-                .warn(format!("startup pause was not applied: {error}"));
-        }
-        // An automatic pause is not a user command, so its rejection is not a
-        // notice. The run log keeps the engine's property failure.
-        self.engine.take_command_failure();
+        // Pause before the load so picture and sound start together. This is
+        // only for a file opened before the first frame; once a frame has
+        // started, a later open must leave the playback pause alone.
+        let automatic = !self.frame_start_seen;
+        let paused = if automatic {
+            let paused = self.engine.set_paused(true);
+            if let Err(error) = &paused {
+                self.log
+                    .warn(format!("startup pause was not applied: {error}"));
+            }
+            // An automatic pause is not a user command, so its rejection is
+            // not a notice. The run log keeps the engine's property failure.
+            self.engine.take_command_failure();
+            paused.is_ok()
+        } else {
+            false
+        };
         let opened = self.engine.open(&path);
         // A rejected loadfile is the engine failure, not a command notice.
         self.engine.take_command_failure();
@@ -233,7 +252,8 @@ impl PlaybackSession {
             self.log.failure(format!("load failed: {error}"));
         }
         opened?;
-        self.startup_pause = paused.is_ok();
+        self.startup_pause = paused;
+        self.startup_resume_attempts = 0;
         self.notices.reset_command();
         self.notices.reset_engine();
         self.awaiting_source = Some(awaiting);
@@ -556,22 +576,39 @@ impl PlaybackSession {
                 .saturating_duration_since(preview.requested_at);
             tx.wake_after(SEEK_DEADLINE.saturating_sub(elapsed));
         }
+        if self.startup_pause && self.frame_start_seen {
+            tx.wake_after(Duration::from_millis(100));
+        }
         changed
     }
 
     fn clear_startup_pause(&mut self) -> bool {
         // Consume the signal even when a user took the pause over, so a stale
         // first frame cannot clear the next file's startup pause.
-        let first_frame = self.engine.take_first_frame();
-        if !self.startup_pause || !first_frame {
+        if self.engine.take_frame_start() {
+            self.frame_start_seen = true;
+        }
+        if !self.startup_pause || !self.frame_start_seen {
             return false;
         }
-        self.startup_pause = false;
+        // The flag stays until the write succeeds, so a rejected resume is
+        // retried instead of leaving the automatic pause behind.
         match self.engine.set_paused(false) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.startup_pause = false;
+                true
+            }
             Err(error) => {
-                self.log
-                    .warn(format!("automatic pause was not cleared: {error}"));
+                self.startup_resume_attempts += 1;
+                if self.startup_resume_attempts >= STARTUP_RESUME_ATTEMPTS {
+                    self.startup_pause = false;
+                    self.log.warn(format!(
+                        "automatic pause was not cleared after {STARTUP_RESUME_ATTEMPTS} attempts: {error}"
+                    ));
+                } else {
+                    self.log
+                        .warn(format!("automatic pause was not cleared: {error}"));
+                }
                 false
             }
         }
@@ -761,6 +798,8 @@ impl PlaybackSession {
             pending_seek: None,
             pending_preview: None,
             startup_pause: false,
+            frame_start_seen: false,
+            startup_resume_attempts: 0,
             export: None,
             notices: Notices::default(),
         }
