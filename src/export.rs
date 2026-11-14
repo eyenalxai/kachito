@@ -337,7 +337,7 @@ fn run(
             set_state(
                 &state,
                 ExportState::Failed(if errors.is_empty() {
-                    format!("ffmpeg exited with {status}")
+                    format!("the export process exited with {status}")
                 } else {
                     errors
                 }),

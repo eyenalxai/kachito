@@ -1939,6 +1939,18 @@ mod tests {
     }
 
     #[test]
+    fn every_built_in_script_loader_is_off_after_initialization() {
+        let engine = engine();
+        for name in BUILT_IN_SCRIPT_LOADERS {
+            assert_eq!(
+                engine.core.get_flag(name),
+                Some(false),
+                "{name} must be accepted and off after initialization"
+            );
+        }
+    }
+
+    #[test]
     fn a_video_reconfig_signals_the_frame_start() {
         let mut engine = engine();
         let event = mpv::Event {

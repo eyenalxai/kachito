@@ -2112,6 +2112,38 @@ mod tests {
     }
 
     #[test]
+    fn a_user_pause_before_the_first_frame_survives_a_later_open() {
+        let dir = temp_dir("startup-pause-before-frame");
+        let first = dir.join("first.mkv");
+        let second = dir.join("second.mkv");
+        std::fs::write(&first, b"not a video").unwrap();
+        std::fs::write(&second, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        session.open(first).unwrap();
+
+        log.lock().unwrap().state = PlaybackState::Playing;
+        session.toggle();
+        assert_eq!(log.lock().unwrap().state, PlaybackState::Paused);
+
+        session.open(second).unwrap();
+        log.lock().unwrap().frame_start = true;
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert_eq!(
+            log.lock().unwrap().calls,
+            vec![
+                "pause:true".to_string(),
+                "open".to_string(),
+                "open".to_string()
+            ],
+            "a later open re-armed the startup pause or resumed the user's pause"
+        );
+        assert_eq!(log.lock().unwrap().state, PlaybackState::Paused);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_rejected_startup_pause_and_a_failed_load_are_logged() {
         let (log, sink, path) = crate::log::testing::log_to_file("session-startup");
         let fake = Arc::new(Mutex::new(FakeLog::default()));

@@ -173,10 +173,11 @@ pub struct PlaybackSession {
     /// file, before its first frame. A user toggle relinquishes it, and the
     /// first frame clears it.
     startup_pause: bool,
-    /// True once the engine reported its first frame start. Only an open
-    /// before this point holds the startup pause, so a later open leaves the
-    /// playback pause where the user put it.
-    frame_start_seen: bool,
+    /// True once the startup phase ended: the engine reported its first frame
+    /// start or the user toggled playback. Only an open before this point
+    /// holds the startup pause, so a later open leaves the playback pause
+    /// where the user put it.
+    startup_complete: bool,
     /// Rejected resume writes since the automatic pause was set.
     startup_resume_attempts: u8,
     export: Option<ExportJob>,
@@ -205,7 +206,7 @@ impl PlaybackSession {
             pending_seek: None,
             pending_preview: None,
             startup_pause: false,
-            frame_start_seen: false,
+            startup_complete: false,
             startup_resume_attempts: 0,
             export: None,
             notices: Notices::default(),
@@ -229,9 +230,10 @@ impl PlaybackSession {
         }
         let awaiting = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
         // Pause before the load so picture and sound start together. This is
-        // only for a file opened before the first frame; once a frame has
-        // started, a later open must leave the playback pause alone.
-        let automatic = !self.frame_start_seen;
+        // only for a file opened during the startup phase; once a frame has
+        // started or the user has toggled, a later open must leave the
+        // playback pause alone.
+        let automatic = !self.startup_complete;
         let paused = if automatic {
             let paused = self.engine.set_paused(true);
             if let Err(error) = &paused {
@@ -327,10 +329,12 @@ impl PlaybackSession {
     }
 
     pub fn toggle(&mut self) {
+        // A user toggle owns the pause from here, even one that lands before
+        // the load reports ready. The startup phase is over, so neither the
+        // first frame nor a later open may resume over the user's choice.
+        self.startup_pause = false;
+        self.startup_complete = true;
         if self.engine.state().is_loaded() {
-            // A user toggle owns the pause from here; the first frame must not
-            // clear what the user chose.
-            self.startup_pause = false;
             self.engine.toggle();
         }
     }
@@ -576,7 +580,7 @@ impl PlaybackSession {
                 .saturating_duration_since(preview.requested_at);
             tx.wake_after(SEEK_DEADLINE.saturating_sub(elapsed));
         }
-        if self.startup_pause && self.frame_start_seen {
+        if self.startup_pause && self.startup_complete {
             tx.wake_after(Duration::from_millis(100));
         }
         changed
@@ -586,9 +590,9 @@ impl PlaybackSession {
         // Consume the signal even when a user took the pause over, so a stale
         // first frame cannot clear the next file's startup pause.
         if self.engine.take_frame_start() {
-            self.frame_start_seen = true;
+            self.startup_complete = true;
         }
-        if !self.startup_pause || !self.frame_start_seen {
+        if !self.startup_pause || !self.startup_complete {
             return false;
         }
         // The flag stays until the write succeeds, so a rejected resume is
@@ -798,7 +802,7 @@ impl PlaybackSession {
             pending_seek: None,
             pending_preview: None,
             startup_pause: false,
-            frame_start_seen: false,
+            startup_complete: false,
             startup_resume_attempts: 0,
             export: None,
             notices: Notices::default(),
