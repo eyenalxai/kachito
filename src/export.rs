@@ -249,18 +249,15 @@ fn run(
 ) {
     let duration = request.duration();
     let temp = temp_output(&request.output);
-    let mut command = Command::new("ffmpeg");
-    command
-        .args(request.command_to(&temp))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = export_command(&request, &temp);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             remove_file(&temp);
             set_state(
                 &state,
-                ExportState::Failed(format!("Could not start ffmpeg: {error}")),
+                ExportState::Failed(format!("Could not start the export process: {error}")),
             );
             return;
         }
@@ -307,7 +304,7 @@ fn run(
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Ok(None) => {}
-            Err(error) => break Err(format!("Could not wait for ffmpeg: {error}")),
+            Err(error) => break Err(format!("Could not wait for the export process: {error}")),
         }
         drop(slot);
         if cancel.load(Ordering::Relaxed) {
@@ -340,7 +337,7 @@ fn run(
             set_state(
                 &state,
                 ExportState::Failed(if errors.is_empty() {
-                    format!("ffmpeg exited with {status}")
+                    format!("the export process exited with {status}")
                 } else {
                     errors
                 }),
@@ -351,6 +348,17 @@ fn run(
             set_state(&state, ExportState::Failed(error));
         }
     }
+}
+
+/// Builds the export process inside the priority wrapper.
+fn export_command(request: &ExportRequest, output: &Path) -> Command {
+    let mut command = Command::new("nice");
+    command
+        .arg("-n")
+        .arg("10")
+        .arg("ffmpeg")
+        .args(request.command_to(output));
+    command
 }
 
 fn set_state(state: &Arc<Mutex<ExportState>>, next: ExportState) {
@@ -449,6 +457,35 @@ mod tests {
         assert!(!command.iter().any(|arg| arg == "0:s:0"));
         assert!(command.contains(&"libx264".into()));
         assert!(command.contains(&"out.mkv".into()));
+    }
+
+    #[test]
+    fn both_export_modes_spawn_through_the_priority_wrapper() {
+        for (mode, codec) in [(ExportMode::Fast, "copy"), (ExportMode::Precise, "libx264")] {
+            let request = ExportRequest::new(
+                PathBuf::from("in.mkv"),
+                0.0,
+                2.0,
+                AudioSelection::default(),
+                1.0 / 60.0,
+                mode,
+                PathBuf::from("out.mkv"),
+            )
+            .unwrap();
+            let command = export_command(&request, Path::new("out.mkv"));
+            assert_eq!(command.get_program(), std::ffi::OsStr::new("nice"));
+            let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
+            assert_eq!(
+                &args[..3],
+                [
+                    OsString::from("-n"),
+                    OsString::from("10"),
+                    OsString::from("ffmpeg")
+                ],
+                "{args:?}"
+            );
+            assert!(args.iter().any(|arg| arg == codec), "{args:?}");
+        }
     }
 
     #[test]

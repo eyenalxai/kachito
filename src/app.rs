@@ -1479,6 +1479,9 @@ mod tests {
         duration: f64,
         command_failure: Option<String>,
         open_error: Option<String>,
+        pause_error: Option<String>,
+        frame_start: bool,
+        calls: Vec<String>,
     }
 
     impl Default for FakeLog {
@@ -1501,6 +1504,9 @@ mod tests {
                 duration: 10.0,
                 command_failure: None,
                 open_error: None,
+                pause_error: None,
+                frame_start: false,
+                calls: Vec::new(),
             }
         }
     }
@@ -1513,6 +1519,7 @@ mod tests {
     impl PlayerEngine for Fake {
         fn open(&mut self, path: &std::path::Path) -> Result<(), String> {
             let mut log = self.log.lock().unwrap();
+            log.calls.push("open".into());
             log.opened = Some(path.to_path_buf());
             match log.open_error.clone() {
                 Some(error) => Err(error),
@@ -1601,6 +1608,17 @@ mod tests {
             Ok(())
         }
         fn set_waker(&self, _: Waker) {}
+        fn set_paused(&mut self, paused: bool) -> Result<(), String> {
+            let mut log = self.log.lock().unwrap();
+            log.calls.push(format!("pause:{paused}"));
+            if let Some(error) = log.pause_error.clone() {
+                return Err(error);
+            }
+            Ok(())
+        }
+        fn take_frame_start(&mut self) -> bool {
+            std::mem::take(&mut self.log.lock().unwrap().frame_start)
+        }
         fn take_command_failure(&mut self) -> Option<String> {
             self.log.lock().unwrap().command_failure.take()
         }
@@ -1990,6 +2008,289 @@ mod tests {
         assert!(session_mut(&mut app).confirm_open(&state));
         assert_eq!(session(&app).source(), Some(source.as_path()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_opened_before_the_first_frame_pauses_before_load() {
+        let dir = temp_dir("startup-pause-order");
+        let source = dir.join("start.mkv");
+        std::fs::write(&source, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        session_mut(&mut app).open(source).unwrap();
+        assert_eq!(
+            log.lock().unwrap().calls,
+            vec!["pause:true".to_string(), "open".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_startup_pause_clears_on_the_first_frame() {
+        let dir = temp_dir("startup-pause-clear");
+        let source = dir.join("start.mkv");
+        std::fs::write(&source, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        session.open(source).unwrap();
+        log.lock().unwrap().frame_start = true;
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert_eq!(
+            log.lock().unwrap().calls,
+            vec![
+                "pause:true".to_string(),
+                "open".to_string(),
+                "pause:false".to_string()
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_user_pause_is_not_cleared_by_the_first_frame() {
+        let dir = temp_dir("startup-pause-user");
+        let source = dir.join("start.mkv");
+        std::fs::write(&source, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        session.open(source).unwrap();
+        log.lock().unwrap().state = PlaybackState::Playing;
+        session.toggle();
+        assert_eq!(log.lock().unwrap().state, PlaybackState::Paused);
+
+        log.lock().unwrap().frame_start = true;
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert_eq!(
+            log.lock().unwrap().state,
+            PlaybackState::Paused,
+            "the first frame resumed a user pause"
+        );
+        assert!(
+            !log.lock()
+                .unwrap()
+                .calls
+                .contains(&"pause:false".to_string()),
+            "the automatic clear ran after a user took the pause"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_later_open_keeps_a_user_pause() {
+        let dir = temp_dir("startup-pause-later");
+        let first = dir.join("first.mkv");
+        let second = dir.join("second.mkv");
+        std::fs::write(&first, b"not a video").unwrap();
+        std::fs::write(&second, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        session.open(first).unwrap();
+        log.lock().unwrap().frame_start = true;
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+
+        log.lock().unwrap().state = PlaybackState::Playing;
+        session.toggle();
+        assert_eq!(log.lock().unwrap().state, PlaybackState::Paused);
+
+        session.open(second).unwrap();
+        log.lock().unwrap().frame_start = true;
+        session.poll(&mut tx);
+        assert_eq!(
+            log.lock().unwrap().calls,
+            vec![
+                "pause:true".to_string(),
+                "open".to_string(),
+                "pause:false".to_string(),
+                "open".to_string()
+            ],
+            "a later open paused the engine or resumed the user's pause"
+        );
+        assert_eq!(log.lock().unwrap().state, PlaybackState::Paused);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_user_pause_before_the_first_frame_survives_a_later_open() {
+        let dir = temp_dir("startup-pause-before-frame");
+        let first = dir.join("first.mkv");
+        let second = dir.join("second.mkv");
+        std::fs::write(&first, b"not a video").unwrap();
+        std::fs::write(&second, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        session.open(first).unwrap();
+
+        log.lock().unwrap().state = PlaybackState::Playing;
+        session.toggle();
+        assert_eq!(log.lock().unwrap().state, PlaybackState::Paused);
+
+        session.open(second).unwrap();
+        log.lock().unwrap().frame_start = true;
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert_eq!(
+            log.lock().unwrap().calls,
+            vec![
+                "pause:true".to_string(),
+                "open".to_string(),
+                "open".to_string()
+            ],
+            "a later open re-armed the startup pause or resumed the user's pause"
+        );
+        assert_eq!(log.lock().unwrap().state, PlaybackState::Paused);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_toggle_on_the_empty_screen_does_not_end_the_startup_phase() {
+        let dir = temp_dir("startup-toggle-empty");
+        let source = dir.join("start.mkv");
+        std::fs::write(&source, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        log.lock().unwrap().state = PlaybackState::Empty;
+
+        session.toggle();
+        session.open(source).unwrap();
+        assert_eq!(
+            log.lock().unwrap().calls,
+            vec!["pause:true".to_string(), "open".to_string()],
+            "a toggle on the empty screen ended the startup phase"
+        );
+
+        log.lock().unwrap().frame_start = true;
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert_eq!(
+            log.lock().unwrap().calls,
+            vec![
+                "pause:true".to_string(),
+                "open".to_string(),
+                "pause:false".to_string()
+            ],
+            "the first frame did not clear the startup pause"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_toggle_while_loading_keeps_the_startup_pause() {
+        let dir = temp_dir("startup-toggle-loading");
+        let source = dir.join("start.mkv");
+        std::fs::write(&source, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        log.lock().unwrap().state = PlaybackState::Loading;
+
+        session.open(source).unwrap();
+        session.toggle();
+        assert_eq!(
+            log.lock().unwrap().calls,
+            vec!["pause:true".to_string(), "open".to_string()],
+            "a toggle while the file was loading ended the startup phase"
+        );
+
+        {
+            let mut log = log.lock().unwrap();
+            log.state = PlaybackState::Playing;
+            log.frame_start = true;
+        }
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert_eq!(
+            log.lock().unwrap().calls,
+            vec![
+                "pause:true".to_string(),
+                "open".to_string(),
+                "pause:false".to_string()
+            ],
+            "the first frame did not resume the automatic pause"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rejected_startup_pause_and_a_failed_load_are_logged() {
+        let (log, sink, path) = crate::log::testing::log_to_file("session-startup");
+        let fake = Arc::new(Mutex::new(FakeLog::default()));
+        let engine = Fake {
+            surface: rune::NativeSurface::new(),
+            log: fake.clone(),
+        };
+        let mut session = PlaybackSession::new(Box::new(engine), log);
+        let dir = temp_dir("startup-log");
+        let source = dir.join("start.mkv");
+        std::fs::write(&source, b"not a video").unwrap();
+
+        fake.lock().unwrap().pause_error = Some("pause is unavailable".into());
+        session.open(source.clone()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("warn: startup pause was not applied: pause is unavailable"),
+            "{text}"
+        );
+
+        fake.lock().unwrap().pause_error = None;
+        fake.lock().unwrap().open_error = Some("loadfile rejected".into());
+        let error = session.open(source).unwrap_err();
+        assert!(error.contains("loadfile rejected"), "{error}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("failure: load failed: loadfile rejected"),
+            "{text}"
+        );
+        assert_eq!(sink.lines(), text.lines().collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_failed_automatic_resume_keeps_the_pause_and_retries() {
+        let (log, sink, path) = crate::log::testing::log_to_file("session-resume");
+        let fake = Arc::new(Mutex::new(FakeLog::default()));
+        let engine = Fake {
+            surface: rune::NativeSurface::new(),
+            log: fake.clone(),
+        };
+        let mut session = PlaybackSession::new(Box::new(engine), log);
+        let dir = temp_dir("startup-resume");
+        let source = dir.join("start.mkv");
+        std::fs::write(&source, b"not a video").unwrap();
+
+        session.open(source).unwrap();
+        {
+            let mut fake = fake.lock().unwrap();
+            fake.frame_start = true;
+            fake.pause_error = Some("pause is unavailable".into());
+        }
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("warn: automatic pause was not cleared: pause is unavailable"),
+            "{text}"
+        );
+
+        fake.lock().unwrap().pause_error = None;
+        session.poll(&mut tx);
+        fake.lock().unwrap().frame_start = true;
+        session.poll(&mut tx);
+        assert_eq!(
+            fake.lock().unwrap().calls,
+            vec![
+                "pause:true".to_string(),
+                "open".to_string(),
+                "pause:false".to_string(),
+                "pause:false".to_string(),
+            ],
+            "the failed resume was not retried, or the cleared pause was written again"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(sink.lines(), text.lines().collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
