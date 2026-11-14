@@ -2370,7 +2370,7 @@ mod tests {
         session.open(source).unwrap();
         log.lock().unwrap().frame_start = true;
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             log.lock().unwrap().calls,
             vec![
@@ -2396,7 +2396,7 @@ mod tests {
 
         log.lock().unwrap().frame_start = true;
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             log.lock().unwrap().state,
             PlaybackState::Paused,
@@ -2424,7 +2424,7 @@ mod tests {
         session.open(first).unwrap();
         log.lock().unwrap().frame_start = true;
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
 
         log.lock().unwrap().state = PlaybackState::Playing;
         session.toggle();
@@ -2432,7 +2432,7 @@ mod tests {
 
         session.open(second).unwrap();
         log.lock().unwrap().frame_start = true;
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             log.lock().unwrap().calls,
             vec![
@@ -2465,7 +2465,7 @@ mod tests {
         session.open(second).unwrap();
         log.lock().unwrap().frame_start = true;
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             log.lock().unwrap().calls,
             vec![
@@ -2498,7 +2498,7 @@ mod tests {
 
         log.lock().unwrap().frame_start = true;
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             log.lock().unwrap().calls,
             vec![
@@ -2534,7 +2534,7 @@ mod tests {
             log.frame_start = true;
         }
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             log.lock().unwrap().calls,
             vec![
@@ -2602,7 +2602,7 @@ mod tests {
             fake.pause_error = Some("pause is unavailable".into());
         }
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.contains("warn: automatic pause was not cleared: pause is unavailable"),
@@ -2610,9 +2610,9 @@ mod tests {
         );
 
         fake.lock().unwrap().pause_error = None;
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         fake.lock().unwrap().frame_start = true;
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             fake.lock().unwrap().calls,
             vec![
