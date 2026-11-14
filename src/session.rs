@@ -329,12 +329,17 @@ impl PlaybackSession {
     }
 
     pub fn toggle(&mut self) {
-        // A user toggle owns the pause from here, even one that lands before
-        // the load reports ready. The startup phase is over, so neither the
-        // first frame nor a later open may resume over the user's choice.
-        self.startup_pause = false;
-        self.startup_complete = true;
+        // Only a toggle that changes playback hands the pause to the user.
+        // On an empty screen or while a file is loading there is nothing to
+        // toggle, so the startup phase stays open for the file that comes
+        // next.
         if self.engine.state().is_loaded() {
+            // A user toggle owns the pause from here; the first frame must
+            // not clear what the user chose. The startup phase is over, so
+            // neither the first frame nor a later open may resume over the
+            // user's choice.
+            self.startup_pause = false;
+            self.startup_complete = true;
             self.engine.toggle();
         }
     }

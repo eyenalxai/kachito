@@ -2144,6 +2144,74 @@ mod tests {
     }
 
     #[test]
+    fn a_toggle_on_the_empty_screen_does_not_end_the_startup_phase() {
+        let dir = temp_dir("startup-toggle-empty");
+        let source = dir.join("start.mkv");
+        std::fs::write(&source, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        log.lock().unwrap().state = PlaybackState::Empty;
+
+        session.toggle();
+        session.open(source).unwrap();
+        assert_eq!(
+            log.lock().unwrap().calls,
+            vec!["pause:true".to_string(), "open".to_string()],
+            "a toggle on the empty screen ended the startup phase"
+        );
+
+        log.lock().unwrap().frame_start = true;
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert_eq!(
+            log.lock().unwrap().calls,
+            vec![
+                "pause:true".to_string(),
+                "open".to_string(),
+                "pause:false".to_string()
+            ],
+            "the first frame did not clear the startup pause"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_toggle_while_loading_keeps_the_startup_pause() {
+        let dir = temp_dir("startup-toggle-loading");
+        let source = dir.join("start.mkv");
+        std::fs::write(&source, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        log.lock().unwrap().state = PlaybackState::Loading;
+
+        session.open(source).unwrap();
+        session.toggle();
+        assert_eq!(
+            log.lock().unwrap().calls,
+            vec!["pause:true".to_string(), "open".to_string()],
+            "a toggle while the file was loading ended the startup phase"
+        );
+
+        {
+            let mut log = log.lock().unwrap();
+            log.state = PlaybackState::Playing;
+            log.frame_start = true;
+        }
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert_eq!(
+            log.lock().unwrap().calls,
+            vec![
+                "pause:true".to_string(),
+                "open".to_string(),
+                "pause:false".to_string()
+            ],
+            "the first frame did not resume the automatic pause"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_rejected_startup_pause_and_a_failed_load_are_logged() {
         let (log, sink, path) = crate::log::testing::log_to_file("session-startup");
         let fake = Arc::new(Mutex::new(FakeLog::default()));
