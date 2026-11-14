@@ -29,8 +29,8 @@ const RENDER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// command. A stalled event thread must not block the UI forever.
 const REQUEST_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The event thread blocks in the event API for this long so a keep-open end
-/// of file, which emits no event, is still observed.
+/// The event thread blocks in the event API for this long; the timeout
+/// refreshes the clock while playback runs.
 const EVENT_WAIT_SECONDS: f64 = 0.1;
 
 /// A frame delivers no completed draw for this many pushes before the surface
@@ -130,6 +130,38 @@ impl PlaybackState {
     }
 }
 
+/// The values the event thread observed from libmpv. Every state read comes
+/// from this snapshot, so a query never calls into mpv and never blocks the UI
+/// on a property read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlaybackSnapshot {
+    pub state: PlaybackState,
+    pub position: f64,
+    pub duration: Option<f64>,
+    pub frame_duration: Option<f64>,
+    pub seeking: bool,
+    pub paused: bool,
+    pub eof_reached: bool,
+    pub path: Option<PathBuf>,
+    pub tracks: Option<Result<Vec<Track>, String>>,
+}
+
+impl Default for PlaybackSnapshot {
+    fn default() -> Self {
+        Self {
+            state: PlaybackState::Empty,
+            position: 0.0,
+            duration: None,
+            frame_duration: None,
+            seeking: false,
+            paused: false,
+            eof_reached: false,
+            path: None,
+            tracks: None,
+        }
+    }
+}
+
 /// Whether three more frames were pushed than the surface completed draws.
 fn skip_software_render(submitted: u64, completed: u64) -> bool {
     submitted.saturating_sub(completed) >= UNDRAWN_PUSH_LIMIT
@@ -193,17 +225,37 @@ pub trait PlayerEngine: Send {
     fn seek(&mut self, seconds: f64);
     /// A transient seek for a scrub preview. The session coalesces these.
     fn seek_preview(&mut self, seconds: f64);
+    /// The latest values the event thread observed from libmpv. Reading this
+    /// never calls into mpv.
+    fn snapshot(&self) -> PlaybackSnapshot;
     /// True while the player is seeking or restarting playback.
-    fn is_seeking(&self) -> bool;
+    fn is_seeking(&self) -> bool {
+        self.snapshot().seeking
+    }
     fn set_volume(&mut self, volume: f32);
     fn set_speed(&mut self, speed: f32);
-    fn position(&self) -> f64;
-    fn duration(&self) -> Option<f64>;
-    fn frame_duration(&self) -> Option<f64>;
-    fn state(&self) -> PlaybackState;
-    fn current_path(&self) -> Option<PathBuf>;
+    fn position(&self) -> f64 {
+        self.snapshot().position
+    }
+    fn duration(&self) -> Option<f64> {
+        self.snapshot().duration
+    }
+    fn frame_duration(&self) -> Option<f64> {
+        self.snapshot().frame_duration
+    }
+    fn state(&self) -> PlaybackState {
+        self.snapshot().state
+    }
+    fn current_path(&self) -> Option<PathBuf> {
+        self.snapshot().path
+    }
     fn surface(&self) -> NativeSurface;
-    fn tracks(&self) -> Result<Vec<Track>, String>;
+    fn tracks(&self) -> Result<Vec<Track>, String> {
+        match self.snapshot().tracks {
+            Some(result) => result,
+            None => Err("the track list has not been read yet".into()),
+        }
+    }
     fn select_audio(&mut self, id: i64) -> Result<(), String>;
     fn select_subtitle(&mut self, id: Option<i64>) -> Result<(), String>;
     /// Installs the app waker for playback state changes and surface pushes.
@@ -560,8 +612,8 @@ impl PlayerEngine for MpvEngine {
     fn seek_preview(&mut self, seconds: f64) {
         self.seek_on_event_thread(seconds, true);
     }
-    fn is_seeking(&self) -> bool {
-        self.core.is_seeking()
+    fn snapshot(&self) -> PlaybackSnapshot {
+        self.core.snapshot()
     }
     fn set_volume(&mut self, volume: f32) {
         self.core.set_volume(volume);
@@ -569,26 +621,8 @@ impl PlayerEngine for MpvEngine {
     fn set_speed(&mut self, speed: f32) {
         self.core.set_speed(speed);
     }
-    fn position(&self) -> f64 {
-        self.core.position()
-    }
-    fn duration(&self) -> Option<f64> {
-        self.core.duration()
-    }
-    fn frame_duration(&self) -> Option<f64> {
-        self.core.frame_duration()
-    }
-    fn state(&self) -> PlaybackState {
-        self.core.state()
-    }
-    fn current_path(&self) -> Option<PathBuf> {
-        self.core.current_path()
-    }
     fn surface(&self) -> NativeSurface {
         self.surface.clone()
-    }
-    fn tracks(&self) -> Result<Vec<Track>, String> {
-        self.core.tracks()
     }
     fn select_audio(&mut self, id: i64) -> Result<(), String> {
         self.core.select_audio(id)
@@ -629,11 +663,13 @@ impl Drop for MpvEngine {
 struct Core {
     handle: *mut mpv::Handle,
     log: Arc<RunLog>,
-    state: Mutex<PlaybackState>,
+    observed: Mutex<PlaybackSnapshot>,
     end_reported: AtomicBool,
     frame_start: Arc<AtomicBool>,
     failure: Mutex<Option<String>>,
     waker: Mutex<Option<Waker>>,
+    #[cfg(test)]
+    property_reads: AtomicUsize,
     #[cfg(test)]
     pause_reads: AtomicUsize,
     #[cfg(test)]
@@ -711,11 +747,13 @@ impl Core {
             let core = Self {
                 handle,
                 log,
-                state: Mutex::new(PlaybackState::Empty),
+                observed: Mutex::new(PlaybackSnapshot::default()),
                 end_reported: AtomicBool::new(false),
                 frame_start: Arc::new(AtomicBool::new(false)),
                 failure: Mutex::new(None),
                 waker: Mutex::new(None),
+                #[cfg(test)]
+                property_reads: AtomicUsize::new(0),
                 #[cfg(test)]
                 pause_reads: AtomicUsize::new(0),
                 #[cfg(test)]
@@ -728,6 +766,7 @@ impl Core {
             let api = mpv::mpv_client_api_version();
             core.log
                 .info(format!("mpv client API: {}.{}", api >> 16, api & 0xffff));
+            core.observe_properties();
             Ok(core)
         }
     }
@@ -743,18 +782,32 @@ impl Core {
         }
     }
 
+    fn snapshot(&self) -> PlaybackSnapshot {
+        self.observed.lock().unwrap().clone()
+    }
+
+    /// Test-only count of property reads made outside the event thread. A
+    /// state query or a UI poll that reaches a property fails the snapshot
+    /// test; the event thread's own refreshes are expected.
+    #[cfg(test)]
+    fn count_property_read(&self) {
+        if std::thread::current().name() != Some("kachito-events") {
+            self.property_reads.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Applies one explicit state transition. An edge outside the machine is
     /// ignored and logged, and the old state stays in place.
     fn transition(&self, next: PlaybackState) -> bool {
         let next_label = format!("{next:?}");
         let rejected = {
-            let mut state = self.state.lock().unwrap();
-            if !state.allows(&next) {
-                Some(state.clone())
-            } else if *state == next {
+            let mut observed = self.observed.lock().unwrap();
+            if !observed.state.allows(&next) {
+                Some(observed.state.clone())
+            } else if observed.state == next {
                 return false;
             } else {
-                *state = next;
+                observed.state = next;
                 None
             }
         };
@@ -773,6 +826,13 @@ impl Core {
         self.log.info(format!("load: {}", path.to_string_lossy()));
         self.end_reported.store(false, Ordering::Relaxed);
         self.frame_start.store(false, Ordering::Relaxed);
+        {
+            let mut observed = self.observed.lock().unwrap();
+            observed.eof_reached = false;
+            observed.seeking = false;
+            observed.path = None;
+            observed.tracks = None;
+        }
         self.transition(PlaybackState::Loading);
         match self.command_bytes(&[b"loadfile".as_slice(), bytes.as_slice()]) {
             Ok(()) => Ok(()),
@@ -783,23 +843,31 @@ impl Core {
         }
     }
 
-    fn current_path(&self) -> Option<PathBuf> {
-        self.get_path("path")
-    }
-
     fn state(&self) -> PlaybackState {
-        self.state.lock().unwrap().clone()
+        self.observed.lock().unwrap().state.clone()
     }
 
     fn on_file_loaded(&self) {
         // One pause read decides the stored state; a state query never reads it.
         let paused = self.get_flag("pause").unwrap_or(false);
+        let path = self.get_path("path");
+        let tracks = self.read_tracks();
+        {
+            let mut observed = self.observed.lock().unwrap();
+            observed.paused = paused;
+            observed.eof_reached = false;
+            observed.path = path;
+            observed.tracks = Some(tracks);
+        }
+        self.end_reported.store(false, Ordering::Relaxed);
         let next = if paused {
             PlaybackState::Paused
         } else {
             PlaybackState::Playing
         };
         self.transition(next);
+        // Publish the clock before the wake reaches a poll.
+        self.refresh_clock();
     }
 
     fn set_paused(&self, paused: bool) -> Result<(), String> {
@@ -807,6 +875,7 @@ impl Core {
             self.seek_exact(0.0);
         }
         self.set_flag("pause", paused)?;
+        self.observed.lock().unwrap().paused = paused;
         if self.state().is_loaded() || matches!(self.state(), PlaybackState::Loading) {
             let next = if paused {
                 PlaybackState::Paused
@@ -871,26 +940,119 @@ impl Core {
         let _ = self.set_double("speed", f64::from(speed.clamp(0.1, 4.0)));
     }
 
-    fn position(&self) -> f64 {
-        self.get_double("time-pos").unwrap_or(0.0).max(0.0)
-    }
-
-    fn is_seeking(&self) -> bool {
-        self.get_flag("seeking").unwrap_or(false)
-    }
-
-    fn duration(&self) -> Option<f64> {
-        self.get_double("duration")
-            .filter(|duration| duration.is_finite() && *duration > 0.0)
-    }
-
-    fn frame_duration(&self) -> Option<f64> {
-        self.get_double("container-fps")
+    /// Reads the clock properties, and a missing path, on the event thread and
+    /// publishes them.
+    fn refresh_clock(&self) {
+        if !self.state().is_loaded() {
+            return;
+        }
+        let position = self
+            .get_double("time-pos")
+            .map(|position| position.max(0.0));
+        let duration = self
+            .get_double("duration")
+            .filter(|duration| duration.is_finite() && *duration > 0.0);
+        let frame_duration = self
+            .get_double("container-fps")
             .filter(|fps| fps.is_finite() && *fps > 0.0)
-            .map(|fps| 1.0 / fps)
+            .map(|fps| 1.0 / fps);
+        let needs_path = { self.observed.lock().unwrap().path.is_none() };
+        let path = if needs_path {
+            self.get_path("path")
+        } else {
+            None
+        };
+        let mut observed = self.observed.lock().unwrap();
+        if let Some(position) = position {
+            observed.position = position;
+        }
+        if let Some(duration) = duration {
+            observed.duration = Some(duration);
+        }
+        if let Some(frame_duration) = frame_duration {
+            observed.frame_duration = Some(frame_duration);
+        }
+        if let Some(path) = path {
+            observed.path = Some(path);
+        }
     }
 
-    fn tracks(&self) -> Result<Vec<Track>, String> {
+    fn observe_properties(&self) {
+        for (name, format) in [
+            ("pause", mpv::FORMAT_FLAG),
+            ("eof-reached", mpv::FORMAT_FLAG),
+            ("seeking", mpv::FORMAT_FLAG),
+            ("track-list", mpv::FORMAT_NODE),
+        ] {
+            if let Err(error) = self.observe(name, format) {
+                self.log.warn(format!("could not observe {name}: {error}"));
+            }
+        }
+    }
+
+    fn observe(&self, name: &str, format: c_int) -> Result<(), String> {
+        let name = CString::new(name).unwrap();
+        check(
+            unsafe { mpv::mpv_observe_property(self.handle, 0, name.as_ptr(), format) },
+            "observe property",
+        )
+    }
+
+    fn on_property_change(&self, data: *mut c_void) {
+        if data.is_null() {
+            return;
+        }
+        let property = unsafe { &*(data as *const mpv::EventProperty) };
+        if property.name.is_null() {
+            return;
+        }
+        let name = text_at(property.name);
+        match name.as_str() {
+            "pause" if property.format == mpv::FORMAT_FLAG => {
+                if let Some(paused) = flag_at(property.data) {
+                    self.observed.lock().unwrap().paused = paused;
+                }
+            }
+            "seeking" if property.format == mpv::FORMAT_FLAG => {
+                if let Some(seeking) = flag_at(property.data) {
+                    self.observed.lock().unwrap().seeking = seeking;
+                }
+            }
+            "eof-reached" if property.format == mpv::FORMAT_FLAG => {
+                if let Some(eof) = flag_at(property.data) {
+                    self.observed.lock().unwrap().eof_reached = eof;
+                    self.observe_eof(eof);
+                }
+            }
+            "track-list" if property.format == mpv::FORMAT_NODE => {
+                if property.data.is_null() {
+                    return;
+                }
+                let node = unsafe { &*(property.data as *const mpv::Node) };
+                let tracks = tracks_from_node(node);
+                self.observed.lock().unwrap().tracks = Some(tracks);
+            }
+            _ => {}
+        }
+    }
+
+    fn observe_eof(&self, reached: bool) {
+        if !reached {
+            self.end_reported.store(false, Ordering::Relaxed);
+            return;
+        }
+        if !matches!(self.state(), PlaybackState::Playing | PlaybackState::Paused) {
+            return;
+        }
+        if !self.end_reported.swap(true, Ordering::Relaxed) {
+            self.log.info("end of file: eof");
+            self.transition(PlaybackState::Ended);
+        }
+    }
+
+    fn read_tracks(&self) -> Result<Vec<Track>, String> {
+        #[cfg(test)]
+        self.count_property_read();
         let mut node = mpv::Node {
             data: mpv::NodeData { int64: 0 },
             format: 0,
@@ -907,87 +1069,28 @@ impl Core {
         if result < 0 {
             return Err(error_string(result));
         }
-        let mut tracks = Vec::new();
-        unsafe {
-            if node.format == mpv::FORMAT_NODE_ARRAY {
-                let list = &*node.data.list;
-                for index in 0..list.num.max(0) as isize {
-                    let item = &*list.values.offset(index);
-                    if item.format != mpv::FORMAT_NODE_MAP {
-                        continue;
-                    }
-                    let map = &*item.data.list;
-                    let mut id = None;
-                    let mut kind = None;
-                    let mut title = None;
-                    let mut language = None;
-                    let mut selected = false;
-                    for pair in 0..map.num.max(0) as isize {
-                        let key = CStr::from_ptr(*map.keys.offset(pair)).to_string_lossy();
-                        let value = &*map.values.offset(pair);
-                        match key.as_ref() {
-                            "id" if value.format == mpv::FORMAT_INT64 => {
-                                id = Some(value.data.int64)
-                            }
-                            "type" if value.format == mpv::FORMAT_STRING => {
-                                kind = Some(
-                                    CStr::from_ptr(value.data.string)
-                                        .to_string_lossy()
-                                        .into_owned(),
-                                )
-                            }
-                            "title" if value.format == mpv::FORMAT_STRING => {
-                                let text = CStr::from_ptr(value.data.string)
-                                    .to_string_lossy()
-                                    .into_owned();
-                                if !text.is_empty() {
-                                    title = Some(text);
-                                }
-                            }
-                            "lang" if value.format == mpv::FORMAT_STRING => {
-                                let text = CStr::from_ptr(value.data.string)
-                                    .to_string_lossy()
-                                    .into_owned();
-                                if !text.is_empty() {
-                                    language = Some(text);
-                                }
-                            }
-                            "selected" if value.format == mpv::FORMAT_FLAG => {
-                                selected = value.data.flag != 0
-                            }
-                            _ => {}
-                        }
-                    }
-                    let kind = match kind.as_deref() {
-                        Some("audio") => TrackKind::Audio,
-                        Some("sub") => TrackKind::Subtitle,
-                        _ => continue,
-                    };
-                    if let Some(id) = id {
-                        tracks.push(Track {
-                            id,
-                            kind,
-                            title,
-                            language,
-                            selected,
-                        });
-                    }
-                }
-            }
-            mpv::mpv_free_node_contents(&mut node);
-        }
-        Ok(tracks)
+        let tracks = tracks_from_node(&node);
+        unsafe { mpv::mpv_free_node_contents(&mut node) };
+        tracks
     }
 
     fn select_audio(&self, id: i64) -> Result<(), String> {
-        self.set_int("aid", id)
+        self.set_int("aid", id)?;
+        mark_selected(
+            &mut self.observed.lock().unwrap(),
+            TrackKind::Audio,
+            Some(id),
+        );
+        Ok(())
     }
 
     fn select_subtitle(&self, id: Option<i64>) -> Result<(), String> {
         match id {
-            Some(id) => self.set_int("sid", id),
-            None => self.command(&["set", "sid", "no"]),
+            Some(id) => self.set_int("sid", id)?,
+            None => self.command(&["set", "sid", "no"])?,
         }
+        mark_selected(&mut self.observed.lock().unwrap(), TrackKind::Subtitle, id);
+        Ok(())
     }
 
     fn set_int(&self, name: &str, value: i64) -> Result<(), String> {
@@ -1029,6 +1132,7 @@ impl Core {
             mpv::EVENT_FILE_LOADED => self.on_file_loaded(),
             mpv::EVENT_VIDEO_RECONFIG => self.frame_start.store(true, Ordering::Relaxed),
             mpv::EVENT_END_FILE => self.on_end_file(unsafe { (*event).data }),
+            mpv::EVENT_PROPERTY_CHANGE => self.on_property_change(unsafe { (*event).data }),
             mpv::EVENT_QUEUE_OVERFLOW => self.on_queue_overflow(),
             _ => {}
         }
@@ -1048,6 +1152,7 @@ impl Core {
         } else {
             self.log_end_of_file(&reason);
         }
+        self.observed.lock().unwrap().eof_reached = end.reason == mpv::END_FILE_REASON_EOF;
         match end.reason {
             mpv::END_FILE_REASON_EOF => {
                 self.transition(PlaybackState::Ended);
@@ -1073,23 +1178,6 @@ impl Core {
             // succeeds, so a rejected pause leaves the state at Playing where
             // playback actually is.
             let _ = self.set_paused(true);
-        }
-    }
-
-    /// With keep-open, a natural end pauses at the last frame and emits no
-    /// END_FILE event, so the eof-reached property is the only signal.
-    fn observe_natural_eof(&self) {
-        let state = self.state();
-        if !matches!(state, PlaybackState::Playing | PlaybackState::Paused) {
-            return;
-        }
-        if self.get_flag("eof-reached").unwrap_or(false) {
-            if !self.end_reported.swap(true, Ordering::Relaxed) {
-                self.log.info("end of file: eof");
-                self.transition(PlaybackState::Ended);
-            }
-        } else {
-            self.end_reported.store(false, Ordering::Relaxed);
         }
     }
 
@@ -1181,6 +1269,8 @@ impl Core {
     }
 
     fn get_bytes(&self, name: &str) -> Option<Vec<u8>> {
+        #[cfg(test)]
+        self.count_property_read();
         let name = CString::new(name).unwrap();
         let mut value: *mut c_char = ptr::null_mut();
         let result = unsafe {
@@ -1209,6 +1299,8 @@ impl Core {
     }
 
     fn get_double(&self, name: &str) -> Option<f64> {
+        #[cfg(test)]
+        self.count_property_read();
         let name = CString::new(name).unwrap();
         let mut value = 0.0f64;
         let result = unsafe {
@@ -1224,8 +1316,11 @@ impl Core {
 
     fn get_flag(&self, name: &str) -> Option<bool> {
         #[cfg(test)]
-        if name == "pause" {
-            self.pause_reads.fetch_add(1, Ordering::Relaxed);
+        {
+            self.count_property_read();
+            if name == "pause" {
+                self.pause_reads.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let name = CString::new(name).unwrap();
         let mut value: c_int = 0;
@@ -1256,7 +1351,12 @@ fn run_event_loop(core: Arc<Core>, requests: Receiver<Request>, mut render: Rend
         loop {
             match requests.try_recv() {
                 Ok(Request::Shutdown) => break 'events,
-                Ok(request) => core.handle_request(request),
+                Ok(request) => {
+                    core.handle_request(request);
+                    // A pause or seek is visible on the next UI poll, so the
+                    // clock is refreshed before this pass blocks again.
+                    core.refresh_clock();
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break 'events,
             }
@@ -1264,7 +1364,8 @@ fn run_event_loop(core: Arc<Core>, requests: Receiver<Request>, mut render: Rend
 
         // Block in the event API. A queued command calls mpv_wakeup, which makes
         // this return with EVENT_NONE so the next pass can run the command. The
-        // timeout rechecks the keep-open EOF flag, which emits no event.
+        // timeout refreshes the clock while playback runs; pause, EOF, seeking
+        // and the track list arrive through property observations.
         let mut event = unsafe { mpv::mpv_wait_event(core.handle, EVENT_WAIT_SECONDS) };
         while !event.is_null() {
             let id = unsafe { (*event).event_id };
@@ -1276,7 +1377,7 @@ fn run_event_loop(core: Arc<Core>, requests: Receiver<Request>, mut render: Rend
             }
             event = unsafe { mpv::mpv_wait_event(core.handle, 0.0) };
         }
-        core.observe_natural_eof();
+        core.refresh_clock();
     }
 
     // Shutdown: tell the core to quit, then let the render thread free its
@@ -1643,6 +1744,12 @@ mod mpv {
         pub log_level: c_int,
     }
     #[repr(C)]
+    pub struct EventProperty {
+        pub name: *const c_char,
+        pub format: c_int,
+        pub data: *mut c_void,
+    }
+    #[repr(C)]
     pub struct Param {
         pub type_: c_int,
         pub data: *mut c_void,
@@ -1674,6 +1781,7 @@ mod mpv {
     pub const EVENT_END_FILE: c_int = 7;
     pub const EVENT_FILE_LOADED: c_int = 8;
     pub const EVENT_VIDEO_RECONFIG: c_int = 17;
+    pub const EVENT_PROPERTY_CHANGE: c_int = 22;
     pub const EVENT_QUEUE_OVERFLOW: c_int = 24;
     pub const END_FILE_REASON_EOF: c_int = 0;
     pub const END_FILE_REASON_STOP: c_int = 2;
@@ -1723,6 +1831,12 @@ mod mpv {
             format: c_int,
             data: *mut c_void,
         ) -> c_int;
+        pub fn mpv_observe_property(
+            ctx: *mut Handle,
+            reply_userdata: u64,
+            name: *const c_char,
+            format: c_int,
+        ) -> c_int;
         pub fn mpv_get_property(
             ctx: *mut Handle,
             name: *const c_char,
@@ -1751,6 +1865,94 @@ mod mpv {
         pub fn mpv_render_context_free(ctx: *mut Render);
     }
 }
+
+fn flag_at(data: *mut c_void) -> Option<bool> {
+    if data.is_null() {
+        return None;
+    }
+    Some(unsafe { *(data as *const c_int) != 0 })
+}
+
+fn mark_selected(snapshot: &mut PlaybackSnapshot, kind: TrackKind, id: Option<i64>) {
+    let Some(Ok(tracks)) = snapshot.tracks.as_mut() else {
+        return;
+    };
+    for track in tracks.iter_mut().filter(|track| track.kind == kind) {
+        track.selected = Some(track.id) == id;
+    }
+}
+
+fn tracks_from_node(node: &mpv::Node) -> Result<Vec<Track>, String> {
+    if node.format != mpv::FORMAT_NODE_ARRAY {
+        return Ok(Vec::new());
+    }
+    let mut tracks = Vec::new();
+    unsafe {
+        let list = &*node.data.list;
+        for index in 0..list.num.max(0) as isize {
+            let item = &*list.values.offset(index);
+            if item.format != mpv::FORMAT_NODE_MAP {
+                continue;
+            }
+            let map = &*item.data.list;
+            let mut id = None;
+            let mut kind = None;
+            let mut title = None;
+            let mut language = None;
+            let mut selected = false;
+            for pair in 0..map.num.max(0) as isize {
+                let key = CStr::from_ptr(*map.keys.offset(pair)).to_string_lossy();
+                let value = &*map.values.offset(pair);
+                match key.as_ref() {
+                    "id" if value.format == mpv::FORMAT_INT64 => id = Some(value.data.int64),
+                    "type" if value.format == mpv::FORMAT_STRING => {
+                        kind = Some(
+                            CStr::from_ptr(value.data.string)
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
+                    }
+                    "title" if value.format == mpv::FORMAT_STRING => {
+                        let text = CStr::from_ptr(value.data.string)
+                            .to_string_lossy()
+                            .into_owned();
+                        if !text.is_empty() {
+                            title = Some(text);
+                        }
+                    }
+                    "lang" if value.format == mpv::FORMAT_STRING => {
+                        let text = CStr::from_ptr(value.data.string)
+                            .to_string_lossy()
+                            .into_owned();
+                        if !text.is_empty() {
+                            language = Some(text);
+                        }
+                    }
+                    "selected" if value.format == mpv::FORMAT_FLAG => {
+                        selected = value.data.flag != 0
+                    }
+                    _ => {}
+                }
+            }
+            let kind = match kind.as_deref() {
+                Some("audio") => TrackKind::Audio,
+                Some("sub") => TrackKind::Subtitle,
+                _ => continue,
+            };
+            if let Some(id) = id {
+                tracks.push(Track {
+                    id,
+                    kind,
+                    title,
+                    language,
+                    selected,
+                });
+            }
+        }
+    }
+    Ok(tracks)
+}
+
 fn path_bytes(path: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     path.as_os_str().as_bytes().to_vec()
@@ -2425,6 +2627,135 @@ mod tests {
             "the second file-loaded event reads pause once too"
         );
         assert_eq!(engine.core.state(), PlaybackState::Paused);
+    }
+
+    #[test]
+    fn the_snapshot_carries_the_refreshed_clock_and_metadata() {
+        let mut engine = engine();
+        engine.open(&fixture("tracks.mkv")).unwrap();
+        wait_for_frame(&engine);
+        wait_for_loaded(&engine);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.snapshot().position <= 0.0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let snapshot = engine.snapshot();
+        assert!(
+            snapshot.position > 0.0,
+            "the position did not refresh: {snapshot:?}"
+        );
+        assert!(
+            snapshot.duration.is_some_and(|duration| duration > 0.0),
+            "the duration did not refresh: {snapshot:?}"
+        );
+        let frame_duration = snapshot.frame_duration.expect("a source frame duration");
+        assert!(
+            (frame_duration - 1.0 / 25.0).abs() < 1e-6,
+            "{frame_duration}"
+        );
+        let tracks = snapshot
+            .tracks
+            .as_ref()
+            .and_then(|tracks| tracks.as_ref().ok())
+            .expect("the observed track list");
+        assert!(!tracks.is_empty(), "{snapshot:?}");
+    }
+
+    #[test]
+    fn a_track_selection_refreshes_the_snapshot_track_list() {
+        let mut engine = engine();
+        engine.open(&fixture("tracks.mkv")).unwrap();
+        let tracks = wait_for_tracks(&engine);
+        let audio: Vec<&Track> = tracks
+            .iter()
+            .filter(|track| track.kind == TrackKind::Audio)
+            .collect();
+        let target = audio[1].id;
+
+        engine.select_audio(target).unwrap();
+        let selected = engine
+            .snapshot()
+            .tracks
+            .as_ref()
+            .and_then(|tracks| tracks.as_ref().ok())
+            .and_then(|tracks| tracks.iter().find(|track| track.id == target))
+            .is_some_and(|track| track.selected);
+        assert!(
+            selected,
+            "the snapshot track list did not observe the selection"
+        );
+    }
+
+    #[test]
+    fn the_state_queries_read_no_properties() {
+        let mut engine = engine();
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_frame(&engine);
+        wait_for_loaded(&engine);
+        let before = engine.core.property_reads.load(Ordering::Relaxed);
+        for _ in 0..20 {
+            let _ = engine.snapshot();
+            let _ = engine.state();
+            let _ = engine.position();
+            let _ = engine.duration();
+            let _ = engine.frame_duration();
+            let _ = engine.is_seeking();
+            let _ = engine.current_path();
+            let _ = engine.tracks();
+        }
+        assert_eq!(
+            engine.core.property_reads.load(Ordering::Relaxed),
+            before,
+            "a state query read a property instead of the snapshot"
+        );
+    }
+
+    #[test]
+    fn a_pause_and_a_seek_refresh_the_snapshot() {
+        let mut engine = engine();
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_frame(&engine);
+        wait_for_loaded(&engine);
+
+        engine.toggle();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(engine.snapshot().state, PlaybackState::Paused) && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.state, PlaybackState::Paused);
+        assert!(snapshot.paused, "the observed pause flag stayed false");
+
+        engine.seek(0.5);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (engine.snapshot().position - 0.5).abs() > 0.1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let position = engine.snapshot().position;
+        assert!(
+            (position - 0.5).abs() <= 0.1,
+            "the snapshot position stayed at {position:.3} s after a seek"
+        );
+    }
+
+    #[test]
+    fn the_end_of_file_and_the_track_list_refresh_the_snapshot() {
+        let mut engine = engine();
+        engine.open(&fixture("tracks.mkv")).unwrap();
+        wait_for_frame(&engine);
+        let tracks = wait_for_tracks(&engine);
+        assert!(!tracks.is_empty());
+
+        engine.open(&fixture("rgbw.mkv")).unwrap();
+        wait_for_ended(&engine);
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.state, PlaybackState::Ended);
+        assert!(
+            snapshot.eof_reached,
+            "the observed end-of-file flag stayed false: {snapshot:?}"
+        );
     }
 
     #[test]
