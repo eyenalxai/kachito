@@ -828,6 +828,10 @@ impl Core {
         self.frame_start.store(false, Ordering::Relaxed);
         {
             let mut observed = self.observed.lock().unwrap();
+            // A newly loaded file must not inherit the previous file's clock.
+            observed.position = 0.0;
+            observed.duration = None;
+            observed.frame_duration = None;
             observed.eof_reached = false;
             observed.seeking = false;
             observed.path = None;
@@ -925,7 +929,14 @@ impl Core {
     fn seek_exact(&self, seconds: f64) {
         let seconds = seconds.max(0.0);
         let flags = "absolute+exact";
-        let _ = self.command(&["seek", &format!("{seconds:.3}"), flags]);
+        if self
+            .command(&["seek", &format!("{seconds:.3}"), flags])
+            .is_ok()
+        {
+            // The session's one-preview-in-flight rule reads this before the
+            // observation lands, so a seek is marked as soon as it is issued.
+            self.observed.lock().unwrap().seeking = true;
+        }
         #[cfg(test)]
         {
             *self.last_seek_flags.lock().unwrap() = Some(flags.to_string());
@@ -1346,6 +1357,13 @@ impl Drop for Core {
     }
 }
 
+/// The event loop refreshes the clock after every event, but a bare wait
+/// timeout only while playback runs. A paused or ended player has no clock to
+/// advance, so the 100 ms timer must not read properties for it.
+fn clock_refresh_needed(saw_event: bool, state: &PlaybackState) -> bool {
+    saw_event || matches!(state, PlaybackState::Playing)
+}
+
 fn run_event_loop(core: Arc<Core>, requests: Receiver<Request>, mut render: RenderThread) {
     'events: loop {
         loop {
@@ -1366,18 +1384,22 @@ fn run_event_loop(core: Arc<Core>, requests: Receiver<Request>, mut render: Rend
         // this return with EVENT_NONE so the next pass can run the command. The
         // timeout refreshes the clock while playback runs; pause, EOF, seeking
         // and the track list arrive through property observations.
+        let mut saw_event = false;
         let mut event = unsafe { mpv::mpv_wait_event(core.handle, EVENT_WAIT_SECONDS) };
         while !event.is_null() {
             let id = unsafe { (*event).event_id };
             if id == mpv::EVENT_NONE {
                 break;
             }
+            saw_event = true;
             if core.handle_event(event) {
                 break 'events;
             }
             event = unsafe { mpv::mpv_wait_event(core.handle, 0.0) };
         }
-        core.refresh_clock();
+        if clock_refresh_needed(saw_event, &core.state()) {
+            core.refresh_clock();
+        }
     }
 
     // Shutdown: tell the core to quit, then let the render thread free its
@@ -2406,6 +2428,33 @@ mod tests {
     }
 
     #[test]
+    fn a_seek_command_marks_the_snapshot_seeking_before_the_observation() {
+        let core = Core::new(true, quiet()).unwrap();
+        // `vo=libmpv` needs a render context before it will load a file.
+        let render = unsafe { create_render(core.handle) }.unwrap();
+        core.open(&fixture("rgbw.mkv")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut loaded = false;
+        while !loaded && Instant::now() < deadline {
+            // This test runs no event loop, so it pumps the event API itself
+            // until libmpv reports the file loaded.
+            let event = unsafe { mpv::mpv_wait_event(core.handle, 0.05) };
+            loaded = !event.is_null() && unsafe { (*event).event_id } == mpv::EVENT_FILE_LOADED;
+        }
+        assert!(loaded, "the test file never loaded");
+
+        core.seek_exact(0.5);
+        let seeking = core.snapshot().seeking;
+        let failure = core.failure.lock().unwrap().clone();
+        // Free the context before any assertion unwinds into `Core::drop`.
+        unsafe { mpv::mpv_render_context_free(render) };
+        assert!(
+            seeking,
+            "the seek command did not mark the snapshot seeking: {failure:?}"
+        );
+    }
+
+    #[test]
     fn a_seek_wakes_the_surface_without_a_state_change() {
         let mut engine = engine();
         let wakes = Arc::new(AtomicUsize::new(0));
@@ -2663,6 +2712,41 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_second_file_clears_the_previous_clock() {
+        let core = Core::new(true, quiet()).unwrap();
+        core.open(&fixture("rgbw.mkv")).unwrap();
+        {
+            let mut observed = core.observed.lock().unwrap();
+            observed.state = PlaybackState::Paused;
+            observed.position = 0.75;
+            observed.duration = Some(1.0);
+            observed.frame_duration = Some(1.0 / 25.0);
+            observed.tracks = Some(Ok(Vec::new()));
+        }
+
+        core.open(&fixture("tracks.mkv")).unwrap();
+
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.state, PlaybackState::Loading);
+        assert_eq!(
+            snapshot.position, 0.0,
+            "the new file inherited the old position"
+        );
+        assert_eq!(
+            snapshot.duration, None,
+            "the new file inherited the old duration"
+        );
+        assert_eq!(
+            snapshot.frame_duration, None,
+            "the new file inherited the old frame duration"
+        );
+        assert_eq!(
+            snapshot.tracks, None,
+            "the new file inherited the old track list"
+        );
+    }
+
+    #[test]
     fn a_track_selection_refreshes_the_snapshot_track_list() {
         let mut engine = engine();
         engine.open(&fixture("tracks.mkv")).unwrap();
@@ -2741,6 +2825,51 @@ mod tests {
     }
 
     #[test]
+    fn properties_written_on_the_mpv_handle_refresh_the_snapshot() {
+        let mut engine = engine();
+        engine.open(&fixture("tracks.mkv")).unwrap();
+        let tracks = wait_for_tracks(&engine);
+        wait_for_loaded(&engine);
+
+        // Write pause and the audio selection straight to the handle, without
+        // `set_paused` or `select_audio`, so only an observed property change
+        // can update the snapshot.
+        engine.core.command(&["set", "pause", "yes"]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !engine.snapshot().paused && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            engine.snapshot().paused,
+            "the observed pause property did not reach the snapshot"
+        );
+
+        let target = tracks
+            .iter()
+            .filter(|track| track.kind == TrackKind::Audio)
+            .nth(1)
+            .expect("a second audio track")
+            .id;
+        engine.core.set_int("aid", target).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let selected = |snapshot: &PlaybackSnapshot| {
+            snapshot
+                .tracks
+                .as_ref()
+                .and_then(|tracks| tracks.as_ref().ok())
+                .and_then(|tracks| tracks.iter().find(|track| track.id == target))
+                .is_some_and(|track| track.selected)
+        };
+        while !selected(&engine.snapshot()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            selected(&engine.snapshot()),
+            "the observed track-list property did not reach the snapshot"
+        );
+    }
+
+    #[test]
     fn the_end_of_file_and_the_track_list_refresh_the_snapshot() {
         let mut engine = engine();
         engine.open(&fixture("tracks.mkv")).unwrap();
@@ -2773,6 +2902,27 @@ mod tests {
             before,
             "the state query must not read pause"
         );
+    }
+
+    #[test]
+    fn the_event_timeout_refreshes_the_clock_only_while_playing() {
+        for state in [
+            PlaybackState::Empty,
+            PlaybackState::Loading,
+            PlaybackState::Paused,
+            PlaybackState::Ended,
+            PlaybackState::Failed("failed".into()),
+        ] {
+            assert!(
+                !clock_refresh_needed(false, &state),
+                "the timeout read the clock in {state:?}"
+            );
+            assert!(
+                clock_refresh_needed(true, &state),
+                "an event did not refresh the clock in {state:?}"
+            );
+        }
+        assert!(clock_refresh_needed(false, &PlaybackState::Playing));
     }
 
     #[test]

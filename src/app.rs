@@ -1796,6 +1796,50 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_transport_updates_a_late_duration_without_a_rebuild() {
+        let (mut app, log) = app_with_fake();
+        log.lock().unwrap().state = PlaybackState::Paused;
+        let session = session_mut(&mut app);
+
+        let mut tx = Tx::default();
+        assert!(
+            !session.poll(&mut tx, false),
+            "the hidden transport rebuilt for the first duration"
+        );
+        assert_eq!(session.timeline().duration(), 10.0);
+
+        log.lock().unwrap().duration = 12.0;
+        log.lock().unwrap().frame_duration = 1.0 / 24.0;
+        let mut tx = Tx::default();
+        assert!(
+            !session.poll(&mut tx, false),
+            "the hidden transport rebuilt for a late duration"
+        );
+        assert_eq!(session.timeline().duration(), 12.0);
+        assert!((session.timeline().frame_duration() - 1.0 / 24.0).abs() < 1e-9);
+        assert!(!format!("{tx:?}").contains("100ms"), "{tx:?}");
+    }
+
+    #[test]
+    fn a_running_export_rebuilds_when_the_duration_refreshes() {
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        session.set_export(Some(ExportJob::with_state(ExportState::Running {
+            fraction: 0.5,
+        })));
+        let mut tx = Tx::default();
+        session.poll(&mut tx, false);
+
+        log.lock().unwrap().duration = 12.0;
+        let mut tx = Tx::default();
+        assert!(
+            session.poll(&mut tx, false),
+            "the running export missed the new duration"
+        );
+        assert_eq!(session.timeline().duration(), 12.0);
+    }
+
+    #[test]
     fn an_idle_export_does_not_request_a_wake_or_rebuild() {
         let (mut app, _) = app_with_fake();
         let session = session_mut(&mut app);
@@ -2124,6 +2168,35 @@ mod tests {
         assert_eq!(text.matches("notice: seek deadline").count(), 1, "{text}");
         assert_eq!(sink.lines(), text.lines().collect::<Vec<_>>());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_optimistic_selection_is_not_reported_again() {
+        let (mut app, log) = app_with_fake();
+        let initial = match session(&app).tracks() {
+            TracksState::Loaded(tracks) => tracks.clone(),
+            other => panic!("{other:?}"),
+        };
+        log.lock().unwrap().snapshot_tracks = Some(Ok(initial));
+
+        let session = session_mut(&mut app);
+        let mut tx = Tx::default();
+        assert!(
+            session.poll(&mut tx, true),
+            "the first track list is reported"
+        );
+        session.select_audio(2).unwrap();
+        let selected = match session.tracks() {
+            TracksState::Loaded(tracks) => tracks.clone(),
+            other => panic!("{other:?}"),
+        };
+        log.lock().unwrap().snapshot_tracks = Some(Ok(selected));
+
+        let mut tx = Tx::default();
+        assert!(
+            !session.poll(&mut tx, true),
+            "the optimistic selection was reported a second time"
+        );
     }
 
     #[test]

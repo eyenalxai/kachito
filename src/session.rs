@@ -484,6 +484,9 @@ impl PlaybackSession {
         for track in tracks.iter_mut().filter(|track| track.kind == kind) {
             track.selected = Some(track.id) == id;
         }
+        // The next poll must agree with the cached list instead of reporting
+        // the same optimistic selection to the view again.
+        self.reported_tracks = Some(Ok(tracks.clone()));
     }
 
     pub fn selected_audio_index(&self) -> Option<usize> {
@@ -569,6 +572,7 @@ impl PlaybackSession {
 
         let playback_ready = self.awaiting_source.is_none()
             && !matches!(&state, PlaybackState::Loading | PlaybackState::Failed(_));
+        let export_running = matches!(self.export_state(), Some(ExportState::Running { .. }));
         if playback_ready
             && let Some(frame_duration) = snapshot.frame_duration
             && let Some(duration) = snapshot.duration
@@ -576,7 +580,9 @@ impl PlaybackSession {
                 || (self.timeline.frame_duration() - frame_duration).abs() > 1e-9)
         {
             self.timeline.set_duration(duration, frame_duration);
-            changed = true;
+            // The timeline itself must stay current, but its duration is only
+            // on screen in the transport clock or the running export tray.
+            changed |= clock_visible || export_running;
         }
         changed |= self.resolve_pending_seek(&snapshot, playback_ready);
         changed |= self.resolve_pending_preview(&snapshot, playback_ready);
