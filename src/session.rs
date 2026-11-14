@@ -1,6 +1,6 @@
 //! One open video and everything that belongs to it.
 
-use crate::engine::{PlaybackState, PlayerEngine, Track, TrackKind};
+use crate::engine::{PlaybackSnapshot, PlaybackState, PlayerEngine, Track, TrackKind};
 use crate::export::{AudioSelection, ExportJob, ExportMode, ExportRequest, ExportState};
 use crate::log::RunLog;
 use crate::timeline::Timeline;
@@ -182,6 +182,12 @@ pub struct PlaybackSession {
     startup_resume_attempts: u8,
     export: Option<ExportJob>,
     notices: Notices,
+    /// The last snapshot this session reported. The view reads it directly.
+    snapshot: PlaybackSnapshot,
+    reported_state: PlaybackState,
+    reported_seeking: bool,
+    reported_export: Option<ExportState>,
+    reported_tracks: Option<Result<Vec<Track>, String>>,
 }
 
 impl PlaybackSession {
@@ -194,6 +200,7 @@ impl PlaybackSession {
         log: Arc<RunLog>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        let snapshot = engine.snapshot();
         Self {
             engine,
             log,
@@ -210,6 +217,11 @@ impl PlaybackSession {
             startup_resume_attempts: 0,
             export: None,
             notices: Notices::default(),
+            reported_state: snapshot.state.clone(),
+            reported_seeking: snapshot.seeking,
+            reported_export: None,
+            reported_tracks: None,
+            snapshot,
         }
     }
 
@@ -256,6 +268,7 @@ impl PlaybackSession {
         opened?;
         self.startup_pause = paused;
         self.startup_resume_attempts = 0;
+        self.snapshot = self.engine.snapshot();
         self.notices.reset_command();
         self.notices.reset_engine();
         self.awaiting_source = Some(awaiting);
@@ -271,25 +284,32 @@ impl PlaybackSession {
         self.awaiting_source.is_some()
     }
 
+    /// Takes the engine's latest snapshot without running a poll, so tests can
+    /// drive the engine directly and then read the state the next poll sees.
+    #[cfg(test)]
+    pub(crate) fn refresh_snapshot(&mut self) {
+        self.snapshot = self.engine.snapshot();
+    }
+
     #[cfg(test)]
     pub(crate) fn is_scrubbing(&self) -> bool {
         self.scrubbing
     }
 
     pub fn state(&self) -> PlaybackState {
-        self.engine.state()
+        self.snapshot.state.clone()
     }
 
     pub fn duration(&self) -> Option<f64> {
-        self.engine.duration()
+        self.snapshot.duration
     }
 
     pub fn position(&self) -> f64 {
-        self.engine.position()
+        self.snapshot.position
     }
 
     pub fn is_seeking(&self) -> bool {
-        self.engine.is_seeking()
+        self.snapshot.seeking
     }
 
     pub fn surface(&self) -> rune::NativeSurface {
@@ -333,7 +353,7 @@ impl PlaybackSession {
         // On an empty screen or while a file is loading there is nothing to
         // toggle, so the startup phase stays open for the file that comes
         // next.
-        if self.engine.state().is_loaded() {
+        if self.engine.snapshot().state.is_loaded() {
             // A user toggle owns the pause from here; the first frame must
             // not clear what the user chose. The startup phase is over, so
             // neither the first frame nor a later open may resume over the
@@ -341,6 +361,7 @@ impl PlaybackSession {
             self.startup_pause = false;
             self.startup_complete = true;
             self.engine.toggle();
+            self.snapshot = self.engine.snapshot();
         }
     }
 
@@ -348,8 +369,8 @@ impl PlaybackSession {
         if !seconds.is_finite() {
             return;
         }
-        let state = self.engine.state();
-        let Some(seconds) = self.clamp_target(seconds, &state) else {
+        let engine = self.engine.snapshot();
+        let Some(seconds) = self.clamp_target(seconds, &engine.state, engine.duration) else {
             self.scrubbing = false;
             self.pending_seek = None;
             self.pending_preview = None;
@@ -358,9 +379,9 @@ impl PlaybackSession {
         let from_preview = self.scrubbing;
         self.pending_preview = None;
         let settled = from_preview
-            && matches!(state, PlaybackState::Paused | PlaybackState::Playing)
-            && !self.engine.is_seeking()
-            && (self.engine.position() - seconds).abs() <= self.seek_tolerance();
+            && matches!(engine.state, PlaybackState::Paused | PlaybackState::Playing)
+            && !engine.seeking
+            && (engine.position - seconds).abs() <= seek_tolerance(&engine);
         if settled {
             self.scrubbing = false;
             self.pending_seek = None;
@@ -372,14 +393,15 @@ impl PlaybackSession {
             requested_at: self.clock.now(),
         });
         self.engine.seek(seconds);
+        self.snapshot = self.engine.snapshot();
     }
 
     pub fn seek_preview(&mut self, seconds: f64) {
         if !seconds.is_finite() {
             return;
         }
-        let state = self.engine.state();
-        let Some(seconds) = self.clamp_target(seconds, &state) else {
+        let engine = self.engine.snapshot();
+        let Some(seconds) = self.clamp_target(seconds, &engine.state, engine.duration) else {
             return;
         };
         // A new drag supersedes a final seek that has not landed.
@@ -390,23 +412,25 @@ impl PlaybackSession {
             requested_at: self.clock.now(),
             issued: false,
         });
-        if !self.engine.is_seeking() {
+        if !engine.seeking {
             self.issue_preview();
         }
+        self.snapshot = self.engine.snapshot();
     }
 
-    fn clamp_target(&self, seconds: f64, state: &PlaybackState) -> Option<f64> {
+    fn clamp_target(
+        &self,
+        seconds: f64,
+        state: &PlaybackState,
+        duration: Option<f64>,
+    ) -> Option<f64> {
         if !state.is_loaded() {
             return None;
         }
-        Some(match self.engine.duration() {
+        Some(match duration {
             Some(duration) => seconds.clamp(0.0, duration),
             None => seconds.max(0.0),
         })
-    }
-
-    fn seek_tolerance(&self) -> f64 {
-        self.engine.frame_duration().unwrap_or(0.05)
     }
 
     fn issue_preview(&mut self) {
@@ -428,7 +452,7 @@ impl PlaybackSession {
     }
 
     pub fn seek_fraction(&mut self, fraction: f32) {
-        if let Some(duration) = self.engine.duration() {
+        if let Some(duration) = self.engine.snapshot().duration {
             self.seek(f64::from(fraction.clamp(0.0, 1.0)) * duration);
         }
     }
@@ -460,6 +484,9 @@ impl PlaybackSession {
         for track in tracks.iter_mut().filter(|track| track.kind == kind) {
             track.selected = Some(track.id) == id;
         }
+        // The next poll must agree with the cached list instead of reporting
+        // the same optimistic selection to the view again.
+        self.reported_tracks = Some(Ok(tracks.clone()));
     }
 
     pub fn selected_audio_index(&self) -> Option<usize> {
@@ -521,55 +548,80 @@ impl PlaybackSession {
         self.notices.record_export(error);
     }
 
-    pub fn poll(&mut self, tx: &mut Tx) -> bool {
+    /// Runs one UI poll against the engine snapshot. `timeline_visible` is true
+    /// while the transport or the export tray is on screen, so a hidden
+    /// timeline updates without rebuilding the view.
+    pub fn poll(&mut self, tx: &mut Tx, timeline_visible: bool) -> bool {
         let previous_notice = self.error();
+        let snapshot = self.engine.snapshot();
+        let state = snapshot.state.clone();
+
         let mut changed = self.clear_startup_pause();
-        let state = self.engine.state();
         changed |= self.notices.take_changed();
         changed |= self.notices.observe_engine(&state);
         changed |= self.observe_command_failure();
         changed |= self.confirm_open(&state);
+        if self.reported_state != state {
+            self.reported_state = state.clone();
+            changed = true;
+        }
+        if self.reported_seeking != snapshot.seeking {
+            self.reported_seeking = snapshot.seeking;
+            // The seek handle is only on screen with the timeline, so a
+            // transition while hidden updates the reported value silently.
+            changed |= timeline_visible;
+        }
+
         let playback_ready = self.awaiting_source.is_none()
             && !matches!(&state, PlaybackState::Loading | PlaybackState::Failed(_));
         if playback_ready
-            && let Some(frame_duration) = self.engine.frame_duration()
-            && let Some(duration) = self.engine.duration()
+            && let Some(frame_duration) = snapshot.frame_duration
+            && let Some(duration) = snapshot.duration
             && ((self.timeline.duration() - duration).abs() > 0.01
                 || (self.timeline.frame_duration() - frame_duration).abs() > 1e-9)
         {
             self.timeline.set_duration(duration, frame_duration);
-            changed = true;
+            // The timeline itself must stay current, but its duration is only
+            // on screen in the transport clock or the export tray.
+            changed |= timeline_visible;
         }
-        changed |= self.resolve_pending_seek(&state, playback_ready);
-        changed |= self.resolve_pending_preview(&state, playback_ready);
+        changed |= self.resolve_pending_seek(&snapshot, playback_ready);
+        changed |= self.resolve_pending_preview(&snapshot, playback_ready);
         self.notices.resolve();
         changed |= self.error() != previous_notice;
         if playback_ready {
             if self.scrubbing {
-                if !self.engine.is_seeking() {
+                if !snapshot.seeking {
                     self.issue_preview();
                 }
                 tx.wake_after(Duration::from_millis(16));
                 changed = true;
             }
-            if !self.scrubbing {
-                let position = self.engine.position();
-                if (self.timeline.position() - position).abs() > 0.01 {
-                    self.timeline.set_position(position);
-                    changed = true;
-                }
+            if !self.scrubbing && (self.timeline.position() - snapshot.position).abs() > 0.01 {
+                self.timeline.set_position(snapshot.position);
+                // A hidden timeline still keeps its position current, but it
+                // does not ask the view to rebuild for a value it does not show.
+                changed |= timeline_visible;
             }
-            changed |= self.load_tracks(&state);
+            if snapshot.tracks.is_some() {
+                changed |= self.sync_tracks(snapshot.tracks.as_ref());
+            } else {
+                changed |= self.load_tracks(&state);
+            }
         }
         if let Some(job) = &self.export {
-            if matches!(job.state(), ExportState::Running { .. }) {
+            let export = job.state();
+            let export_changed = self.reported_export.as_ref() != Some(&export);
+            if matches!(export, ExportState::Running { .. }) {
                 tx.wake_after(Duration::from_millis(100));
             }
+            changed |= export_changed;
+            self.reported_export = Some(export);
+        } else if self.reported_export.take().is_some() {
             changed = true;
         }
-        if matches!(&state, PlaybackState::Playing) {
+        if matches!(&state, PlaybackState::Playing) && timeline_visible {
             tx.wake_after(Duration::from_millis(100));
-            changed = true;
         }
         if let Some(pending) = self.pending_seek {
             let elapsed = self
@@ -588,6 +640,7 @@ impl PlaybackSession {
         if self.startup_pause && self.startup_complete {
             tx.wake_after(Duration::from_millis(100));
         }
+        self.snapshot = snapshot;
         changed
     }
 
@@ -623,14 +676,14 @@ impl PlaybackSession {
         }
     }
 
-    fn resolve_pending_seek(&mut self, state: &PlaybackState, playback_ready: bool) -> bool {
+    fn resolve_pending_seek(&mut self, snapshot: &PlaybackSnapshot, playback_ready: bool) -> bool {
         let Some(pending) = self.pending_seek else {
             return false;
         };
         let landed = playback_ready
-            && state.is_loaded()
-            && !self.engine.is_seeking()
-            && (self.engine.position() - pending.target).abs() <= self.seek_tolerance();
+            && snapshot.state.is_loaded()
+            && !snapshot.seeking
+            && (snapshot.position - pending.target).abs() <= seek_tolerance(snapshot);
         if landed {
             self.pending_seek = None;
             self.scrubbing = false;
@@ -644,18 +697,22 @@ impl PlaybackSession {
         {
             return false;
         }
-        self.expire_seek(pending.target)
+        self.expire_seek(pending.target, snapshot.position)
     }
 
-    fn resolve_pending_preview(&mut self, state: &PlaybackState, playback_ready: bool) -> bool {
+    fn resolve_pending_preview(
+        &mut self,
+        snapshot: &PlaybackSnapshot,
+        playback_ready: bool,
+    ) -> bool {
         let Some(preview) = self.pending_preview else {
             return false;
         };
         if preview.issued {
             let landed = playback_ready
-                && state.is_loaded()
-                && !self.engine.is_seeking()
-                && (self.engine.position() - preview.target).abs() <= self.seek_tolerance();
+                && snapshot.state.is_loaded()
+                && !snapshot.seeking
+                && (snapshot.position - preview.target).abs() <= seek_tolerance(snapshot);
             if landed {
                 self.pending_preview = None;
                 return false;
@@ -669,11 +726,10 @@ impl PlaybackSession {
         {
             return false;
         }
-        self.expire_seek(preview.target)
+        self.expire_seek(preview.target, snapshot.position)
     }
 
-    fn expire_seek(&mut self, target: f64) -> bool {
-        let position = self.engine.position();
+    fn expire_seek(&mut self, target: f64, position: f64) -> bool {
         self.pending_seek = None;
         self.pending_preview = None;
         self.scrubbing = false;
@@ -732,10 +788,28 @@ impl PlaybackSession {
         true
     }
 
+    /// Applies a track list observed in the engine snapshot. A selection the
+    /// session already applied optimistically is not reported again.
+    fn sync_tracks(&mut self, tracks: Option<&Result<Vec<Track>, String>>) -> bool {
+        let Some(tracks) = tracks else {
+            return false;
+        };
+        if self.awaiting_source.is_some() || self.source.is_none() {
+            return false;
+        }
+        if self.reported_tracks.as_ref() == Some(tracks) {
+            return false;
+        }
+        self.reported_tracks = Some(tracks.clone());
+        self.store_tracks(tracks.clone());
+        true
+    }
+
     fn commit_source(&mut self) {
         if let Some(path) = self.awaiting_source.take() {
             self.source = Some(path);
             self.tracks = TracksState::Unloaded;
+            self.reported_tracks = None;
             self.timeline = Timeline::new();
             self.scrubbing = false;
             self.pending_seek = None;
@@ -795,6 +869,7 @@ impl PlaybackSession {
         log: Arc<RunLog>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        let snapshot = engine.snapshot();
         Self {
             engine,
             log,
@@ -811,6 +886,11 @@ impl PlaybackSession {
             startup_resume_attempts: 0,
             export: None,
             notices: Notices::default(),
+            reported_state: snapshot.state.clone(),
+            reported_seeking: snapshot.seeking,
+            reported_export: None,
+            reported_tracks: None,
+            snapshot,
         }
     }
 
@@ -823,6 +903,10 @@ impl PlaybackSession {
     pub(crate) fn set_export(&mut self, export: Option<ExportJob>) {
         self.export = export;
     }
+}
+
+fn seek_tolerance(snapshot: &PlaybackSnapshot) -> f64 {
+    snapshot.frame_duration.unwrap_or(0.05)
 }
 
 pub(crate) fn tracks_of(tracks: &[Track], kind: TrackKind) -> impl Iterator<Item = &Track> {

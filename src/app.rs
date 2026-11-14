@@ -351,8 +351,9 @@ fn setup(app: &mut App, waker: Waker) {
 
 fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
+    let timeline_visible = app.transport_visible || app.export_open;
     if let Some(session) = &mut app.session {
-        changed |= session.poll(tx);
+        changed |= session.poll(tx, timeline_visible);
         let source = session.source().map(|path| path.to_path_buf());
         if app.title_source != source {
             tx.set_title(format!("{} — Kachito", file_title(source.as_deref())));
@@ -1453,7 +1454,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::PlayerEngine;
+    use crate::engine::{PlaybackSnapshot, PlayerEngine};
     use crate::export::ExportJob;
     use crate::session::Clock;
     use crate::timeline::{DEFAULT_FRAME, Timeline};
@@ -1482,6 +1483,10 @@ mod tests {
         pause_error: Option<String>,
         frame_start: bool,
         calls: Vec<String>,
+        /// Direct engine state getters are charged as property reads, so a
+        /// view that bypasses the session's snapshot is visible to tests.
+        property_reads: usize,
+        snapshot_tracks: Option<Result<Vec<Track>, String>>,
     }
 
     impl Default for FakeLog {
@@ -1507,6 +1512,8 @@ mod tests {
                 pause_error: None,
                 frame_start: false,
                 calls: Vec::new(),
+                property_reads: 0,
+                snapshot_tracks: None,
             }
         }
     }
@@ -1542,8 +1549,24 @@ mod tests {
             log.last_preview_seek = Some(seconds);
             log.preview_seeks += 1;
         }
+        fn snapshot(&self) -> PlaybackSnapshot {
+            let log = self.log.lock().unwrap();
+            PlaybackSnapshot {
+                state: log.state.clone(),
+                position: log.position,
+                duration: Some(log.duration),
+                frame_duration: Some(log.frame_duration),
+                seeking: log.seeking,
+                paused: matches!(log.state, PlaybackState::Paused),
+                eof_reached: matches!(log.state, PlaybackState::Ended),
+                path: log.opened.clone(),
+                tracks: log.snapshot_tracks.clone(),
+            }
+        }
         fn is_seeking(&self) -> bool {
-            self.log.lock().unwrap().seeking
+            let mut log = self.log.lock().unwrap();
+            log.property_reads += 1;
+            log.seeking
         }
         fn set_volume(&mut self, volume: f32) {
             self.log.lock().unwrap().volume = Some(volume);
@@ -1552,19 +1575,29 @@ mod tests {
             self.log.lock().unwrap().speed = Some(speed);
         }
         fn position(&self) -> f64 {
-            self.log.lock().unwrap().position
+            let mut log = self.log.lock().unwrap();
+            log.property_reads += 1;
+            log.position
         }
         fn duration(&self) -> Option<f64> {
-            Some(self.log.lock().unwrap().duration)
+            let mut log = self.log.lock().unwrap();
+            log.property_reads += 1;
+            Some(log.duration)
         }
         fn state(&self) -> PlaybackState {
-            self.log.lock().unwrap().state.clone()
+            let mut log = self.log.lock().unwrap();
+            log.property_reads += 1;
+            log.state.clone()
         }
         fn frame_duration(&self) -> Option<f64> {
-            Some(self.log.lock().unwrap().frame_duration)
+            let mut log = self.log.lock().unwrap();
+            log.property_reads += 1;
+            Some(log.frame_duration)
         }
         fn current_path(&self) -> Option<PathBuf> {
-            self.log.lock().unwrap().opened.clone()
+            let mut log = self.log.lock().unwrap();
+            log.property_reads += 1;
+            log.opened.clone()
         }
         fn surface(&self) -> rune::NativeSurface {
             self.surface.clone()
@@ -1572,6 +1605,7 @@ mod tests {
         fn tracks(&self) -> Result<Vec<Track>, String> {
             let mut log = self.log.lock().unwrap();
             log.tracks_reads += 1;
+            log.property_reads += 1;
             if let Some(result) = &log.tracks_result {
                 return result.clone();
             }
@@ -1723,6 +1757,278 @@ mod tests {
         dir
     }
 
+    fn settle(runtime: &mut Runtime<App>) {
+        let mut stable = 0;
+        for _ in 0..600 {
+            let commits = runtime.stats.commits;
+            runtime.frame(1.0 / 60.0);
+            if runtime.stats.commits == commits {
+                stable += 1;
+                if stable == 5 {
+                    return;
+                }
+            } else {
+                stable = 0;
+            }
+        }
+        panic!("the view never settled");
+    }
+
+    #[test]
+    fn a_hidden_transport_does_not_request_the_clock_wake() {
+        let (mut app, log) = app_with_fake();
+        {
+            let mut log = log.lock().unwrap();
+            log.state = PlaybackState::Playing;
+            log.position = 2.0;
+        }
+        let session = session_mut(&mut app);
+        let mut tx = Tx::default();
+        session.poll(&mut tx, true);
+
+        let mut tx = Tx::default();
+        let changed = session.poll(&mut tx, false);
+        assert!(!changed, "a hidden clock reported a change");
+        assert!(!format!("{tx:?}").contains("100ms"), "{tx:?}");
+    }
+
+    #[test]
+    fn a_visible_clock_keeps_the_clock_wake() {
+        let (mut app, log) = app_with_fake();
+        {
+            let mut log = log.lock().unwrap();
+            log.state = PlaybackState::Playing;
+            log.position = 2.0;
+        }
+        let session = session_mut(&mut app);
+        let mut tx = Tx::default();
+        session.poll(&mut tx, true);
+
+        log.lock().unwrap().position = 3.0;
+        let mut tx = Tx::default();
+        let changed = session.poll(&mut tx, true);
+        assert!(changed, "the visible clock did not report the new position");
+        assert!(format!("{tx:?}").contains("100ms"), "{tx:?}");
+        assert_eq!(session.timeline().position(), 3.0);
+    }
+
+    #[test]
+    fn a_hidden_transport_updates_a_late_duration_without_a_rebuild() {
+        let (mut app, log) = app_with_fake();
+        log.lock().unwrap().state = PlaybackState::Paused;
+        let session = session_mut(&mut app);
+
+        let mut tx = Tx::default();
+        assert!(
+            !session.poll(&mut tx, false),
+            "the hidden transport rebuilt for the first duration"
+        );
+        assert_eq!(session.timeline().duration(), 10.0);
+
+        log.lock().unwrap().duration = 12.0;
+        log.lock().unwrap().frame_duration = 1.0 / 24.0;
+        let mut tx = Tx::default();
+        assert!(
+            !session.poll(&mut tx, false),
+            "the hidden transport rebuilt for a late duration"
+        );
+        assert_eq!(session.timeline().duration(), 12.0);
+        assert!((session.timeline().frame_duration() - 1.0 / 24.0).abs() < 1e-9);
+        assert!(!format!("{tx:?}").contains("100ms"), "{tx:?}");
+    }
+
+    #[test]
+    fn an_open_export_tray_rebuilds_when_the_duration_refreshes() {
+        let (mut app, log) = app_with_fake();
+        log.lock().unwrap().state = PlaybackState::Paused;
+        app.title_source = Some(PathBuf::from("test.mkv"));
+        app.transport_visible = false;
+        app.export_open = true;
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        settle(&mut runtime);
+        assert!(
+            runtime.find("export-tray").is_some(),
+            "the export tray is not open"
+        );
+
+        let commits = runtime.stats.commits;
+        log.lock().unwrap().duration = 12.0;
+        runtime.frame(1.0 / 60.0);
+        assert!(
+            runtime.stats.commits > commits,
+            "the open export tray missed the new duration"
+        );
+    }
+
+    #[test]
+    fn a_hidden_seek_transition_does_not_rebuild_the_view() {
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        let mut tx = Tx::default();
+        session.poll(&mut tx, false);
+
+        log.lock().unwrap().seeking = true;
+        let mut tx = Tx::default();
+        assert!(
+            !session.poll(&mut tx, false),
+            "the hidden seek handle rebuilt the view"
+        );
+        assert!(session.is_seeking(), "the snapshot missed the seek");
+    }
+
+    #[test]
+    fn a_running_export_with_a_closed_tray_does_not_rebuild_for_a_clock_refresh() {
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        session.set_export(Some(ExportJob::with_state(ExportState::Running {
+            fraction: 0.5,
+        })));
+        let mut tx = Tx::default();
+        session.poll(&mut tx, false);
+
+        log.lock().unwrap().duration = 12.0;
+        log.lock().unwrap().frame_duration = 1.0 / 24.0;
+        let mut tx = Tx::default();
+        assert!(
+            !session.poll(&mut tx, false),
+            "the running export rebuilt for a clock refresh"
+        );
+        assert_eq!(session.timeline().duration(), 12.0);
+        assert!((session.timeline().frame_duration() - 1.0 / 24.0).abs() < 1e-9);
+        assert!(
+            format!("{tx:?}").contains("100ms"),
+            "the running export stopped waking for progress: {tx:?}"
+        );
+    }
+
+    #[test]
+    fn an_idle_export_does_not_request_a_wake_or_rebuild() {
+        let (mut app, _) = app_with_fake();
+        let session = session_mut(&mut app);
+        session.set_export(Some(ExportJob::with_state(ExportState::Finished)));
+
+        let mut tx = Tx::default();
+        assert!(session.poll(&mut tx, false), "the finished export is shown");
+        let mut tx = Tx::default();
+        assert!(
+            !session.poll(&mut tx, false),
+            "an idle export rebuilt the view"
+        );
+        assert!(!format!("{tx:?}").contains("100ms"), "{tx:?}");
+    }
+
+    #[test]
+    fn a_hidden_transport_with_an_idle_export_does_not_rebuild() {
+        let (mut app, log) = app_with_fake();
+        let session = session_mut(&mut app);
+        session.set_export(Some(ExportJob::with_state(ExportState::Finished)));
+        let mut tx = Tx::default();
+        session.poll(&mut tx, false);
+
+        log.lock().unwrap().duration = 12.0;
+        log.lock().unwrap().frame_duration = 1.0 / 24.0;
+        let mut tx = Tx::default();
+        assert!(
+            !session.poll(&mut tx, false),
+            "the hidden transport rebuilt with an idle export"
+        );
+        assert_eq!(session.timeline().duration(), 12.0);
+        assert!(!format!("{tx:?}").contains("100ms"), "{tx:?}");
+    }
+
+    #[test]
+    fn a_running_export_keeps_the_progress_wake() {
+        let (mut app, _) = app_with_fake();
+        let session = session_mut(&mut app);
+        session.set_export(Some(ExportJob::with_state(ExportState::Running {
+            fraction: 0.25,
+        })));
+
+        let mut tx = Tx::default();
+        session.poll(&mut tx, false);
+        let mut tx = Tx::default();
+        let changed = session.poll(&mut tx, false);
+        assert!(!changed, "unchanged export progress rebuilt the view");
+        assert!(format!("{tx:?}").contains("100ms"), "{tx:?}");
+    }
+
+    #[test]
+    fn a_hidden_transport_with_no_export_does_not_rebuild_the_view() {
+        let (app, log) = app_with_fake();
+        log.lock().unwrap().state = PlaybackState::Playing;
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        runtime.frame(3.0);
+        assert!(
+            runtime.find("transport").is_none(),
+            "the transport stayed visible"
+        );
+
+        let reads = log.lock().unwrap().property_reads;
+        let commits = runtime.stats.commits;
+        for _ in 0..10 {
+            runtime.frame(0.1);
+        }
+        assert_eq!(log.lock().unwrap().property_reads, reads);
+        assert_eq!(
+            runtime.stats.commits, commits,
+            "the hidden transport rebuilt the view"
+        );
+    }
+
+    #[test]
+    fn a_track_list_change_from_the_snapshot_updates_the_view() {
+        let (mut app, log) = app_with_fake();
+        let next_track = Track {
+            id: 20,
+            kind: TrackKind::Subtitle,
+            title: Some("Signs".into()),
+            language: None,
+            selected: true,
+        };
+        log.lock().unwrap().snapshot_tracks = Some(Ok(vec![next_track.clone()]));
+
+        let session = session_mut(&mut app);
+        let mut tx = Tx::default();
+        assert!(
+            session.poll(&mut tx, true),
+            "the new track list is reported"
+        );
+        assert_eq!(session.tracks(), &TracksState::Loaded(vec![next_track]));
+
+        let mut tx = Tx::default();
+        assert!(
+            !session.poll(&mut tx, true),
+            "an unchanged track list rebuilt the view"
+        );
+    }
+
+    #[test]
+    fn the_view_reads_no_properties_when_the_snapshot_is_still() {
+        let (app, log) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        let reads = log.lock().unwrap().property_reads;
+        let commits = runtime.stats.commits;
+
+        for _ in 0..10 {
+            runtime.frame(1.0 / 60.0);
+        }
+
+        assert_eq!(
+            log.lock().unwrap().property_reads,
+            reads,
+            "the view read an engine property with an unchanged snapshot"
+        );
+        assert_eq!(
+            runtime.stats.commits, commits,
+            "the view rebuilt with an unchanged snapshot"
+        );
+    }
+
     #[test]
     fn a_stuck_seek_clears_at_five_seconds_and_restores_the_engine_position() {
         let (mut app, log, clock) = app_with_fake_and_clock();
@@ -1737,13 +2043,13 @@ mod tests {
 
         session.seek(5.0);
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert!(session.is_scrubbing());
         assert!(format!("{tx:?}").contains("16ms"), "{tx:?}");
 
         clock.advance(Duration::from_millis(4_999));
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert!(
             session.is_scrubbing(),
             "the seek cleared before the deadline"
@@ -1752,7 +2058,7 @@ mod tests {
 
         clock.advance(Duration::from_millis(1));
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert!(
             !session.is_scrubbing(),
             "the stuck seek stayed pending past the deadline"
@@ -1763,7 +2069,7 @@ mod tests {
         assert!(notice.contains("seek"), "{notice}");
 
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(session.error().as_deref(), Some(notice.as_str()));
     }
 
@@ -1782,13 +2088,13 @@ mod tests {
             log.position = 2.0;
         }
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert!(session.is_scrubbing());
         assert!(format!("{tx:?}").contains("16ms"), "{tx:?}");
 
         clock.advance(Duration::from_millis(4_999));
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert!(
             session.is_scrubbing(),
             "the preview cleared before the deadline"
@@ -1797,7 +2103,7 @@ mod tests {
 
         clock.advance(Duration::from_millis(1));
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert!(
             !session.is_scrubbing(),
             "the stuck preview stayed pending past the deadline"
@@ -1808,7 +2114,7 @@ mod tests {
         assert!(notice.contains("seek"), "{notice}");
 
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(session.error().as_deref(), Some(notice.as_str()));
     }
 
@@ -1827,7 +2133,7 @@ mod tests {
         log.lock().unwrap().state = PlaybackState::Failed("the decoder stopped".into());
 
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert!(session.is_scrubbing());
         assert!(
             format!("{tx:?}").contains("5s"),
@@ -1836,7 +2142,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(5));
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
 
         assert!(
             !session.is_scrubbing(),
@@ -1868,14 +2174,14 @@ mod tests {
 
         clock.advance(Duration::from_millis(4_999));
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert!(
             session.is_scrubbing(),
             "the empty engine cleared the seek before the deadline"
         );
 
         clock.advance(Duration::from_millis(1));
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert!(!session.is_scrubbing());
         assert_eq!(session.timeline().position(), 0.0);
         let notice = session.error().expect("one notice");
@@ -1898,12 +2204,12 @@ mod tests {
 
         clock.advance(Duration::from_secs(5));
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         let notice = session.error().expect("one notice");
         assert!(notice.contains("did not finish in time"), "{notice}");
 
         log.lock().unwrap().command_failure = Some("set speed 2: rejected".into());
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         let notice = session.error().expect("one notice");
         assert!(
             notice.contains("set speed 2"),
@@ -1937,13 +2243,42 @@ mod tests {
         session.seek(5.0);
         clock.advance(Duration::from_secs(5));
         let mut tx = Tx::default();
-        session.poll(&mut tx);
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
+        session.poll(&mut tx, true);
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches("notice: seek deadline").count(), 1, "{text}");
         assert_eq!(sink.lines(), text.lines().collect::<Vec<_>>());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_optimistic_selection_is_not_reported_again() {
+        let (mut app, log) = app_with_fake();
+        let initial = match session(&app).tracks() {
+            TracksState::Loaded(tracks) => tracks.clone(),
+            other => panic!("{other:?}"),
+        };
+        log.lock().unwrap().snapshot_tracks = Some(Ok(initial));
+
+        let session = session_mut(&mut app);
+        let mut tx = Tx::default();
+        assert!(
+            session.poll(&mut tx, true),
+            "the first track list is reported"
+        );
+        session.select_audio(2).unwrap();
+        let selected = match session.tracks() {
+            TracksState::Loaded(tracks) => tracks.clone(),
+            other => panic!("{other:?}"),
+        };
+        log.lock().unwrap().snapshot_tracks = Some(Ok(selected));
+
+        let mut tx = Tx::default();
+        assert!(
+            !session.poll(&mut tx, true),
+            "the optimistic selection was reported a second time"
+        );
     }
 
     #[test]
@@ -2004,6 +2339,7 @@ mod tests {
             Some(source.as_path())
         );
 
+        session_mut(&mut app).refresh_snapshot();
         let state = session(&app).state();
         assert!(session_mut(&mut app).confirm_open(&state));
         assert_eq!(session(&app).source(), Some(source.as_path()));
@@ -2034,7 +2370,7 @@ mod tests {
         session.open(source).unwrap();
         log.lock().unwrap().frame_start = true;
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             log.lock().unwrap().calls,
             vec![
@@ -2060,7 +2396,7 @@ mod tests {
 
         log.lock().unwrap().frame_start = true;
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             log.lock().unwrap().state,
             PlaybackState::Paused,
@@ -2088,7 +2424,7 @@ mod tests {
         session.open(first).unwrap();
         log.lock().unwrap().frame_start = true;
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
 
         log.lock().unwrap().state = PlaybackState::Playing;
         session.toggle();
@@ -2096,7 +2432,7 @@ mod tests {
 
         session.open(second).unwrap();
         log.lock().unwrap().frame_start = true;
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             log.lock().unwrap().calls,
             vec![
@@ -2129,7 +2465,7 @@ mod tests {
         session.open(second).unwrap();
         log.lock().unwrap().frame_start = true;
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             log.lock().unwrap().calls,
             vec![
@@ -2162,7 +2498,7 @@ mod tests {
 
         log.lock().unwrap().frame_start = true;
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             log.lock().unwrap().calls,
             vec![
@@ -2198,7 +2534,7 @@ mod tests {
             log.frame_start = true;
         }
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             log.lock().unwrap().calls,
             vec![
@@ -2266,7 +2602,7 @@ mod tests {
             fake.pause_error = Some("pause is unavailable".into());
         }
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.contains("warn: automatic pause was not cleared: pause is unavailable"),
@@ -2274,9 +2610,9 @@ mod tests {
         );
 
         fake.lock().unwrap().pause_error = None;
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         fake.lock().unwrap().frame_start = true;
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             fake.lock().unwrap().calls,
             vec![
@@ -2473,6 +2809,7 @@ mod tests {
         let at = runtime.find("video").unwrap_or((10.0, 10.0));
         runtime.drop_files(vec![dropped.clone()], Some(at));
         runtime.frame(1.0 / 60.0);
+        session_mut(&mut runtime.state).refresh_snapshot();
         let state = session(&runtime.state).state();
         assert!(session_mut(&mut runtime.state).confirm_open(&state));
         assert_eq!(session(&runtime.state).source(), Some(dropped.as_path()));
@@ -2557,6 +2894,7 @@ mod tests {
         assert!(session(&app).is_awaiting_source());
 
         log.lock().unwrap().state = PlaybackState::Failed("corrupt".into());
+        session_mut(&mut app).refresh_snapshot();
         let state = session(&app).state();
         assert!(session_mut(&mut app).confirm_open(&state));
         assert_eq!(session(&app).source(), old_path.as_deref());
@@ -2585,11 +2923,13 @@ mod tests {
         assert_eq!(session(&app).source(), old_path.as_deref());
         assert!(session(&app).is_awaiting_source());
 
+        session_mut(&mut app).refresh_snapshot();
         let state = session(&app).state();
         assert!(!session_mut(&mut app).confirm_open(&state));
         assert_eq!(session(&app).source(), old_path.as_deref());
 
         log.lock().unwrap().state = PlaybackState::Paused;
+        session_mut(&mut app).refresh_snapshot();
         let state = session(&app).state();
         assert!(session_mut(&mut app).confirm_open(&state));
         assert_eq!(session(&app).source(), Some(next.as_path()));
@@ -2610,6 +2950,7 @@ mod tests {
 
         app.open(next);
         log.lock().unwrap().state = PlaybackState::Paused;
+        session_mut(&mut app).refresh_snapshot();
         let state = session(&app).state();
         assert!(session_mut(&mut app).confirm_open(&state));
         assert_eq!(session(&app).export_state(), None);
@@ -2628,6 +2969,7 @@ mod tests {
 
         app.open(corrupt);
         log.lock().unwrap().state = PlaybackState::Failed("corrupt".into());
+        session_mut(&mut app).refresh_snapshot();
         let state = session(&app).state();
         assert!(session_mut(&mut app).confirm_open(&state));
         assert_eq!(app.error_text().as_deref(), Some("corrupt"));
@@ -2697,6 +3039,7 @@ mod tests {
             log.tracks_result = Some(Ok(Vec::new()));
             log.tracks_reads = 0;
         }
+        session_mut(&mut app).refresh_snapshot();
         let state = session(&app).state();
         assert!(session_mut(&mut app).load_tracks(&state));
         assert_eq!(session(&app).tracks(), &TracksState::Loaded(Vec::new()));
@@ -2714,6 +3057,7 @@ mod tests {
             log.tracks_result = Some(Err("track list unavailable".into()));
             log.tracks_reads = 0;
         }
+        session_mut(&mut app).refresh_snapshot();
         let state = session(&app).state();
         assert!(session_mut(&mut app).load_tracks(&state));
         assert_eq!(
@@ -2930,6 +3274,8 @@ mod tests {
         });
         runtime.frame(3.1);
         assert!(runtime.find("play").is_some());
+        // The visible clock resumes its poll after the key frame.
+        runtime.frame(0.1);
         runtime.frame(3.0);
         assert!(runtime.find("play").is_none());
     }
@@ -3099,11 +3445,11 @@ mod tests {
         session.set_scrubbing(true);
 
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(session.timeline().position(), 5.0);
 
         session.seek(5.0);
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             session.timeline().position(),
             5.0,
@@ -3111,11 +3457,11 @@ mod tests {
         );
 
         log.lock().unwrap().position = 5.0;
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(session.timeline().position(), 5.0);
 
         log.lock().unwrap().position = 0.0;
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert_eq!(
             session.timeline().position(),
             0.0,
@@ -3139,7 +3485,7 @@ mod tests {
 
         log.lock().unwrap().seeking = false;
         let mut tx = Tx::default();
-        session_mut(&mut app).poll(&mut tx);
+        session_mut(&mut app).poll(&mut tx, true);
         assert_eq!(log.lock().unwrap().preview_seeks, 1);
         let preview = log.lock().unwrap().last_preview_seek.expect("a preview");
         assert!((preview - 6.0).abs() < 1e-4);
@@ -3158,7 +3504,7 @@ mod tests {
         assert_eq!(log.lock().unwrap().last_seek, None);
 
         let mut tx = Tx::default();
-        session_mut(&mut app).poll(&mut tx);
+        session_mut(&mut app).poll(&mut tx, true);
         assert!((session(&app).timeline().position() - 5.0).abs() < 1e-4);
     }
 
@@ -3179,14 +3525,14 @@ mod tests {
         assert!(session.is_scrubbing());
 
         let mut tx = Tx::default();
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert!(
             session.is_scrubbing(),
             "the busy engine cleared the release seek"
         );
 
         log.lock().unwrap().seeking = false;
-        session.poll(&mut tx);
+        session.poll(&mut tx, true);
         assert!(!session.is_scrubbing());
         assert!((session.timeline().position() - 5.0).abs() < 1e-4);
     }
