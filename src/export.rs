@@ -1,5 +1,6 @@
 //! Clip export through the system ffmpeg.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -38,7 +39,6 @@ pub enum ExportError {
     InvalidFrameDuration,
     InvalidPath,
     SameFile,
-    NonUtf8Path,
     AudioTrackOutOfRange,
     Spawn(String),
 }
@@ -59,7 +59,6 @@ impl fmt::Display for ExportError {
                 f.write_str("Choose a source video and an output file with valid paths.")
             }
             Self::SameFile => f.write_str("Choose an output file other than the source video."),
-            Self::NonUtf8Path => f.write_str("The file path must be valid UTF-8."),
             Self::AudioTrackOutOfRange => {
                 f.write_str("The selected audio track is no longer available.")
             }
@@ -102,13 +101,7 @@ impl ExportRequest {
         if source.file_name().is_none() || output.file_name().is_none() {
             return Err(ExportError::InvalidPath);
         }
-        let Some(source_text) = source.to_str() else {
-            return Err(ExportError::NonUtf8Path);
-        };
-        let Some(output_text) = output.to_str() else {
-            return Err(ExportError::NonUtf8Path);
-        };
-        if source_text.contains('\0') || output_text.contains('\0') {
+        if has_nul(&source) || has_nul(&output) {
             return Err(ExportError::InvalidPath);
         }
         if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
@@ -142,8 +135,8 @@ impl ExportRequest {
         self.end - self.start
     }
 
-    fn command_to(&self, output: &Path) -> Vec<String> {
-        let mut args = vec![
+    fn command_to(&self, output: &Path) -> Vec<OsString> {
+        let mut args: Vec<OsString> = vec![
             "-hide_banner".into(),
             "-loglevel".into(),
             "error".into(),
@@ -151,17 +144,17 @@ impl ExportRequest {
             "-progress".into(),
             "pipe:1".into(),
             "-ss".into(),
-            format!("{:.3}", self.start),
+            format!("{:.3}", self.start).into(),
             "-t".into(),
-            format!("{:.3}", self.duration()),
+            format!("{:.3}", self.duration()).into(),
             "-i".into(),
-            self.source.display().to_string(),
+            self.source.clone().into_os_string(),
             "-map".into(),
             "0:v:0".into(),
         ];
         if let Some(index) = self.audio_index {
             args.push("-map".into());
-            args.push(format!("0:a:{index}"));
+            args.push(format!("0:a:{index}").into());
         }
         match self.mode {
             ExportMode::Fast => {
@@ -177,7 +170,7 @@ impl ExportRequest {
             }
         }
         args.push("-y".into());
-        args.push(output.display().to_string());
+        args.push(output.as_os_str().to_os_string());
         args
     }
 }
@@ -387,6 +380,10 @@ fn temp_output(output: &Path) -> PathBuf {
 
 fn remove_file(path: &Path) {
     let _ = std::fs::remove_file(path);
+}
+
+fn has_nul(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().contains(&0)
 }
 
 fn same_file(a: &Path, b: &Path) -> Result<bool, ExportError> {
@@ -605,20 +602,63 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_non_utf8_paths() {
+    fn accepts_non_utf8_paths_and_passes_them_as_path_arguments() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
-        let source = PathBuf::from(OsString::from_vec(vec![0xff]));
-        let result = ExportRequest::new(
-            source,
+
+        let source = PathBuf::from(OsString::from_vec(b"in-\xff.mkv".to_vec()));
+        let output = PathBuf::from(OsString::from_vec(b"out-\xfe.mkv".to_vec()));
+        let request = ExportRequest::new(
+            source.clone(),
             0.0,
             2.0,
             AudioSelection::default(),
             1.0 / 60.0,
             ExportMode::Fast,
-            PathBuf::from("out.mkv"),
+            output.clone(),
+        )
+        .expect("a non-UTF-8 path is a valid path");
+        let command = request.command_to(&output);
+        assert!(
+            command
+                .windows(2)
+                .any(|pair| pair[0] == "-i" && pair[1] == source.as_os_str()),
+            "{command:?}"
         );
-        assert_eq!(result.unwrap_err(), ExportError::NonUtf8Path);
+        assert_eq!(command.last(), Some(&output.into_os_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_source_and_output_export() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("kachito-export-non-utf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join(OsString::from_vec(b"source-\xff.mkv".to_vec()));
+        std::fs::copy(fixture("tracks.mkv"), &source).unwrap();
+        let output = dir.join(OsString::from_vec(b"out-\xfe.mkv".to_vec()));
+        let request = ExportRequest::new(
+            source,
+            0.0,
+            0.8,
+            AudioSelection {
+                index: Some(0),
+                count: 1,
+            },
+            1.0 / 60.0,
+            ExportMode::Precise,
+            output.clone(),
+        )
+        .expect("a non-UTF-8 source and output are valid paths");
+        let job = ExportJob::start(request).expect("start the export");
+        let state = wait_for_terminal(&job, Duration::from_secs(30));
+        assert_eq!(state, ExportState::Finished);
+        assert!(output.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -7,9 +7,29 @@ use crate::timeline::Timeline;
 use rune::Tx;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) const SUPPORTED: &[&str] = &["mkv", "mp4", "m4v", "mov", "webm"];
+
+const SEEK_DEADLINE: Duration = Duration::from_secs(5);
+
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingSeek {
+    target: f64,
+    requested_at: Instant,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TracksState {
@@ -29,6 +49,7 @@ struct Notices {
     command: Option<Notice>,
     export: Option<Notice>,
     engine: Option<Notice>,
+    seek: Option<Notice>,
     command_shown: bool,
     clock: u64,
     changed: bool,
@@ -40,6 +61,7 @@ impl Notices {
             self.command.as_ref(),
             self.export.as_ref(),
             self.engine.as_ref(),
+            self.seek.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -54,6 +76,10 @@ impl Notices {
     fn record_export(&mut self, message: String) {
         self.export = Some(self.new(message));
         self.changed = true;
+    }
+
+    fn record_seek(&mut self, message: String) {
+        self.seek = Some(self.new(message));
     }
 
     fn record_command(&mut self, failure: &str) -> bool {
@@ -95,7 +121,8 @@ impl Notices {
             .export
             .as_ref()
             .map(|notice| notice.at)
-            .max(self.engine.as_ref().map(|notice| notice.at));
+            .max(self.engine.as_ref().map(|notice| notice.at))
+            .max(self.seek.as_ref().map(|notice| notice.at));
         if other.is_none_or(|other| command_at > other) {
             self.command_shown = true;
         }
@@ -123,12 +150,13 @@ impl Notices {
 pub struct PlaybackSession {
     engine: Box<dyn PlayerEngine>,
     log: Arc<RunLog>,
+    clock: Arc<dyn Clock>,
     source: Option<PathBuf>,
     awaiting_source: Option<PathBuf>,
     tracks: TracksState,
     timeline: Timeline,
     scrubbing: bool,
-    pending_seek: Option<f64>,
+    pending_seek: Option<PendingSeek>,
     preview_target: Option<f64>,
     export: Option<ExportJob>,
     notices: Notices,
@@ -136,9 +164,18 @@ pub struct PlaybackSession {
 
 impl PlaybackSession {
     pub fn new(engine: Box<dyn PlayerEngine>, log: Arc<RunLog>) -> Self {
+        Self::with_clock(engine, log, Arc::new(SystemClock))
+    }
+
+    pub fn with_clock(
+        engine: Box<dyn PlayerEngine>,
+        log: Arc<RunLog>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             engine,
             log,
+            clock,
             source: None,
             awaiting_source: None,
             tracks: TracksState::Unloaded,
@@ -272,7 +309,10 @@ impl PlaybackSession {
             return;
         }
         self.scrubbing = true;
-        self.pending_seek = Some(seconds);
+        self.pending_seek = Some(PendingSeek {
+            target: seconds,
+            requested_at: self.clock.now(),
+        });
         self.engine.seek(seconds);
     }
 
@@ -335,14 +375,23 @@ impl PlaybackSession {
 
     pub fn select_audio(&mut self, id: i64) -> Result<(), String> {
         self.engine.select_audio(id)?;
-        self.refresh_tracks();
+        self.mark_selected(TrackKind::Audio, Some(id));
         Ok(())
     }
 
     pub fn select_subtitle(&mut self, id: Option<i64>) -> Result<(), String> {
         self.engine.select_subtitle(id)?;
-        self.refresh_tracks();
+        self.mark_selected(TrackKind::Subtitle, id);
         Ok(())
+    }
+
+    fn mark_selected(&mut self, kind: TrackKind, id: Option<i64>) {
+        let TracksState::Loaded(tracks) = &mut self.tracks else {
+            return;
+        };
+        for track in tracks.iter_mut().filter(|track| track.kind == kind) {
+            track.selected = Some(track.id) == id;
+        }
     }
 
     pub fn selected_audio_index(&self) -> Option<usize> {
@@ -424,12 +473,32 @@ impl PlaybackSession {
                 self.timeline.set_duration(duration, frame_duration);
                 changed = true;
             }
-            if let Some(target) = self.pending_seek {
+            if let Some(pending) = self.pending_seek {
                 let landed = !self.engine.is_seeking()
-                    && (self.engine.position() - target).abs() <= self.seek_tolerance();
+                    && (self.engine.position() - pending.target).abs() <= self.seek_tolerance();
                 if landed || matches!(&state, PlaybackState::Failed(_) | PlaybackState::Empty) {
                     self.pending_seek = None;
                     self.scrubbing = false;
+                } else if self
+                    .clock
+                    .now()
+                    .saturating_duration_since(pending.requested_at)
+                    >= SEEK_DEADLINE
+                {
+                    let position = self.engine.position();
+                    self.pending_seek = None;
+                    self.scrubbing = false;
+                    self.preview_target = None;
+                    self.timeline.set_position(position);
+                    self.notices.record_seek(
+                        "The seek did not finish in time. Playback continues from the current position."
+                            .into(),
+                    );
+                    self.log.warn(format!(
+                        "notice: seek deadline: target {:.3}s, position {:.3}s",
+                        pending.target, position
+                    ));
+                    changed = true;
                 }
             }
             if self.scrubbing {
@@ -518,16 +587,13 @@ impl PlaybackSession {
             self.preview_target = None;
             self.export = None;
             self.notices.export = None;
+            self.notices.seek = None;
         }
     }
 
     fn read_tracks(&mut self) {
         let result = self.engine.tracks();
         self.store_tracks(result);
-    }
-
-    fn refresh_tracks(&mut self) {
-        self.read_tracks();
     }
 
     fn store_tracks(&mut self, result: Result<Vec<Track>, String>) {
@@ -553,9 +619,31 @@ impl PlaybackSession {
         tracks: TracksState,
         log: Arc<RunLog>,
     ) -> Self {
+        Self::with_source_clock_and_log(engine, source, tracks, log, Arc::new(SystemClock))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_source_and_clock(
+        engine: Box<dyn PlayerEngine>,
+        source: PathBuf,
+        tracks: TracksState,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self::with_source_clock_and_log(engine, source, tracks, Arc::new(RunLog::disabled()), clock)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_source_clock_and_log(
+        engine: Box<dyn PlayerEngine>,
+        source: PathBuf,
+        tracks: TracksState,
+        log: Arc<RunLog>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             engine,
             log,
+            clock,
             source: Some(source),
             awaiting_source: None,
             tracks,
