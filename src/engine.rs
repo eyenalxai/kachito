@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicU64;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -24,6 +24,10 @@ pub const CLIENT_API_MAJOR: u32 = 2;
 
 /// Exit waits this long for the render thread to free its context.
 const RENDER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The UI waits this long for the event thread to answer a synchronous
+/// command. A stalled event thread must not block the UI forever.
+const REQUEST_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The event thread blocks in the event API for this long so a keep-open end
 /// of file, which emits no event, is still observed.
@@ -136,8 +140,10 @@ impl SoftwareFormat {
         if self.alpha_pass { "bgr0" } else { "bgra" }
     }
 
-    fn fallback(self) -> Option<Self> {
-        (self == Self::BGRA).then_some(Self::BGR0)
+    /// A format change is allowed only when libmpv rejects the target itself.
+    /// Any other render error is not a format problem and keeps `bgra`.
+    fn fallback(self, code: c_int) -> Option<Self> {
+        (self == Self::BGRA && code == mpv::ERROR_UNSUPPORTED).then_some(Self::BGR0)
     }
 }
 
@@ -239,11 +245,10 @@ impl RenderWake {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         while !*pending && !stop.load(Ordering::Relaxed) {
-            let (guard, _) = self
+            pending = self
                 .ready
-                .wait_timeout(pending, Duration::from_millis(100))
+                .wait(pending)
                 .unwrap_or_else(|error| error.into_inner());
-            pending = guard;
         }
         let ready = *pending;
         *pending = false;
@@ -258,6 +263,7 @@ extern "C" fn render_update_callback(ctx: *mut c_void) {
 }
 
 struct RenderThread {
+    core: Option<Arc<Core>>,
     stop: Arc<AtomicBool>,
     wake: Arc<RenderWake>,
     done: Receiver<()>,
@@ -270,23 +276,48 @@ impl RenderThread {
         self.wake.notify();
     }
 
-    /// Waits for the render thread to free its context. A thread that misses
-    /// the deadline is left detached; the player is destroyed anyway.
+    /// Waits for the render thread to free its context.
+    ///
+    /// A thread that misses the deadline is left detached, and its reference
+    /// to the core is leaked: the thread may still be inside
+    /// `mpv_render_context_render` or `mpv_render_context_free`, and destroying
+    /// the handle under it would be a use-after-free. The handle then lives
+    /// until process exit, which is the safe outcome.
     fn join(&mut self, timeout: Duration, log: &RunLog) -> bool {
         match self.done.recv_timeout(timeout) {
-            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
                 if let Some(handle) = self.handle.take() {
                     let _ = handle.join();
                 }
+                let _ = self.core.take();
                 true
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(RecvTimeoutError::Timeout) => {
                 log.warn(format!(
-                    "render thread did not stop within {:.1} s; destroying the player anyway",
+                    "render thread did not stop within {:.1} s; keeping the player handle alive until the process exits",
                     timeout.as_secs_f64()
                 ));
+                // SAFETY: The detached thread still owns the render context
+                // and may call into this handle. Leaking the Arc keeps
+                // `Core::drop` from running `mpv_terminate_destroy` while
+                // that is possible.
+                if let Some(core) = self.core.take() {
+                    std::mem::forget(core);
+                }
                 false
             }
+        }
+    }
+}
+
+impl Drop for RenderThread {
+    fn drop(&mut self) {
+        // A thread that was never joined (for example because the event thread
+        // panicked) is in the same position as a timed-out join.
+        if self.handle.is_some()
+            && let Some(core) = self.core.take()
+        {
+            std::mem::forget(core);
         }
     }
 }
@@ -387,6 +418,7 @@ impl MpvEngine {
         };
 
         let mut render_thread = RenderThread {
+            core: Some(core.clone()),
             stop: render_stop,
             wake: wake.clone(),
             done: render_done_rx,
@@ -436,6 +468,27 @@ impl MpvEngine {
         unsafe { mpv::mpv_wakeup(self.core.handle) };
     }
 
+    /// Waits for one synchronous command to answer. A timeout is a logged
+    /// failure rather than an unbounded UI stall.
+    fn wait_for_reply<T>(&self, done: Receiver<T>, what: &str) -> Result<T, String> {
+        match done.recv_timeout(REQUEST_REPLY_TIMEOUT) {
+            Ok(reply) => Ok(reply),
+            Err(RecvTimeoutError::Timeout) => {
+                let error = format!(
+                    "the playback event thread did not answer {what} within {:.1} s",
+                    REQUEST_REPLY_TIMEOUT.as_secs_f64()
+                );
+                self.core.log.failure(&error);
+                Err(error)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let error = format!("the playback event thread stopped before answering {what}");
+                self.core.log.failure(&error);
+                Err(error)
+            }
+        }
+    }
+
     fn seek_on_event_thread(&mut self, seconds: f64, preview: bool) {
         let (reply, done) = std::sync::mpsc::sync_channel(1);
         if self
@@ -448,7 +501,7 @@ impl MpvEngine {
             .is_ok()
         {
             self.wake_event_thread();
-            let _ = done.recv();
+            let _ = self.wait_for_reply(done, "seek");
         }
     }
 }
@@ -463,14 +516,13 @@ impl PlayerEngine for MpvEngine {
             })
             .map_err(|_| "the playback event thread is not running".to_string())?;
         self.wake_event_thread();
-        done.recv()
-            .map_err(|_| "the playback event thread stopped".to_string())?
+        self.wait_for_reply(done, "open")?
     }
     fn toggle(&mut self) {
         let (reply, done) = std::sync::mpsc::sync_channel(1);
         if self.requests.send(Request::Toggle { reply }).is_ok() {
             self.wake_event_thread();
-            let _ = done.recv();
+            let _ = self.wait_for_reply(done, "toggle");
         }
     }
     fn seek(&mut self, seconds: f64) {
@@ -547,6 +599,12 @@ struct Core {
     last_seek_flags: Mutex<Option<String>>,
 }
 
+// SAFETY: The two-thread split makes this load-bearing. The event thread and
+// the UI thread call libmpv through the same handle; libmpv's client API is
+// thread-safe, and every mutable field is behind a mutex or an atomic, so no
+// Rust-level data race is possible. The handle outlives both threads because
+// `Core::drop` runs only after the render thread has freed its context (see
+// the comment on that impl).
 unsafe impl Send for Core {}
 unsafe impl Sync for Core {}
 
@@ -946,10 +1004,14 @@ impl Core {
     }
 
     fn on_queue_overflow(&self) {
-        self.log
-            .warn("event queue overflow: events were dropped before they reached the player state");
+        self.log.failure(
+            "event queue overflow: events were dropped before they reached the player state",
+        );
         if matches!(self.state(), PlaybackState::Playing) {
-            self.transition(PlaybackState::Paused);
+            // Pause first: `set_paused` stores Paused only after the write
+            // succeeds, so a rejected pause leaves the state at Playing where
+            // playback actually is.
+            self.set_paused(true);
         }
     }
 
@@ -1120,6 +1182,10 @@ impl Core {
 
 impl Drop for Core {
     fn drop(&mut self) {
+        // SAFETY: This runs only when every `Arc<Core>` is gone. A render
+        // thread that was not joined leaks its Arc in `RenderThread::join` or
+        // `RenderThread::drop`, so the handle cannot be destroyed while that
+        // thread may still call into it.
         unsafe { mpv::mpv_terminate_destroy(self.handle) };
     }
 }
@@ -1188,6 +1254,10 @@ impl Core {
 
 struct RenderContext(*mut mpv::Render);
 
+// SAFETY: The render contract requires every render-context call on one
+// thread. The context is created on the render thread and freed there when
+// `Renderer` drops; it is never shared, so moving the wrapper between threads
+// cannot race. `Sync` is deliberately not implemented.
 unsafe impl Send for RenderContext {}
 
 impl Drop for RenderContext {
@@ -1254,8 +1324,8 @@ impl Renderer {
         match self.render_frame(self.format) {
             Ok(()) => self.push_frame(),
             Err(error) => {
-                let Some(fallback) = self.format.fallback() else {
-                    return Err(error);
+                let Some(fallback) = self.format.fallback(error.code) else {
+                    return Err(error.to_string());
                 };
                 self.log.warn(format!(
                     "software render format {} rejected: {error}; falling back to {} with the alpha pass",
@@ -1263,7 +1333,8 @@ impl Renderer {
                     fallback.label()
                 ));
                 self.format = fallback;
-                self.render_frame(self.format)?;
+                self.render_frame(self.format)
+                    .map_err(|error| error.to_string())?;
                 self.push_frame()
             }
         }
@@ -1325,7 +1396,7 @@ impl Renderer {
         }
     }
 
-    fn render_frame(&mut self, format: SoftwareFormat) -> Result<(), String> {
+    fn render_frame(&mut self, format: SoftwareFormat) -> Result<(), RenderError> {
         let mut size = [VIDEO_WIDTH, VIDEO_HEIGHT];
         let mut stride = (VIDEO_WIDTH * 4) as usize;
         let block: c_int = 0;
@@ -1362,7 +1433,7 @@ impl Renderer {
     }
 
     /// Render failures can repeat every frame, so only the first one is logged.
-    fn log_render_error_once(&mut self, error: String) {
+    fn log_render_error_once(&mut self, error: impl std::fmt::Display) {
         if !self.render_error_logged {
             self.render_error_logged = true;
             self.log.warn(format!("software render failed: {error}"));
@@ -1406,17 +1477,31 @@ unsafe fn create_render(handle: *mut mpv::Handle) -> Result<*mut mpv::Render, St
     check_render(
         unsafe { mpv::mpv_render_context_create(&mut render, handle, params.as_mut_ptr()) },
         "libmpv render context",
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     Ok(render)
+}
+
+/// A rejected render call that keeps the libmpv code, so the format fallback
+/// can tell a rejected target from every other failure.
+struct RenderError {
+    what: &'static str,
+    code: c_int,
+}
+
+impl std::fmt::Display for RenderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: libmpv error {}", self.what, self.code)
+    }
 }
 
 /// A render-thread-safe error check. It must not call `mpv_error_string` or any
 /// other non-render client API function.
-fn check_render(code: c_int, what: &str) -> Result<(), String> {
+fn check_render(code: c_int, what: &'static str) -> Result<(), RenderError> {
     if code >= 0 {
         return Ok(());
     }
-    Err(format!("{what}: libmpv error {code}"))
+    Err(RenderError { what, code })
 }
 
 unsafe fn set_option(ctx: *mut mpv::Handle, name: &str, value: &str) -> Result<(), String> {
@@ -1530,6 +1615,10 @@ mod mpv {
     pub const END_FILE_REASON_REDIRECT: c_int = 5;
 
     pub const LOG_LEVEL_WARN: c_int = 30;
+
+    pub const ERROR_UNSUPPORTED: c_int = -18;
+    #[cfg(test)]
+    pub const ERROR_INVALID_PARAMETER: c_int = -4;
 
     pub const FORMAT_STRING: c_int = 1;
     pub const FORMAT_FLAG: c_int = 3;
@@ -2128,10 +2217,23 @@ mod tests {
 
     #[test]
     fn a_rejected_bgra_falls_back_to_bgr0_with_the_alpha_pass() {
-        assert_eq!(SoftwareFormat::BGRA.fallback(), Some(SoftwareFormat::BGR0));
+        assert_eq!(
+            SoftwareFormat::BGRA.fallback(mpv::ERROR_UNSUPPORTED),
+            Some(SoftwareFormat::BGR0)
+        );
         assert_eq!(SoftwareFormat::BGR0.label(), "bgr0");
         assert!(SoftwareFormat::BGR0.alpha_pass);
-        assert_eq!(SoftwareFormat::BGR0.fallback(), None);
+        assert_eq!(SoftwareFormat::BGR0.fallback(mpv::ERROR_UNSUPPORTED), None);
+    }
+
+    #[test]
+    fn a_non_unsupported_render_error_keeps_bgra() {
+        assert_eq!(
+            SoftwareFormat::BGRA.fallback(mpv::ERROR_INVALID_PARAMETER),
+            None,
+            "only a rejected format is allowed to change the target"
+        );
+        assert_eq!(SoftwareFormat::BGRA.label(), "bgra");
     }
 
     #[test]
@@ -2215,15 +2317,23 @@ mod tests {
     }
 
     #[test]
-    fn a_queue_overflow_is_logged_and_leaves_playing() {
+    fn a_queue_overflow_is_a_failure_and_pauses_playback() {
         let (log, _sink, path) = crate::log::testing::log_to_file("engine-overflow");
         let engine = MpvEngine::new(true, log).unwrap();
         assert!(engine.core.transition(PlaybackState::Loading));
         assert!(engine.core.transition(PlaybackState::Playing));
         engine.core.on_queue_overflow();
         assert_eq!(engine.core.state(), PlaybackState::Paused);
+        assert_eq!(
+            engine.core.get_flag("pause"),
+            Some(true),
+            "the player must be paused before the state says Paused"
+        );
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("event queue overflow"), "{text}");
+        assert!(
+            text.contains("failure: event queue overflow"),
+            "overflow needs a failure record, not a warning: {text}"
+        );
         drop(engine);
         let _ = std::fs::remove_file(path);
     }
@@ -2250,14 +2360,17 @@ mod tests {
     }
 
     #[test]
-    fn a_render_join_times_out_and_is_logged() {
+    fn a_render_join_times_out_and_keeps_the_core_alive() {
         let (log, _sink, path) = crate::log::testing::log_to_file("engine-render-timeout");
+        let core = Arc::new(Core::new(true, quiet()).unwrap());
+        let core_ref = Arc::downgrade(&core);
         let (done, done_rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             thread::sleep(Duration::from_millis(500));
             let _ = done.send(());
         });
         let mut render = RenderThread {
+            core: Some(core.clone()),
             stop: Arc::new(AtomicBool::new(false)),
             wake: Arc::new(RenderWake::new()),
             done: done_rx,
@@ -2271,7 +2384,13 @@ mod tests {
         );
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("render thread did not stop within"), "{text}");
+
         drop(render);
+        drop(core);
+        assert!(
+            core_ref.upgrade().is_some(),
+            "a detached render thread may still use the handle, so the core must stay alive"
+        );
         let _ = std::fs::remove_file(path);
     }
 }

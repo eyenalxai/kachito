@@ -73,6 +73,7 @@ pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 enum LineKind {
     Info,
     Warn,
+    Failure,
     Command,
     CommandFailed,
     PropertyWrite,
@@ -85,6 +86,7 @@ impl LineKind {
         match self {
             Self::Info => "info",
             Self::Warn => "warn",
+            Self::Failure => "failure",
             Self::Command => "command",
             Self::CommandFailed => "command failed",
             Self::PropertyWrite => "property write",
@@ -174,6 +176,10 @@ impl RunLog {
 
     pub fn warn(&self, message: impl AsRef<str>) {
         self.write(LineKind::Warn, message.as_ref());
+    }
+
+    pub fn failure(&self, message: impl AsRef<str>) {
+        self.write(LineKind::Failure, message.as_ref());
     }
 
     pub fn command(&self, args: &[&str]) {
@@ -308,6 +314,7 @@ mod tests {
         log.command_failed("seek 1.000 absolute: invalid parameter");
         log.property_write("volume", "NaN");
         log.property_failed("volume = NaN: invalid parameter");
+        log.failure("event queue overflow");
         log.record_mpv_message("warn", "cplayer", "a warning");
 
         let file = std::fs::read_to_string(&path).unwrap();
@@ -319,6 +326,7 @@ mod tests {
         assert!(file.contains("command failed: seek 1.000 absolute: invalid parameter"));
         assert!(file.contains("property write: volume = NaN"));
         assert!(file.contains("property write failed: volume = NaN: invalid parameter"));
+        assert!(file.contains("failure: event queue overflow"));
         assert!(file.contains("mpv: warn cplayer: a warning"));
         let _ = std::fs::remove_file(path);
     }
