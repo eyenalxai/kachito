@@ -2,9 +2,11 @@
 
 use crate::engine::{PlaybackState, PlayerEngine, Track, TrackKind};
 use crate::export::{AudioSelection, ExportJob, ExportMode, ExportRequest, ExportState};
+use crate::log::RunLog;
 use crate::timeline::Timeline;
 use rune::Tx;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) const SUPPORTED: &[&str] = &["mkv", "mp4", "m4v", "mov", "webm"];
@@ -16,8 +18,111 @@ pub enum TracksState {
     Failed(String),
 }
 
+#[derive(Clone, Debug)]
+struct Notice {
+    message: String,
+    at: u64,
+}
+
+#[derive(Debug, Default)]
+struct Notices {
+    command: Option<Notice>,
+    export: Option<Notice>,
+    engine: Option<Notice>,
+    command_shown: bool,
+    clock: u64,
+    changed: bool,
+}
+
+impl Notices {
+    fn current(&self) -> Option<String> {
+        [
+            self.command.as_ref(),
+            self.export.as_ref(),
+            self.engine.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .max_by_key(|notice| notice.at)
+        .map(|notice| notice.message.clone())
+    }
+
+    fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
+    }
+
+    fn record_export(&mut self, message: String) {
+        self.export = Some(self.new(message));
+        self.changed = true;
+    }
+
+    fn record_command(&mut self, failure: &str) -> bool {
+        if self.command_shown {
+            return false;
+        }
+        let message = format!("The player could not apply that command: {failure}");
+        self.command = Some(self.new(message));
+        true
+    }
+
+    fn observe_engine(&mut self, state: &PlaybackState) -> bool {
+        let PlaybackState::Failed(message) = state else {
+            self.engine = None;
+            return false;
+        };
+        if self
+            .engine
+            .as_ref()
+            .is_some_and(|notice| notice.message == *message)
+        {
+            return false;
+        }
+        let message = message.clone();
+        self.engine = Some(self.new(message));
+        true
+    }
+
+    /// The command notice is raised only once it is the one on screen.
+    fn resolve(&mut self) {
+        if self.command_shown {
+            return;
+        }
+        let Some(command) = self.command.as_ref() else {
+            return;
+        };
+        let command_at = command.at;
+        let other = self
+            .export
+            .as_ref()
+            .map(|notice| notice.at)
+            .max(self.engine.as_ref().map(|notice| notice.at));
+        if other.is_none_or(|other| command_at > other) {
+            self.command_shown = true;
+        }
+    }
+
+    fn reset_command(&mut self) {
+        self.command = None;
+        self.command_shown = false;
+        self.changed = true;
+    }
+
+    fn reset_engine(&mut self) {
+        self.engine = None;
+    }
+
+    fn new(&mut self, message: String) -> Notice {
+        self.clock += 1;
+        Notice {
+            message,
+            at: self.clock,
+        }
+    }
+}
+
 pub struct PlaybackSession {
     engine: Box<dyn PlayerEngine>,
+    log: Arc<RunLog>,
     source: Option<PathBuf>,
     awaiting_source: Option<PathBuf>,
     tracks: TracksState,
@@ -26,13 +131,14 @@ pub struct PlaybackSession {
     pending_seek: Option<f64>,
     preview_target: Option<f64>,
     export: Option<ExportJob>,
-    export_error: Option<String>,
+    notices: Notices,
 }
 
 impl PlaybackSession {
-    pub fn new(engine: Box<dyn PlayerEngine>) -> Self {
+    pub fn new(engine: Box<dyn PlayerEngine>, log: Arc<RunLog>) -> Self {
         Self {
             engine,
+            log,
             source: None,
             awaiting_source: None,
             tracks: TracksState::Unloaded,
@@ -41,7 +147,7 @@ impl PlaybackSession {
             pending_seek: None,
             preview_target: None,
             export: None,
-            export_error: None,
+            notices: Notices::default(),
         }
     }
 
@@ -61,7 +167,12 @@ impl PlaybackSession {
             return Err(format!("{} is not a readable video file.", path.display()));
         }
         let awaiting = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
-        self.engine.open(&path)?;
+        let opened = self.engine.open(&path);
+        // A rejected loadfile is the engine failure, not a command notice.
+        self.engine.take_command_failure();
+        opened?;
+        self.notices.reset_command();
+        self.notices.reset_engine();
         self.awaiting_source = Some(awaiting);
         Ok(())
     }
@@ -118,14 +229,14 @@ impl PlaybackSession {
 
     #[cfg(test)]
     pub(crate) fn export_error(&self) -> Option<&str> {
-        self.export_error.as_deref()
+        self.notices
+            .export
+            .as_ref()
+            .map(|notice| notice.message.as_str())
     }
 
     pub fn error(&self) -> Option<String> {
-        match self.engine.state() {
-            PlaybackState::Failed(error) => Some(error),
-            _ => self.export_error.clone(),
-        }
+        self.notices.current()
     }
 
     pub fn set_waker(&self, waker: rune::Waker) {
@@ -258,7 +369,7 @@ impl PlaybackSession {
             TracksState::Unloaded | TracksState::Failed(_) => 0,
         };
         self.export = None;
-        self.export_error = None;
+        self.notices.export = None;
         let request = match ExportRequest::new(
             source,
             start,
@@ -273,13 +384,13 @@ impl PlaybackSession {
         ) {
             Ok(request) => request,
             Err(error) => {
-                self.export_error = Some(error.to_string());
+                self.set_export_error(error.to_string());
                 return;
             }
         };
         match ExportJob::start(request) {
             Ok(job) => self.export = Some(job),
-            Err(error) => self.export_error = Some(error.to_string()),
+            Err(error) => self.set_export_error(error.to_string()),
         }
     }
 
@@ -290,12 +401,18 @@ impl PlaybackSession {
     }
 
     pub fn set_export_error(&mut self, error: String) {
-        self.export_error = Some(error);
+        self.notices.record_export(error);
     }
 
     pub fn poll(&mut self, tx: &mut Tx) -> bool {
+        let previous_notice = self.error();
         let state = self.engine.state();
-        let mut changed = self.confirm_open(&state);
+        let mut changed = self.notices.take_changed();
+        changed |= self.notices.observe_engine(&state);
+        changed |= self.observe_command_failure();
+        changed |= self.confirm_open(&state);
+        self.notices.resolve();
+        changed |= self.error() != previous_notice;
         let playback_ready = self.awaiting_source.is_none()
             && !matches!(&state, PlaybackState::Loading | PlaybackState::Failed(_));
         if playback_ready {
@@ -344,7 +461,20 @@ impl PlaybackSession {
         changed
     }
 
+    fn observe_command_failure(&mut self) -> bool {
+        let Some(failure) = self.engine.take_command_failure() else {
+            return false;
+        };
+        if !self.notices.record_command(&failure) {
+            return false;
+        }
+        self.log
+            .info(format!("notice: rejected command: {failure}"));
+        true
+    }
+
     pub(crate) fn confirm_open(&mut self, state: &PlaybackState) -> bool {
+        self.notices.observe_engine(state);
         if self.awaiting_source.is_none() {
             return false;
         }
@@ -387,7 +517,7 @@ impl PlaybackSession {
             self.pending_seek = None;
             self.preview_target = None;
             self.export = None;
-            self.export_error = None;
+            self.notices.export = None;
         }
     }
 
@@ -413,8 +543,19 @@ impl PlaybackSession {
         source: PathBuf,
         tracks: TracksState,
     ) -> Self {
+        Self::with_source_and_log(engine, source, tracks, Arc::new(RunLog::disabled()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_source_and_log(
+        engine: Box<dyn PlayerEngine>,
+        source: PathBuf,
+        tracks: TracksState,
+        log: Arc<RunLog>,
+    ) -> Self {
         Self {
             engine,
+            log,
             source: Some(source),
             awaiting_source: None,
             tracks,
@@ -423,7 +564,7 @@ impl PlaybackSession {
             pending_seek: None,
             preview_target: None,
             export: None,
-            export_error: None,
+            notices: Notices::default(),
         }
     }
 

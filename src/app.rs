@@ -2,6 +2,7 @@
 
 use crate::engine::{MpvEngine, PlaybackState, Track, TrackKind, VIDEO_HEIGHT, VIDEO_WIDTH};
 use crate::export::{ExportMode, ExportState};
+use crate::log::{RunLog, StderrSink};
 use crate::session::{PlaybackSession, SUPPORTED, TracksState, tracks_of};
 use crate::ui::{self, Palette, icons};
 use rune::{
@@ -9,6 +10,7 @@ use rune::{
     SurfaceFit, Transition, Tx, Waker, col, el, icon, row, text,
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const SPEEDS: &[f32] = &[0.5, 1.0, 1.25, 1.5, 2.0];
 const HIDE_AFTER: f64 = 2.5;
@@ -42,8 +44,9 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let mut app = match MpvEngine::new(rune::is_headless()) {
-            Ok(engine) => Self::with_session(Some(PlaybackSession::new(Box::new(engine)))),
+        let log = Arc::new(RunLog::from_env(Arc::new(StderrSink)));
+        let mut app = match MpvEngine::new(rune::is_headless(), log.clone()) {
+            Ok(engine) => Self::with_session(Some(PlaybackSession::new(Box::new(engine), log))),
             Err(error) => {
                 let mut app = Self::with_session(None);
                 app.error = Some(error);
@@ -1472,6 +1475,8 @@ mod tests {
         frame_duration: f64,
         position: f64,
         duration: f64,
+        command_failure: Option<String>,
+        open_error: Option<String>,
     }
 
     impl Default for FakeLog {
@@ -1492,6 +1497,8 @@ mod tests {
                 frame_duration: 1.0 / 60.0,
                 position: 0.0,
                 duration: 10.0,
+                command_failure: None,
+                open_error: None,
             }
         }
     }
@@ -1503,8 +1510,12 @@ mod tests {
 
     impl PlayerEngine for Fake {
         fn open(&mut self, path: &std::path::Path) -> Result<(), String> {
-            self.log.lock().unwrap().opened = Some(path.to_path_buf());
-            Ok(())
+            let mut log = self.log.lock().unwrap();
+            log.opened = Some(path.to_path_buf());
+            match log.open_error.clone() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
         fn toggle(&mut self) {
             let mut log = self.log.lock().unwrap();
@@ -1588,6 +1599,9 @@ mod tests {
             Ok(())
         }
         fn set_waker(&self, _: Waker) {}
+        fn take_command_failure(&mut self) -> Option<String> {
+            self.log.lock().unwrap().command_failure.take()
+        }
     }
 
     fn app_with_fake() -> (App, Arc<Mutex<FakeLog>>) {
@@ -1633,11 +1647,169 @@ mod tests {
             .rect
     }
 
+    fn shows_text(runtime: &Runtime<App>, needle: &str) -> bool {
+        runtime.elements().into_iter().any(|element| {
+            element
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains(needle))
+        })
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kachito-app-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn the_first_rejected_command_raises_one_notice_per_file() {
+        let (app, log) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        assert!(!shows_text(&runtime, "The player could not apply"));
+
+        log.lock().unwrap().command_failure = Some("set volume 40: property unavailable".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(
+            shows_text(&runtime, "set volume 40"),
+            "the first rejection raises the notice"
+        );
+
+        log.lock().unwrap().command_failure =
+            Some("seek 5.000 absolute+exact: invalid parameter".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(
+            shows_text(&runtime, "set volume 40"),
+            "the first notice stays on screen"
+        );
+        assert!(
+            !shows_text(&runtime, "seek 5.000"),
+            "a second rejection is quiet"
+        );
+    }
+
+    #[test]
+    fn the_newest_notice_wins() {
+        let (app, log) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+
+        log.lock().unwrap().command_failure = Some("set volume 40: rejected".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(shows_text(&runtime, "set volume 40"));
+
+        runtime.state.set_export_error("the export failed".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(shows_text(&runtime, "the export failed"));
+        assert!(!shows_text(&runtime, "set volume 40"));
+
+        log.lock().unwrap().state = PlaybackState::Failed("the engine failed".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(shows_text(&runtime, "the engine failed"));
+        assert!(!shows_text(&runtime, "the export failed"));
+
+        log.lock().unwrap().state = PlaybackState::Paused;
+        runtime
+            .state
+            .set_export_error("the newer export failed".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(shows_text(&runtime, "the newer export failed"));
+        assert!(!shows_text(&runtime, "the engine failed"));
+    }
+
+    #[test]
+    fn a_rejected_load_does_not_consume_the_command_notice() {
+        let dir = temp_dir("rejected-load-notice");
+        let corrupt = dir.join("corrupt.mkv");
+        std::fs::write(&corrupt, b"not a video").unwrap();
+        let (mut app, log) = app_with_fake();
+        {
+            let mut log = log.lock().unwrap();
+            log.state = PlaybackState::Loading;
+            log.open_error = Some("loadfile rejected".into());
+            log.command_failure = Some("loadfile corrupt.mkv: loading failed".into());
+        }
+        assert!(session_mut(&mut app).open(corrupt).is_err());
+        log.lock().unwrap().state = PlaybackState::Failed("loadfile rejected".into());
+
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        assert!(shows_text(&runtime, "loadfile rejected"));
+        assert!(!shows_text(&runtime, "The player could not apply"));
+
+        log.lock().unwrap().command_failure = Some("set volume 40: rejected".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(
+            shows_text(&runtime, "set volume 40"),
+            "the later rejection gets the one notice"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_successful_open_clears_the_command_notice() {
+        let dir = temp_dir("clear-command-notice");
+        let next = dir.join("next.mkv");
+        std::fs::write(&next, b"not a video").unwrap();
+        let (app, log) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        log.lock().unwrap().command_failure = Some("set pause yes: rejected".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(runtime.find("error-banner-card").is_some());
+
+        runtime.state.open(next);
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(runtime.state.error_text(), None);
+        assert!(
+            runtime.find("error-banner-card").is_none(),
+            "the successful open clears the notice"
+        );
+
+        log.lock().unwrap().command_failure = Some("seek 1.000 absolute+exact: rejected".into());
+        runtime.frame(1.0 / 60.0);
+        assert!(
+            runtime.find("error-banner-card").is_some(),
+            "the next file gets its own one notice"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rejected_command_is_logged_by_the_session() {
+        let (log, sink, path) = crate::log::testing::log_to_file("session-notice");
+        let fake = Arc::new(Mutex::new(FakeLog::default()));
+        let engine = Fake {
+            surface: rune::NativeSurface::new(),
+            log: fake.clone(),
+        };
+        let tracks = engine.tracks().expect("the fake track list");
+        let session = PlaybackSession::with_source_and_log(
+            Box::new(engine),
+            PathBuf::from("test.mkv"),
+            TracksState::Loaded(tracks),
+            log,
+        );
+        let app = App::with_session(Some(session));
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        fake.lock().unwrap().command_failure = Some("set speed 0: invalid parameter".into());
+        runtime.frame(1.0 / 60.0);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("notice: rejected command: set speed 0: invalid parameter"),
+            "{text}"
+        );
+        assert_eq!(sink.lines(), text.lines().collect::<Vec<_>>());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1658,10 +1830,13 @@ mod tests {
         let dropped = dir.join("dropped.mkv");
         std::fs::write(&dropped, b"not a video").unwrap();
         let log = Arc::new(Mutex::new(FakeLog::default()));
-        let playback = PlaybackSession::new(Box::new(Fake {
-            surface: rune::NativeSurface::new(),
-            log: log.clone(),
-        }));
+        let playback = PlaybackSession::new(
+            Box::new(Fake {
+                surface: rune::NativeSurface::new(),
+                log: log.clone(),
+            }),
+            Arc::new(RunLog::disabled()),
+        );
         let app = App::with_session(Some(playback));
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.frame(0.0);
