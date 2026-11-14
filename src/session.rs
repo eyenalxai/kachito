@@ -460,47 +460,21 @@ impl PlaybackSession {
         changed |= self.notices.observe_engine(&state);
         changed |= self.observe_command_failure();
         changed |= self.confirm_open(&state);
-        self.notices.resolve();
-        changed |= self.error() != previous_notice;
         let playback_ready = self.awaiting_source.is_none()
             && !matches!(&state, PlaybackState::Loading | PlaybackState::Failed(_));
+        if playback_ready
+            && let Some(frame_duration) = self.engine.frame_duration()
+            && let Some(duration) = self.engine.duration()
+            && ((self.timeline.duration() - duration).abs() > 0.01
+                || (self.timeline.frame_duration() - frame_duration).abs() > 1e-9)
+        {
+            self.timeline.set_duration(duration, frame_duration);
+            changed = true;
+        }
+        changed |= self.resolve_pending_seek(&state, playback_ready);
+        self.notices.resolve();
+        changed |= self.error() != previous_notice;
         if playback_ready {
-            if let Some(frame_duration) = self.engine.frame_duration()
-                && let Some(duration) = self.engine.duration()
-                && ((self.timeline.duration() - duration).abs() > 0.01
-                    || (self.timeline.frame_duration() - frame_duration).abs() > 1e-9)
-            {
-                self.timeline.set_duration(duration, frame_duration);
-                changed = true;
-            }
-            if let Some(pending) = self.pending_seek {
-                let landed = !self.engine.is_seeking()
-                    && (self.engine.position() - pending.target).abs() <= self.seek_tolerance();
-                if landed || matches!(&state, PlaybackState::Failed(_) | PlaybackState::Empty) {
-                    self.pending_seek = None;
-                    self.scrubbing = false;
-                } else if self
-                    .clock
-                    .now()
-                    .saturating_duration_since(pending.requested_at)
-                    >= SEEK_DEADLINE
-                {
-                    let position = self.engine.position();
-                    self.pending_seek = None;
-                    self.scrubbing = false;
-                    self.preview_target = None;
-                    self.timeline.set_position(position);
-                    self.notices.record_seek(
-                        "The seek did not finish in time. Playback continues from the current position."
-                            .into(),
-                    );
-                    self.log.warn(format!(
-                        "notice: seek deadline: target {:.3}s, position {:.3}s",
-                        pending.target, position
-                    ));
-                    changed = true;
-                }
-            }
             if self.scrubbing {
                 if !self.engine.is_seeking() {
                     self.issue_preview();
@@ -527,7 +501,50 @@ impl PlaybackSession {
             tx.wake_after(Duration::from_millis(100));
             changed = true;
         }
+        if let Some(pending) = self.pending_seek {
+            let elapsed = self
+                .clock
+                .now()
+                .saturating_duration_since(pending.requested_at);
+            tx.wake_after(SEEK_DEADLINE.saturating_sub(elapsed));
+        }
         changed
+    }
+
+    fn resolve_pending_seek(&mut self, state: &PlaybackState, playback_ready: bool) -> bool {
+        let Some(pending) = self.pending_seek else {
+            return false;
+        };
+        let landed = playback_ready
+            && state.is_loaded()
+            && !self.engine.is_seeking()
+            && (self.engine.position() - pending.target).abs() <= self.seek_tolerance();
+        if landed {
+            self.pending_seek = None;
+            self.scrubbing = false;
+            return false;
+        }
+        if self
+            .clock
+            .now()
+            .saturating_duration_since(pending.requested_at)
+            < SEEK_DEADLINE
+        {
+            return false;
+        }
+        let position = self.engine.position();
+        self.pending_seek = None;
+        self.scrubbing = false;
+        self.preview_target = None;
+        self.timeline.set_position(position);
+        self.notices.record_seek(
+            "The seek did not finish in time. Playback continues from the current position.".into(),
+        );
+        self.log.warn(format!(
+            "notice: seek deadline: target {:.3}s, position {:.3}s",
+            pending.target, position
+        ));
+        true
     }
 
     fn observe_command_failure(&mut self) -> bool {

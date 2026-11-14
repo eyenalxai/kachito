@@ -1750,6 +1750,105 @@ mod tests {
     }
 
     #[test]
+    fn a_stuck_seek_expires_after_the_engine_fails() {
+        let (mut app, log, clock) = app_with_fake_and_clock();
+        let session = session_mut(&mut app);
+        session.timeline_mut().set_duration(10.0, 1.0 / 60.0);
+        session.timeline_mut().set_position(5.0);
+        {
+            let mut log = log.lock().unwrap();
+            log.seeking = true;
+            log.position = 2.0;
+        }
+        session.seek(5.0);
+        log.lock().unwrap().state = PlaybackState::Failed("the decoder stopped".into());
+
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert!(session.is_scrubbing());
+        assert!(
+            format!("{tx:?}").contains("5s"),
+            "the deadline has no wake: {tx:?}"
+        );
+
+        clock.advance(Duration::from_secs(5));
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+
+        assert!(
+            !session.is_scrubbing(),
+            "the failed engine kept the seek pending"
+        );
+        assert_eq!(session.timeline().position(), 2.0);
+        let notice = session.error().expect("one notice");
+        assert!(notice.contains("did not finish in time"), "{notice}");
+    }
+
+    #[test]
+    fn a_stuck_seek_expires_after_the_engine_goes_empty() {
+        let (mut app, log, clock) = app_with_fake_and_clock();
+        let session = session_mut(&mut app);
+        session.timeline_mut().set_duration(10.0, 1.0 / 60.0);
+        session.timeline_mut().set_position(5.0);
+        {
+            let mut log = log.lock().unwrap();
+            log.seeking = true;
+            log.position = 2.0;
+        }
+        session.seek(5.0);
+        {
+            let mut log = log.lock().unwrap();
+            log.seeking = false;
+            log.position = 0.0;
+            log.state = PlaybackState::Empty;
+        }
+
+        clock.advance(Duration::from_millis(4_999));
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        assert!(
+            session.is_scrubbing(),
+            "the empty engine cleared the seek before the deadline"
+        );
+
+        clock.advance(Duration::from_millis(1));
+        session.poll(&mut tx);
+        assert!(!session.is_scrubbing());
+        assert_eq!(session.timeline().position(), 0.0);
+        let notice = session.error().expect("one notice");
+        assert!(notice.contains("did not finish in time"), "{notice}");
+    }
+
+    #[test]
+    fn a_seek_deadline_does_not_consume_the_command_notice() {
+        let (mut app, log, clock) = app_with_fake_and_clock();
+        let session = session_mut(&mut app);
+        session.timeline_mut().set_duration(10.0, 1.0 / 60.0);
+        session.timeline_mut().set_position(5.0);
+        {
+            let mut log = log.lock().unwrap();
+            log.seeking = true;
+            log.position = 2.0;
+            log.command_failure = Some("set volume 40: rejected".into());
+        }
+        session.seek(5.0);
+
+        clock.advance(Duration::from_secs(5));
+        let mut tx = Tx::default();
+        session.poll(&mut tx);
+        let notice = session.error().expect("one notice");
+        assert!(notice.contains("did not finish in time"), "{notice}");
+
+        log.lock().unwrap().command_failure = Some("set speed 2: rejected".into());
+        session.poll(&mut tx);
+        let notice = session.error().expect("one notice");
+        assert!(
+            notice.contains("set speed 2"),
+            "the deadline consumed the command notice: {notice}"
+        );
+    }
+
+    #[test]
     fn a_seek_deadline_is_logged_once() {
         let (log, sink, path) = crate::log::testing::log_to_file("seek-deadline");
         let fake = Arc::new(Mutex::new(FakeLog::default()));

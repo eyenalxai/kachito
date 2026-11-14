@@ -83,23 +83,24 @@ impl PlaybackState {
 
 /// A command or property write whose arguments name its log line and failure.
 enum Action<'a> {
-    Command(&'a [&'a str]),
-    CommandBytes(&'a [&'a [u8]]),
+    Command(&'a [&'a [u8]]),
     Property { name: &'a str, value: &'a str },
 }
 
 impl Action<'_> {
     fn describe(&self) -> String {
         match self {
-            Self::Command(args) => args.join(" "),
-            Self::CommandBytes(args) => args
-                .iter()
-                .map(|arg| String::from_utf8_lossy(arg).into_owned())
-                .collect::<Vec<_>>()
-                .join(" "),
+            Self::Command(args) => lossy_text(args),
             Self::Property { name, value } => format!("{name} = {value}"),
         }
     }
+}
+
+fn lossy_text(args: &[&[u8]]) -> String {
+    args.iter()
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// What the UI needs from a playback backend.
@@ -374,7 +375,7 @@ impl Core {
     }
 
     fn open(&self, path: &Path) -> Result<(), String> {
-        let bytes = path_bytes(path)?;
+        let bytes = path_bytes(path);
         self.log.info(format!("load: {}", path.to_string_lossy()));
         self.end_reported.store(false, Ordering::Relaxed);
         self.set_state(PlaybackState::Loading);
@@ -679,19 +680,14 @@ impl Core {
     }
 
     fn command(&self, args: &[&str]) -> Result<(), String> {
-        self.log.command(args);
-        let action = Action::Command(args);
-        self.run_command(args.iter().map(|arg| arg.as_bytes()), &action)
+        let args: Vec<&[u8]> = args.iter().map(|arg| arg.as_bytes()).collect();
+        self.command_bytes(&args)
     }
 
     fn command_bytes(&self, args: &[&[u8]]) -> Result<(), String> {
-        let text: Vec<String> = args
-            .iter()
-            .map(|arg| String::from_utf8_lossy(arg).into_owned())
-            .collect();
-        let refs: Vec<&str> = text.iter().map(String::as_str).collect();
-        self.log.command(&refs);
-        let action = Action::CommandBytes(args);
+        let text = lossy_text(args);
+        self.log.command(&[text.as_str()]);
+        let action = Action::Command(args);
         self.run_command(args.iter().copied(), &action)
     }
 
@@ -721,7 +717,7 @@ impl Core {
     fn record_failure(&self, action: &Action, error: &str) -> Result<(), String> {
         let failure = format!("{}: {error}", action.describe());
         match action {
-            Action::Command(_) | Action::CommandBytes(_) => self.log.command_failed(&failure),
+            Action::Command(_) => self.log.command_failed(&failure),
             Action::Property { .. } => self.log.property_failed(&failure),
         }
         *self.failure.lock().unwrap() = Some(failure.clone());
@@ -764,26 +760,7 @@ impl Core {
         )
     }
 
-    fn get_string(&self, name: &str) -> Option<String> {
-        let name = CString::new(name).unwrap();
-        let mut value: *mut c_char = ptr::null_mut();
-        let result = unsafe {
-            mpv::mpv_get_property(
-                self.handle,
-                name.as_ptr(),
-                mpv::FORMAT_STRING,
-                &mut value as *mut *mut c_char as *mut c_void,
-            )
-        };
-        if result < 0 || value.is_null() {
-            return None;
-        }
-        let text = unsafe { CStr::from_ptr(value).to_string_lossy().into_owned() };
-        unsafe { mpv::mpv_free(value as *mut c_void) };
-        Some(text)
-    }
-
-    fn get_path(&self, name: &str) -> Option<PathBuf> {
+    fn get_bytes(&self, name: &str) -> Option<Vec<u8>> {
         let name = CString::new(name).unwrap();
         let mut value: *mut c_char = ptr::null_mut();
         let result = unsafe {
@@ -799,7 +776,16 @@ impl Core {
         }
         let bytes = unsafe { CStr::from_ptr(value) }.to_bytes().to_vec();
         unsafe { mpv::mpv_free(value as *mut c_void) };
-        Some(path_from_bytes(bytes))
+        Some(bytes)
+    }
+
+    fn get_string(&self, name: &str) -> Option<String> {
+        self.get_bytes(name)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn get_path(&self, name: &str) -> Option<PathBuf> {
+        self.get_bytes(name).map(path_from_bytes)
     }
 
     fn get_double(&self, name: &str) -> Option<f64> {
@@ -1115,29 +1101,14 @@ mod mpv {
     }
 }
 
-fn path_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        Ok(path.as_os_str().as_bytes().to_vec())
-    }
-    #[cfg(not(unix))]
-    {
-        path.to_str()
-            .map(|text| text.as_bytes().to_vec())
-            .ok_or_else(|| "the file path is not valid UTF-8".into())
-    }
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
 }
 
-#[cfg(unix)]
 fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
     use std::os::unix::ffi::OsStringExt;
     PathBuf::from(std::ffi::OsString::from_vec(bytes))
-}
-
-#[cfg(not(unix))]
-fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(test)]

@@ -9,7 +9,9 @@ Exact seeks show the frame at the requested time, so the drag preview uses
 them. They cost decode time, and a 40 ms throttle would interrupt each seek
 before it landed, so the session keeps one preview seek in flight and always
 sends the latest pointer target. The handle stays at the requested time and
-dims while the picture catches up. On release, one exact seek lands the final
+dims while the picture catches up. If no landing seek arrives within five
+seconds, the handle returns to the engine position and one notice reports the
+timeout. On release, one exact seek lands the final
 frame; if the preview already landed within a frame, the exact seek is
 skipped. The export range body drag uses the same path.
 
