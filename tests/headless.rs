@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[test]
-fn a_headless_snap_contains_a_video_frame() {
+fn a_headless_snap_contains_an_opaque_video_frame() {
     let png = std::env::temp_dir().join(format!("kachito-headless-{}.png", std::process::id()));
     let state = std::env::temp_dir().join(format!("kachito-headless-state-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state);
@@ -33,15 +33,34 @@ fn a_headless_snap_contains_a_video_frame() {
     let mut reader = decoder.read_info().expect("read the PNG header");
     let mut pixels = vec![0; reader.output_buffer_size().expect("PNG size")];
     let info = reader.next_frame(&mut pixels).expect("decode the PNG");
+    let width = info.width;
+    let height = info.height;
 
-    let x = info.width / 2;
-    let y = info.height / 2;
-    let index = (y * info.width + x) as usize * 4;
+    let alpha_at = |x: u32, y: u32| pixels[((y * width + x) * 4 + 3) as usize];
+
+    let x = width / 2;
+    let y = height / 2;
+    let index = (y * width + x) as usize * 4;
     let brightest = pixels[index..index + 3].iter().copied().max().unwrap();
     assert!(
         brightest > 180,
         "the centre pixel is {brightest}, so the snapshot has no video frame"
     );
+    assert_eq!(alpha_at(x, y), 255, "the centre pixel is not opaque");
+
+    let edges = [
+        (1, 1),
+        (width - 2, 1),
+        (1, height - 2),
+        (width - 2, height - 2),
+    ];
+    for (x, y) in edges {
+        assert!(
+            alpha_at(x, y) > 0,
+            "the edge pixel at ({x}, {y}) is transparent"
+        );
+    }
+
     let _ = std::fs::remove_file(&png);
     let _ = std::fs::remove_dir_all(&state);
 }

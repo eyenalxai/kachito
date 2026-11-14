@@ -622,10 +622,7 @@ impl PlaybackSession {
         if current.as_deref() != self.awaiting_source.as_deref() {
             return false;
         }
-        if matches!(
-            state,
-            PlaybackState::Ready | PlaybackState::Playing | PlaybackState::Paused
-        ) {
+        if matches!(state, PlaybackState::Playing | PlaybackState::Paused) {
             self.commit_source();
             true
         } else if matches!(state, PlaybackState::Failed(_)) {
