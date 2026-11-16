@@ -63,6 +63,8 @@ struct Notices {
     pending: Vec<Notice>,
     /// The last engine failure reported, so an unchanged state raises one notice.
     engine: Option<String>,
+    /// The rejected-command notice line is written once per file, as before.
+    command_logged: bool,
 }
 
 impl Notices {
@@ -74,7 +76,7 @@ impl Notices {
         self.pending.push(notice);
     }
 
-    fn record_export(&mut self, message: String) {
+    fn record_export_failure(&mut self, message: String) {
         self.record(Notice {
             message,
             tone: Tone::Danger,
@@ -95,7 +97,7 @@ impl Notices {
                 tone: Tone::Neutral,
                 persistent: false,
             }),
-            ExportState::Failed(error) => self.record_export(error.clone()),
+            ExportState::Failed(error) => self.record_export_failure(error.clone()),
         }
     }
 
@@ -142,6 +144,19 @@ impl Notices {
 
     fn reset_engine(&mut self) {
         self.engine = None;
+    }
+
+    /// True for the first rejected command of a file, so the notice line is logged once.
+    fn command_log_due(&mut self) -> bool {
+        if self.command_logged {
+            return false;
+        }
+        self.command_logged = true;
+        true
+    }
+
+    fn reset_command_log(&mut self) {
+        self.command_logged = false;
     }
 }
 
@@ -256,7 +271,9 @@ impl PlaybackSession {
         self.startup_pause = paused;
         self.startup_resume_attempts = 0;
         self.snapshot = self.engine.snapshot();
+        self.notices.take();
         self.notices.reset_engine();
+        self.notices.reset_command_log();
         self.awaiting_source = Some(awaiting);
         Ok(())
     }
@@ -321,11 +338,6 @@ impl PlaybackSession {
     /// Drains the notices raised since the last drain.
     pub(crate) fn take_notices(&mut self) -> Vec<Notice> {
         self.notices.take()
-    }
-
-    /// Drops notices that have not reached the screen, as a successful open does.
-    pub(crate) fn clear_notices(&mut self) {
-        self.notices.take();
     }
 
     pub fn set_waker(&self, waker: rune::Waker) {
@@ -528,14 +540,14 @@ impl PlaybackSession {
     }
 
     pub fn set_export_error(&mut self, error: String) {
-        self.notices.record_export(error);
+        self.notices.record_export_failure(error);
     }
 
     /// Runs one UI poll against the engine snapshot. `timeline_visible` is true
     /// while the transport or the export tray is on screen, so a hidden
     /// timeline updates without rebuilding the view.
     pub fn poll(&mut self, tx: &mut Tx, timeline_visible: bool) -> bool {
-        let previous_notice = self.notices.pending.len();
+        let pending_before = self.notices.pending.len();
         let snapshot = self.engine.snapshot();
         let state = snapshot.state.clone();
 
@@ -569,7 +581,7 @@ impl PlaybackSession {
         }
         changed |= self.resolve_pending_seek(&snapshot, playback_ready);
         changed |= self.resolve_pending_preview(&snapshot, playback_ready);
-        changed |= self.notices.pending.len() != previous_notice;
+        changed |= self.notices.pending.len() != pending_before;
         if playback_ready {
             if self.scrubbing {
                 if !snapshot.seeking {
@@ -733,8 +745,10 @@ impl PlaybackSession {
             return false;
         };
         self.notices.record_command(&failure);
-        self.log
-            .info(format!("notice: rejected command: {failure}"));
+        if self.notices.command_log_due() {
+            self.log
+                .info(format!("notice: rejected command: {failure}"));
+        }
         true
     }
 

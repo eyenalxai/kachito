@@ -88,13 +88,13 @@ impl App {
         }
     }
 
-    /// Raises one toast and reports whether the view changed.
-    fn notify(&mut self, message: impl Into<String>, tone: Tone, persistent: bool) -> bool {
-        self.toasts.push(message, tone, persistent, self.now)
+    /// Raises one toast.
+    fn notify(&mut self, message: impl Into<String>, tone: Tone, persistent: bool) {
+        self.toasts.push(message, tone, persistent, self.now);
     }
 
-    fn notify_error(&mut self, message: impl Into<String>) -> bool {
-        self.notify(message, Tone::Danger, true)
+    fn notify_error(&mut self, message: impl Into<String>) {
+        self.notify(message, Tone::Danger, true);
     }
 
     fn dismiss_toast(&mut self, id: u64) {
@@ -110,7 +110,6 @@ impl App {
         let opened = session.open(path);
         match opened {
             Ok(()) => {
-                session.clear_notices();
                 self.last_dir = parent;
                 self.toasts.clear();
                 self.menu = None;
@@ -385,7 +384,9 @@ fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
         Vec::new()
     };
     for notice in notices {
-        changed |= app.notify(notice.message, notice.tone, notice.persistent);
+        changed |= app
+            .toasts
+            .push(notice.message, notice.tone, notice.persistent, app.now);
     }
     if app.activity {
         app.activity = false;
@@ -650,7 +651,7 @@ fn export_status(app: &App, theme: &Palette) -> El {
     let mut slot = row().w(64.0).justify_end();
     if let Some(ExportState::Running { fraction }) = app.export_state() {
         slot = slot.child(
-            text(format!("{}%", (fraction * 100.0).round()))
+            text(export_percent(fraction))
                 .key("export-status")
                 .font(ui::TIME)
                 .color(theme.text_muted)
@@ -658,6 +659,10 @@ fn export_status(app: &App, theme: &Palette) -> El {
         );
     }
     slot
+}
+
+fn export_percent(fraction: f32) -> String {
+    format!("{}%", (fraction * 100.0).round())
 }
 
 fn video_stage(session: &PlaybackSession, theme: &Palette) -> El {
@@ -728,7 +733,7 @@ fn empty_screen(app: &App, theme: &Palette) -> El {
 
 /// The toast stack sits in the bottom-right corner, above the transport and the export
 /// tray when one is on screen.
-fn toast_bottom(app: &App) -> f32 {
+fn toast_bottom_inset(app: &App) -> f32 {
     if !app.has_source() {
         TOAST_INSET
     } else if app.export_open {
@@ -744,7 +749,7 @@ fn toast_stack(app: &App, theme: &Palette) -> Option<El> {
     }
     let mut stack = col()
         .key("toast-stack")
-        .pin(None, None, Some(TOAST_INSET), Some(toast_bottom(app)))
+        .pin(None, None, Some(TOAST_INSET), Some(toast_bottom_inset(app)))
         .items_end()
         .gap(8.0)
         .role("region")
@@ -1276,7 +1281,7 @@ fn export_tray(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
                 ),
             )
             .child(
-                text(format!("{}%", (fraction * 100.0).round()))
+                text(export_percent(*fraction))
                     .key("export-progress")
                     .font(ui::TIME)
                     .color(theme.text_muted),
@@ -2765,7 +2770,7 @@ mod tests {
         assert!(shows_text(&runtime, "set volume 40"));
         assert!(
             shows_text(&runtime, "the export failed"),
-            "a distinct notice replaced the older toast"
+            "a distinct notice stacks beside the older toast"
         );
 
         log.lock().unwrap().state = PlaybackState::Failed("the engine failed".into());
@@ -3025,11 +3030,18 @@ mod tests {
         runtime.frame(0.0);
         fake.lock().unwrap().command_failure = Some("set speed 0: invalid parameter".into());
         runtime.frame(1.0 / 60.0);
+        fake.lock().unwrap().command_failure = Some("seek 2.000 absolute+exact: invalid".into());
+        runtime.frame(1.0 / 60.0);
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.contains("notice: rejected command: set speed 0: invalid parameter"),
             "{text}"
+        );
+        assert_eq!(
+            text.matches("notice: rejected command").count(),
+            1,
+            "the notice line was logged more than once: {text}"
         );
         assert_eq!(sink.lines(), text.lines().collect::<Vec<_>>());
         let _ = std::fs::remove_file(path);
