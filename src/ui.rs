@@ -17,6 +17,14 @@ pub const LABEL: TextStyle = TextStyle::new(12.0, 500.0);
 pub const SECTION: TextStyle = TextStyle::new(11.0, 600.0).tracking(0.6);
 pub const TINY: TextStyle = TextStyle::new(11.0, 400.0);
 pub const TIME: TextStyle = TextStyle::new(12.0, 500.0).features("'tnum' 1");
+pub const TOAST_TITLE: TextStyle = TextStyle {
+    line_height: 20.0,
+    ..BODY_STRONG
+};
+pub const TOAST_DETAIL: TextStyle = TextStyle {
+    line_height: 16.0,
+    ..TINY
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {

@@ -4,7 +4,7 @@ use crate::engine::{PlaybackSnapshot, PlaybackState, PlayerEngine, Track, TrackK
 use crate::export::{AudioSelection, ExportJob, ExportMode, ExportRequest, ExportState};
 use crate::log::RunLog;
 use crate::timeline::Timeline;
-use crate::toast::Tone;
+use crate::toast::{Tone, sentence_case};
 use rune::Tx;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -53,7 +53,8 @@ pub enum TracksState {
 /// One message the session raises for the screen to present.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Notice {
-    pub message: String,
+    pub title: String,
+    pub detail: Option<String>,
     pub tone: Tone,
     pub persistent: bool,
 }
@@ -78,7 +79,8 @@ impl Notices {
 
     fn record_export_failure(&mut self, message: String) {
         self.record(Notice {
-            message,
+            title: "Export failed".into(),
+            detail: Some(sentence_case(&message)),
             tone: Tone::Danger,
             persistent: true,
         });
@@ -88,12 +90,14 @@ impl Notices {
         match state {
             ExportState::Running { .. } => {}
             ExportState::Finished => self.record(Notice {
-                message: "Clip exported.".into(),
+                title: "Clip exported".into(),
+                detail: None,
                 tone: Tone::Success,
                 persistent: false,
             }),
             ExportState::Cancelled => self.record(Notice {
-                message: "Export cancelled.".into(),
+                title: "Export cancelled".into(),
+                detail: None,
                 tone: Tone::Neutral,
                 persistent: false,
             }),
@@ -101,9 +105,10 @@ impl Notices {
         }
     }
 
-    fn record_seek(&mut self, message: String) {
+    fn record_seek(&mut self) {
         self.record(Notice {
-            message,
+            title: "Seek took too long".into(),
+            detail: Some("Playback continues from the current position.".into()),
             tone: Tone::Danger,
             persistent: false,
         });
@@ -111,7 +116,10 @@ impl Notices {
 
     fn record_command(&mut self, failure: &str) {
         self.record(Notice {
-            message: format!("The player could not apply that command: {failure}"),
+            title: "Command not applied".into(),
+            detail: Some(sentence_case(&format!(
+                "the player could not apply that command: {failure}"
+            ))),
             tone: Tone::Danger,
             persistent: false,
         });
@@ -119,7 +127,8 @@ impl Notices {
 
     fn record_tracks(&mut self, message: String) {
         self.record(Notice {
-            message: format!("The track list could not be read: {message}"),
+            title: "Tracks unavailable".into(),
+            detail: Some(sentence_case(&message)),
             tone: Tone::Danger,
             persistent: true,
         });
@@ -135,7 +144,8 @@ impl Notices {
         }
         self.engine = Some(message.clone());
         self.record(Notice {
-            message: message.clone(),
+            title: "Playback failed".into(),
+            detail: Some(sentence_case(message)),
             tone: Tone::Danger,
             persistent: true,
         });
@@ -730,9 +740,7 @@ impl PlaybackSession {
         self.pending_preview = None;
         self.scrubbing = false;
         self.timeline.set_position(position);
-        self.notices.record_seek(
-            "The seek did not finish in time. Playback continues from the current position.".into(),
-        );
+        self.notices.record_seek();
         self.log.warn(format!(
             "notice: seek deadline: target {:.3}s, position {:.3}s",
             target, position

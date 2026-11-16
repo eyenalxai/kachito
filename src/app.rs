@@ -57,7 +57,7 @@ impl App {
             Ok(engine) => Self::with_session(Some(PlaybackSession::new(Box::new(engine), log))),
             Err(error) => {
                 let mut app = Self::with_session(None);
-                app.notify_error(error);
+                app.notify_error("Playback engine unavailable", error);
                 app
             }
         };
@@ -89,12 +89,18 @@ impl App {
     }
 
     /// Raises one toast.
-    fn notify(&mut self, message: impl Into<String>, tone: Tone, persistent: bool) {
-        self.toasts.push(message, tone, persistent, self.now);
+    fn notify(
+        &mut self,
+        title: impl Into<String>,
+        detail: Option<String>,
+        tone: Tone,
+        persistent: bool,
+    ) {
+        self.toasts.push(title, detail, tone, persistent, self.now);
     }
 
-    fn notify_error(&mut self, message: impl Into<String>) {
-        self.notify(message, Tone::Danger, true);
+    fn notify_error(&mut self, title: impl Into<String>, detail: impl Into<String>) {
+        self.notify(title, Some(detail.into()), Tone::Danger, true);
     }
 
     fn dismiss_toast(&mut self, id: u64) {
@@ -103,7 +109,10 @@ impl App {
 
     fn open(&mut self, path: PathBuf) {
         let Some(session) = &mut self.session else {
-            self.notify_error("The playback engine is not available.");
+            self.notify_error(
+                "Playback engine unavailable",
+                "The playback engine is not available.",
+            );
             return;
         };
         let parent = path.parent().map(|parent| parent.to_path_buf());
@@ -116,7 +125,7 @@ impl App {
                 self.touch();
             }
             Err(error) => {
-                self.notify_error(error);
+                self.notify_error("Couldn't open the video", error);
             }
         }
     }
@@ -237,7 +246,7 @@ impl App {
             .as_mut()
             .and_then(|session| session.select_audio(id).err());
         if let Some(error) = error {
-            self.notify(error, Tone::Danger, false);
+            self.notify("Audio track not selected", Some(error), Tone::Danger, false);
         }
         self.menu = None;
     }
@@ -248,7 +257,12 @@ impl App {
             .as_mut()
             .and_then(|session| session.select_subtitle(id).err());
         if let Some(error) = error {
-            self.notify(error, Tone::Danger, false);
+            self.notify(
+                "Subtitle track not selected",
+                Some(error),
+                Tone::Danger,
+                false,
+            );
         }
         self.menu = None;
     }
@@ -384,9 +398,13 @@ fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
         Vec::new()
     };
     for notice in notices {
-        changed |= app
-            .toasts
-            .push(notice.message, notice.tone, notice.persistent, app.now);
+        changed |= app.toasts.push(
+            notice.title,
+            notice.detail,
+            notice.tone,
+            notice.persistent,
+            app.now,
+        );
     }
     if app.activity {
         app.activity = false;
@@ -483,7 +501,7 @@ fn open_dialog(app: &mut App, tx: &mut Tx) {
         Ok(Some(path)) => app.open(path),
         Ok(None) => {}
         Err(error) => {
-            app.notify_error(error.to_string());
+            app.notify_error("Couldn't open the file dialog", error.to_string());
         }
     });
 }
@@ -510,7 +528,7 @@ fn export_dialog(app: &mut App, tx: &mut Tx) {
         Ok(Some(path)) => app.start_export(path),
         Ok(None) => {}
         Err(error) => {
-            app.notify_error(error.to_string());
+            app.notify_error("Couldn't save the clip", error.to_string());
         }
     });
 }
@@ -782,12 +800,31 @@ fn toast_card(toast: &Toast, theme: &Palette) -> El {
         ),
     };
     let id = toast.id;
+    let mut body = col()
+        .grow(1.0)
+        .gap(2.0)
+        .live_region(LiveRegion::Assertive)
+        .child(
+            text(toast.title.clone())
+                .font(ui::TOAST_TITLE)
+                .color(theme.text)
+                .wrap(),
+        );
+    if let Some(detail) = &toast.detail {
+        body = body.child(
+            text(detail.clone())
+                .font(ui::TOAST_DETAIL)
+                .color(theme.text_muted)
+                .wrap()
+                .max_lines(3),
+        );
+    }
     let mut card = row()
         .key(format!("toast-{id}"))
         .w(360.0)
-        .padding(12.0)
+        .padding(8.0)
         .gap(10.0)
-        .items_start()
+        .center_y()
         .radius(10.0)
         .fill(fill)
         .border(1.0, border)
@@ -798,21 +835,14 @@ fn toast_card(toast: &Toast, theme: &Palette) -> El {
                 .springs(ui::TRAY_MOTION),
         )
         .child(
-            el().size(18.0, 20.0)
+            el().size(20.0, 20.0)
                 .center()
                 .child(icon(glyph, 18.0).color(ink).a11y_hidden()),
         )
-        .child(
-            text(toast.message.clone())
-                .font(ui::LABEL)
-                .color(theme.text)
-                .live_region(LiveRegion::Assertive)
-                .wrap()
-                .grow(1.0),
-        );
+        .child(body);
     if toast.persistent {
         card = card.child(
-            ui::small_icon_button(&icons::CLOSE, "Dismiss notification", theme)
+            ui::icon_button(&icons::CLOSE, "Dismiss notification", theme)
                 .key(format!("toast-close-{id}"))
                 .on_press(move |app: &mut App| app.dismiss_toast(id)),
         );
@@ -1812,7 +1842,10 @@ mod tests {
         session
             .take_notices()
             .into_iter()
-            .map(|notice| notice.message)
+            .map(|notice| match notice.detail {
+                Some(detail) => format!("{}: {detail}", notice.title),
+                None => notice.title,
+            })
             .collect()
     }
 
@@ -1822,11 +1855,14 @@ mod tests {
         notices.remove(0)
     }
 
-    fn toast_texts(app: &App) -> Vec<&str> {
+    fn toast_texts(app: &App) -> Vec<String> {
         app.toasts
             .entries()
             .iter()
-            .map(|toast| toast.message.as_str())
+            .map(|toast| match &toast.detail {
+                Some(detail) => format!("{}: {detail}", toast.title),
+                None => toast.title.clone(),
+            })
             .collect()
     }
 
@@ -1840,6 +1876,15 @@ mod tests {
             .collect();
         cards.sort();
         cards
+    }
+
+    fn toast_fill(runtime: &Runtime<App>, key: &str) -> Color {
+        runtime
+            .elements()
+            .into_iter()
+            .find(|element| element.key.as_deref() == Some(key))
+            .unwrap_or_else(|| panic!("{key}"))
+            .fill
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -2158,7 +2203,7 @@ mod tests {
         assert_eq!(session.timeline().position(), 2.0);
         assert!(!format!("{tx:?}").contains("16ms"), "{tx:?}");
         let notice = only_notice(session);
-        assert!(notice.contains("seek"), "{notice}");
+        assert!(notice.contains("Seek took too long"), "{notice}");
 
         let mut tx = Tx::default();
         session.poll(&mut tx, true);
@@ -2203,7 +2248,7 @@ mod tests {
         assert_eq!(session.timeline().position(), 2.0);
         assert!(!format!("{tx:?}").contains("16ms"), "{tx:?}");
         let notice = only_notice(session);
-        assert!(notice.contains("seek"), "{notice}");
+        assert!(notice.contains("Seek took too long"), "{notice}");
 
         let mut tx = Tx::default();
         session.poll(&mut tx, true);
@@ -2245,7 +2290,7 @@ mod tests {
         assert!(
             notices
                 .iter()
-                .any(|notice| notice.contains("did not finish in time")),
+                .any(|notice| notice.contains("Seek took too long")),
             "{notices:?}"
         );
     }
@@ -2282,7 +2327,7 @@ mod tests {
         assert!(!session.is_scrubbing());
         assert_eq!(session.timeline().position(), 0.0);
         let notice = only_notice(session);
-        assert!(notice.contains("did not finish in time"), "{notice}");
+        assert!(notice.contains("Seek took too long"), "{notice}");
     }
 
     #[test]
@@ -2306,7 +2351,7 @@ mod tests {
         assert!(
             raised
                 .iter()
-                .any(|notice| notice.contains("did not finish in time")),
+                .any(|notice| notice.contains("Seek took too long")),
             "{raised:?}"
         );
 
@@ -2759,36 +2804,39 @@ mod tests {
     #[test]
     fn notices_from_different_sources_stack_and_the_cap_drops_the_oldest() {
         let (mut app, log) = app_with_fake();
-        app.notify_error("the export failed");
+        app.notify_error("Export failed", "The export failed.");
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.poll = Some(poll);
         runtime.frame(0.0);
-        assert!(shows_text(&runtime, "the export failed"));
+        assert!(shows_text(&runtime, "Export failed"));
+        assert!(shows_text(&runtime, "The export failed."));
 
         log.lock().unwrap().command_failure = Some("set volume 40: rejected".into());
         runtime.frame(1.0 / 60.0);
+        assert!(shows_text(&runtime, "Command not applied"));
         assert!(shows_text(&runtime, "set volume 40"));
         assert!(
-            shows_text(&runtime, "the export failed"),
+            shows_text(&runtime, "The export failed."),
             "a distinct notice stacks beside the older toast"
         );
 
         log.lock().unwrap().state = PlaybackState::Failed("the engine failed".into());
         runtime.frame(1.0 / 60.0);
-        assert!(shows_text(&runtime, "the engine failed"));
-        assert!(shows_text(&runtime, "the export failed"));
+        assert!(shows_text(&runtime, "Playback failed"));
+        assert!(shows_text(&runtime, "The engine failed."));
+        assert!(shows_text(&runtime, "The export failed."));
         assert!(shows_text(&runtime, "set volume 40"));
 
         log.lock().unwrap().state = PlaybackState::Paused;
         session_mut(&mut runtime.state).set_export_error("the newer export failed".into());
         runtime.frame(1.0 / 60.0);
         runtime.frame(0.3);
-        assert!(shows_text(&runtime, "the newer export failed"));
+        assert!(shows_text(&runtime, "The newer export failed."));
         assert!(
-            !shows_text(&runtime, "the export failed"),
+            !shows_text(&runtime, "The export failed."),
             "the oldest toast left"
         );
-        assert!(shows_text(&runtime, "the engine failed"));
+        assert!(shows_text(&runtime, "The engine failed."));
         assert!(shows_text(&runtime, "set volume 40"));
     }
 
@@ -2810,7 +2858,7 @@ mod tests {
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.poll = Some(poll);
         runtime.frame(0.0);
-        assert!(shows_text(&runtime, "loadfile rejected"));
+        assert!(shows_text(&runtime, "Loadfile rejected."));
         assert!(!shows_text(&runtime, "The player could not apply"));
 
         log.lock().unwrap().command_failure = Some("set volume 40: rejected".into());
@@ -2819,7 +2867,7 @@ mod tests {
             shows_text(&runtime, "set volume 40"),
             "the later rejection gets its own toast"
         );
-        assert!(shows_text(&runtime, "loadfile rejected"));
+        assert!(shows_text(&runtime, "Loadfile rejected."));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2873,12 +2921,12 @@ mod tests {
 
         clock.advance(Duration::from_secs(5));
         runtime.frame(0.1);
-        assert!(shows_text(&runtime, "did not finish in time"));
+        assert!(shows_text(&runtime, "Seek took too long"));
 
         runtime.frame(crate::toast::TRANSIENT_SECONDS);
         runtime.frame(0.3);
         assert!(
-            !shows_text(&runtime, "did not finish in time"),
+            !shows_text(&runtime, "Seek took too long"),
             "the transient toast outlived its timer"
         );
     }
@@ -2886,23 +2934,30 @@ mod tests {
     #[test]
     fn a_persistent_toast_stays_past_the_timeout_until_closed() {
         let (mut app, _) = app_with_fake();
-        app.notify_error("the engine failed");
+        app.notify_error("Playback failed", "The engine failed.");
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.poll = Some(poll);
         runtime.frame(0.0);
         runtime.frame(crate::toast::TRANSIENT_SECONDS + 1.0);
-        assert!(shows_text(&runtime, "the engine failed"));
-        assert!(runtime.find("toast-close-1").is_some());
+        assert!(shows_text(&runtime, "The engine failed."));
+        let close = rect(&runtime, "toast-close-1");
+        assert!(
+            close[2] >= 40.0 && close[3] >= 40.0,
+            "the close control is under the desktop hit floor: {close:?}"
+        );
 
         click(&mut runtime, "toast-close-1");
         runtime.frame(0.3);
-        assert!(!shows_text(&runtime, "the engine failed"));
+        assert!(!shows_text(&runtime, "The engine failed."));
     }
 
     #[test]
     fn a_toast_renders_without_a_session() {
         let mut app = App::with_session(None);
-        app.notify_error("The playback engine is not available.");
+        app.notify_error(
+            "Playback engine unavailable",
+            "The playback engine is not available.",
+        );
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.frame(0.5);
         assert!(runtime.find("empty").is_some());
@@ -2916,8 +2971,8 @@ mod tests {
     #[test]
     fn an_identical_toast_refreshes_instead_of_stacking() {
         let (mut app, _) = app_with_fake();
-        app.notify_error("the export failed");
-        app.notify_error("the export failed");
+        app.notify_error("Export failed", "The export failed.");
+        app.notify_error("Export failed", "The export failed.");
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.frame(0.5);
         assert_eq!(toast_cards(&runtime), vec!["toast-1".to_string()]);
@@ -2926,7 +2981,7 @@ mod tests {
     #[test]
     fn the_toast_stack_sits_above_the_transport() {
         let (mut app, _) = app_with_fake();
-        app.notify_error("the export failed");
+        app.notify_error("Export failed", "The export failed.");
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.frame(0.5);
         let toast = rect(&runtime, "toast-1");
@@ -2940,7 +2995,7 @@ mod tests {
     #[test]
     fn the_toast_stack_sits_above_the_export_tray() {
         let (mut app, _) = app_with_fake();
-        app.notify_error("the export failed");
+        app.notify_error("Export failed", "The export failed.");
         app.export_open = true;
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.frame(0.5);
@@ -2961,8 +3016,13 @@ mod tests {
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.poll = Some(poll);
         runtime.frame(0.0);
-        assert!(shows_text(&runtime, "the export process exited"));
+        assert!(shows_text(&runtime, "The export process exited."));
         assert!(runtime.find("toast-close-1").is_some());
+        assert_eq!(
+            toast_fill(&runtime, "toast-1"),
+            ui::palette().danger_surface,
+            "an export failure is not the danger surface"
+        );
 
         click(&mut runtime, "export-toggle");
         runtime.frame(0.2);
@@ -2977,8 +3037,13 @@ mod tests {
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.poll = Some(poll);
         runtime.frame(0.0);
-        assert!(shows_text(&runtime, "Clip exported."));
+        assert!(shows_text(&runtime, "Clip exported"));
         assert!(runtime.find("toast-close-1").is_none());
+        assert_eq!(
+            toast_fill(&runtime, "toast-1"),
+            ui::palette().surface_raised,
+            "a finished export used the error surface"
+        );
     }
 
     #[test]
@@ -2988,7 +3053,12 @@ mod tests {
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.poll = Some(poll);
         runtime.frame(0.0);
-        assert!(shows_text(&runtime, "Export cancelled."));
+        assert!(shows_text(&runtime, "Export cancelled"));
+        assert_eq!(
+            toast_fill(&runtime, "toast-1"),
+            ui::palette().surface_raised,
+            "a cancelled export used the error surface"
+        );
     }
 
     #[test]
@@ -2999,10 +3069,8 @@ mod tests {
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.poll = Some(poll);
         runtime.frame(0.0);
-        assert!(shows_text(
-            &runtime,
-            "The track list could not be read: track list unavailable"
-        ));
+        assert!(shows_text(&runtime, "Tracks unavailable"));
+        assert!(shows_text(&runtime, "Track list unavailable."));
         click(&mut runtime, "audio-menu");
         runtime.frame(0.2);
         assert!(runtime.find("track-unavailable").is_some());
@@ -3123,7 +3191,7 @@ mod tests {
         app.open(PathBuf::from("https://example.test/movie.mp4"));
         assert_eq!(
             toast_texts(&app),
-            vec!["Remote URLs are not supported yet."]
+            vec!["Couldn't open the video: Remote URLs are not supported yet."]
         );
         assert_eq!(log.lock().unwrap().opened, None);
     }
@@ -3185,7 +3253,7 @@ mod tests {
         assert_eq!(session(&app).tracks(), &old_tracks);
         assert_eq!(session(&app).timeline(), &old_timeline);
         assert!(!session(&app).is_awaiting_source());
-        assert_eq!(only_notice(session_mut(&mut app)), "corrupt");
+        assert!(only_notice(session_mut(&mut app)).contains("Corrupt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3229,7 +3297,7 @@ mod tests {
         std::fs::write(&next, b"not a video").unwrap();
         let (mut app, log) = app_with_fake();
         session_mut(&mut app).set_export(Some(ExportJob::with_state(ExportState::Finished)));
-        app.notify_error("old export error");
+        app.notify_error("Export failed", "The old export error.");
         log.lock().unwrap().state = PlaybackState::Loading;
 
         app.open(next);
@@ -3248,7 +3316,7 @@ mod tests {
         let corrupt = dir.join("corrupt.mkv");
         std::fs::write(&corrupt, b"not a video").unwrap();
         let (mut app, log) = app_with_fake();
-        app.notify_error("old export error");
+        app.notify_error("Export failed", "The old export error.");
         log.lock().unwrap().state = PlaybackState::Loading;
 
         app.open(corrupt);
@@ -3257,7 +3325,7 @@ mod tests {
         session_mut(&mut app).refresh_snapshot();
         let state = session(&app).state();
         assert!(session_mut(&mut app).confirm_open(&state));
-        assert_eq!(only_notice(session_mut(&mut app)), "corrupt");
+        assert!(only_notice(session_mut(&mut app)).contains("Corrupt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3311,7 +3379,7 @@ mod tests {
         assert_eq!(session(&runtime.state).source(), old_path.as_deref());
         assert_eq!(session(&runtime.state).timeline(), &old_timeline);
         assert!(!session(&runtime.state).is_awaiting_source());
-        assert!(shows_text(&runtime, "corrupt"));
+        assert!(shows_text(&runtime, "Corrupt."));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3900,16 +3968,18 @@ mod tests {
     }
 
     #[test]
-    fn a_long_toast_wraps_instead_of_truncating() {
+    fn a_long_toast_detail_clamps_to_three_lines() {
         let (mut app, _) = app_with_fake();
         app.notify_error(
+            "Couldn't open the video",
             "The playback engine could not open this file because the container is damaged.              Choose a different file or re-download the clip."
                 .repeat(4),
         );
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.frame(0.0);
         let card = rect(&runtime, "toast-1");
-        assert!(card[3] > 38.0, "{card:?}");
+        assert!(card[3] > 38.0, "the detail stayed on one line: {card:?}");
+        assert!(card[3] < 120.0, "the detail was not clamped: {card:?}");
     }
 
     #[test]
