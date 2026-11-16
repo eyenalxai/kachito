@@ -4,6 +4,7 @@ use crate::engine::{MpvEngine, PlaybackState, Track, TrackKind, VIDEO_HEIGHT, VI
 use crate::export::{ExportMode, ExportState};
 use crate::log::{RunLog, StderrSink};
 use crate::session::{PlaybackSession, SUPPORTED, TracksState, tracks_of};
+use crate::toast::{Toast, Toasts, Tone};
 use crate::ui::{self, Palette, icons};
 use rune::{
     AppSpec, Color, Cx, Drag, El, FileDialogOptions, Key, KeyEvent, LiveRegion, Phase, ScrollSpec,
@@ -16,6 +17,11 @@ const SPEEDS: &[f32] = &[0.5, 1.0, 1.25, 1.5, 2.0];
 const HIDE_AFTER: f64 = 2.5;
 const SKIP: f64 = 10.0;
 const SCRUB_THRESHOLD: f32 = 2.0;
+/// The toast stack's inset from the window's right and bottom edges.
+const TOAST_INSET: f32 = 16.0;
+/// The bottom clearance above the transport and the export tray.
+const TOAST_TRANSPORT_CLEARANCE: f32 = 128.0;
+const TOAST_EXPORT_CLEARANCE: f32 = 216.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Menu {
@@ -26,7 +32,9 @@ enum Menu {
 
 struct App {
     session: Option<PlaybackSession>,
-    error: Option<String>,
+    toasts: Toasts,
+    /// The app clock at the last poll, so a handler can stamp a toast timer.
+    now: f64,
     volume: f32,
     last_volume: f32,
     speed: f32,
@@ -49,7 +57,7 @@ impl App {
             Ok(engine) => Self::with_session(Some(PlaybackSession::new(Box::new(engine), log))),
             Err(error) => {
                 let mut app = Self::with_session(None);
-                app.error = Some(error);
+                app.notify_error("Playback engine unavailable", error);
                 app
             }
         };
@@ -62,7 +70,8 @@ impl App {
     fn with_session(session: Option<PlaybackSession>) -> Self {
         Self {
             session,
-            error: None,
+            toasts: Toasts::default(),
+            now: 0.0,
             volume: 1.0,
             last_volume: 1.0,
             speed: 1.0,
@@ -79,20 +88,45 @@ impl App {
         }
     }
 
+    /// Raises one toast.
+    fn notify(
+        &mut self,
+        title: impl Into<String>,
+        detail: Option<String>,
+        tone: Tone,
+        persistent: bool,
+    ) {
+        self.toasts.push(title, detail, tone, persistent, self.now);
+    }
+
+    fn notify_error(&mut self, title: impl Into<String>, detail: impl Into<String>) {
+        self.notify(title, Some(detail.into()), Tone::Danger, true);
+    }
+
+    fn dismiss_toast(&mut self, id: u64) {
+        self.toasts.dismiss(id);
+    }
+
     fn open(&mut self, path: PathBuf) {
         let Some(session) = &mut self.session else {
-            self.error = Some("The playback engine is not available.".into());
+            self.notify_error(
+                "Playback engine unavailable",
+                "The playback engine is not available.",
+            );
             return;
         };
         let parent = path.parent().map(|parent| parent.to_path_buf());
-        match session.open(path) {
+        let opened = session.open(path);
+        match opened {
             Ok(()) => {
                 self.last_dir = parent;
-                self.error = None;
+                self.toasts.clear();
                 self.menu = None;
                 self.touch();
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => {
+                self.notify_error("Couldn't open the video", error);
+            }
         }
     }
 
@@ -207,19 +241,28 @@ impl App {
     }
 
     fn select_audio(&mut self, id: i64) {
-        if let Some(session) = &mut self.session
-            && let Err(error) = session.select_audio(id)
-        {
-            self.error = Some(error);
+        let error = self
+            .session
+            .as_mut()
+            .and_then(|session| session.select_audio(id).err());
+        if let Some(error) = error {
+            self.notify("Audio track not selected", Some(error), Tone::Danger, false);
         }
         self.menu = None;
     }
 
     fn select_subtitle(&mut self, id: Option<i64>) {
-        if let Some(session) = &mut self.session
-            && let Err(error) = session.select_subtitle(id)
-        {
-            self.error = Some(error);
+        let error = self
+            .session
+            .as_mut()
+            .and_then(|session| session.select_subtitle(id).err());
+        if let Some(error) = error {
+            self.notify(
+                "Subtitle track not selected",
+                Some(error),
+                Tone::Danger,
+                false,
+            );
         }
         self.menu = None;
     }
@@ -285,18 +328,6 @@ impl App {
         }
     }
 
-    fn set_export_error(&mut self, error: String) {
-        if let Some(session) = &mut self.session {
-            session.set_export_error(error);
-        }
-    }
-
-    fn error_text(&self) -> Option<String> {
-        self.error
-            .clone()
-            .or_else(|| self.session.as_ref().and_then(|session| session.error()))
-    }
-
     fn export_state(&self) -> Option<ExportState> {
         self.session
             .as_ref()
@@ -350,9 +381,10 @@ fn setup(app: &mut App, waker: Waker) {
 }
 
 fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
+    app.now = t;
     let mut changed = false;
     let timeline_visible = app.transport_visible || app.export_open;
-    if let Some(session) = &mut app.session {
+    let notices = if let Some(session) = &mut app.session {
         changed |= session.poll(tx, timeline_visible);
         let source = session.source().map(|path| path.to_path_buf());
         if app.title_source != source {
@@ -361,6 +393,18 @@ fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
             app.export_open = false;
             changed = true;
         }
+        session.take_notices()
+    } else {
+        Vec::new()
+    };
+    for notice in notices {
+        changed |= app.toasts.push(
+            notice.title,
+            notice.detail,
+            notice.tone,
+            notice.persistent,
+            app.now,
+        );
     }
     if app.activity {
         app.activity = false;
@@ -378,6 +422,12 @@ fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
             app.transport_visible = true;
             changed = true;
         }
+    }
+    if app.toasts.prune(t) {
+        changed = true;
+    }
+    if let Some(due) = app.toasts.next_deadline() {
+        tx.wake_at(due);
     }
     changed
 }
@@ -450,7 +500,9 @@ fn open_dialog(app: &mut App, tx: &mut Tx) {
     tx.open_file(options, |app: &mut App, result, _| match result {
         Ok(Some(path)) => app.open(path),
         Ok(None) => {}
-        Err(error) => app.error = Some(error.to_string()),
+        Err(error) => {
+            app.notify_error("Couldn't open the file dialog", error.to_string());
+        }
     });
 }
 
@@ -475,13 +527,14 @@ fn export_dialog(app: &mut App, tx: &mut Tx) {
     tx.save_file(options, move |app: &mut App, result, _| match result {
         Ok(Some(path)) => app.start_export(path),
         Ok(None) => {}
-        Err(error) => app.set_export_error(error.to_string()),
+        Err(error) => {
+            app.notify_error("Couldn't save the clip", error.to_string());
+        }
     });
 }
 
 fn view(app: &App, _: &mut Cx<App>) -> El {
     let theme = ui::palette();
-    let error = app.error_text();
     let mut root = col()
         .key("root")
         .w_full()
@@ -503,17 +556,17 @@ fn view(app: &App, _: &mut Cx<App>) -> El {
         } else if app.transport_visible {
             stage = stage.child(transport(app, session, &theme));
         }
-        if let Some(error) = &error {
-            stage = stage.child(error_banner(error, &theme));
-        }
         root = root.child(top_bar(app, &theme)).child(stage);
     } else {
         root = root
             .child(top_bar(app, &theme))
-            .child(empty_screen(app, &theme, error.as_deref()));
+            .child(empty_screen(app, &theme));
     }
     if let Some(menu) = menu_overlay(app, &theme) {
         root = root.child(menu);
+    }
+    if let Some(toasts) = toast_stack(app, &theme) {
+        root = root.child(toasts);
     }
     root
 }
@@ -614,24 +667,20 @@ fn export_button(app: &App, theme: &Palette) -> El {
 
 fn export_status(app: &App, theme: &Palette) -> El {
     let mut slot = row().w(64.0).justify_end();
-    if let Some(state) = app.export_state() {
-        let (label, color) = match state {
-            ExportState::Running { fraction } => {
-                (format!("{}%", (fraction * 100.0).round()), theme.text_muted)
-            }
-            ExportState::Finished => ("Exported".into(), theme.text_muted),
-            ExportState::Cancelled => ("Cancelled".into(), theme.text_muted),
-            ExportState::Failed(_) => ("Failed".into(), theme.danger),
-        };
+    if let Some(ExportState::Running { fraction }) = app.export_state() {
         slot = slot.child(
-            text(label)
+            text(export_percent(fraction))
                 .key("export-status")
                 .font(ui::TIME)
-                .color(color)
+                .color(theme.text_muted)
                 .truncate(),
         );
     }
     slot
+}
+
+fn export_percent(fraction: f32) -> String {
+    format!("{}%", (fraction * 100.0).round())
 }
 
 fn video_stage(session: &PlaybackSession, theme: &Palette) -> El {
@@ -653,7 +702,7 @@ fn video_stage(session: &PlaybackSession, theme: &Palette) -> El {
         )
 }
 
-fn empty_screen(app: &App, theme: &Palette, error: Option<&str>) -> El {
+fn empty_screen(app: &App, theme: &Palette) -> El {
     let border = if app.drop_hover {
         theme.accent
     } else {
@@ -691,47 +740,114 @@ fn empty_screen(app: &App, theme: &Palette, error: Option<&str>) -> El {
                 .font(ui::TINY)
                 .color(theme.text_faint),
         );
-    let mut stage = el()
-        .key("empty")
+    el().key("empty")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .fill(theme.stage)
         .center()
-        .child(zone);
-    if let Some(error) = error {
-        stage = stage.child(error_banner(error, theme));
-    }
-    stage
+        .child(zone)
 }
 
-fn error_banner(error: &str, theme: &Palette) -> El {
-    row()
-        .key("error-banner")
-        .pin(Some(0.0), Some(12.0), Some(0.0), None)
-        .w_full()
-        .justify_center()
+/// The toast stack sits in the bottom-right corner, above the transport and the export
+/// tray when one is on screen.
+fn toast_bottom_inset(app: &App) -> f32 {
+    if !app.has_source() {
+        TOAST_INSET
+    } else if app.export_open {
+        TOAST_EXPORT_CLEARANCE
+    } else {
+        TOAST_TRANSPORT_CLEARANCE
+    }
+}
+
+fn toast_stack(app: &App, theme: &Palette) -> Option<El> {
+    if app.toasts.is_empty() {
+        return None;
+    }
+    let mut stack = col()
+        .key("toast-stack")
+        .pin(None, None, Some(TOAST_INSET), Some(toast_bottom_inset(app)))
+        .items_end()
+        .gap(8.0)
+        .role("region")
+        .label("Notifications");
+    for toast in app.toasts.entries() {
+        stack = stack.child(toast_card(toast, theme));
+    }
+    Some(stack)
+}
+
+fn toast_card(toast: &Toast, theme: &Palette) -> El {
+    let (glyph, ink, fill, border) = match toast.tone {
+        Tone::Danger => (
+            &icons::ALERT,
+            theme.danger,
+            theme.danger_surface,
+            theme.danger.alpha(0.4),
+        ),
+        Tone::Success => (
+            &icons::CHECK,
+            theme.accent,
+            theme.surface_raised,
+            theme.accent.alpha(0.45),
+        ),
+        Tone::Neutral => (
+            &icons::FILM,
+            theme.text_muted,
+            theme.surface_raised,
+            theme.border_strong,
+        ),
+    };
+    let id = toast.id;
+    let mut body = col()
+        .grow(1.0)
+        .gap(2.0)
+        .live_region(LiveRegion::Assertive)
         .child(
-            row()
-                .key("error-banner-card")
-                .w(640.0)
-                .min_h(38.0)
-                .padding(10.0)
-                .gap(8.0)
-                .center_y()
-                .radius(9.0)
-                .fill(theme.danger_surface)
-                .border(1.0, theme.danger.alpha(0.4))
-                .child(icon(&icons::ALERT, 18.0).color(theme.danger).a11y_hidden())
-                .child(
-                    text(error.to_string())
-                        .font(ui::LABEL)
-                        .color(theme.danger)
-                        .live_region(LiveRegion::Assertive)
-                        .wrap()
-                        .grow(1.0),
-                ),
+            text(toast.title.clone())
+                .font(ui::TOAST_TITLE)
+                .color(theme.text)
+                .wrap(),
+        );
+    if let Some(detail) = &toast.detail {
+        body = body.child(
+            text(detail.clone())
+                .font(ui::TOAST_DETAIL)
+                .color(theme.text_muted)
+                .wrap()
+                .max_lines(3),
+        );
+    }
+    let mut card = row()
+        .key(format!("toast-{id}"))
+        .w(360.0)
+        .padding(8.0)
+        .gap(10.0)
+        .center_y()
+        .radius(10.0)
+        .fill(fill)
+        .border(1.0, border)
+        .shadow(14.0, 30.0, theme.shadow)
+        .transition(
+            Transition::offset(0.0, 8.0)
+                .combined(Transition::opacity())
+                .springs(ui::TRAY_MOTION),
         )
+        .child(
+            el().size(20.0, 20.0)
+                .center()
+                .child(icon(glyph, 18.0).color(ink).a11y_hidden()),
+        )
+        .child(body);
+    if toast.persistent {
+        card = card.child(
+            ui::icon_button(&icons::CLOSE, "Dismiss notification", theme)
+                .key(format!("toast-close-{id}"))
+                .on_press(move |app: &mut App| app.dismiss_toast(id)),
+        );
+    }
+    card
 }
 
 fn transport(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
@@ -1037,9 +1153,9 @@ fn audio_rows(app: &App, theme: &Palette) -> El {
         TracksState::Unloaded => col()
             .w_full()
             .child(ui::menu_empty("Loading tracks…", theme).key("track-loading")),
-        TracksState::Failed(error) => col()
+        TracksState::Failed(_) => col()
             .w_full()
-            .child(ui::menu_empty(error.clone(), theme).key("track-error")),
+            .child(ui::menu_empty("Tracks unavailable", theme).key("track-unavailable")),
         TracksState::Loaded(tracks) => {
             let audio: Vec<&Track> = tracks_of(tracks, TrackKind::Audio).collect();
             if audio.is_empty() {
@@ -1089,8 +1205,8 @@ fn subtitle_rows(app: &App, theme: &Palette) -> El {
         Some(TracksState::Unloaded) | None => {
             list = list.child(ui::menu_empty("Loading tracks…", theme).key("track-loading"));
         }
-        Some(TracksState::Failed(error)) => {
-            list = list.child(ui::menu_empty(error.clone(), theme).key("track-error"));
+        Some(TracksState::Failed(_)) => {
+            list = list.child(ui::menu_empty("Tracks unavailable", theme).key("track-unavailable"));
         }
         Some(TracksState::Loaded(tracks)) => {
             let subtitles: Vec<&Track> = tracks_of(tracks, TrackKind::Subtitle).collect();
@@ -1184,55 +1300,27 @@ fn export_tray(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
             .child(fast),
     );
     footer = footer.child(el().grow(1.0));
-    match &state {
-        Some(ExportState::Running { fraction }) => {
-            footer = footer
-                .child(
-                    el().w(160.0).h(4.0).radius(2.0).fill(theme.track).child(
-                        el().w((160.0 * fraction.clamp(0.0, 1.0)).max(2.0))
-                            .h(4.0)
-                            .radius(2.0)
-                            .fill(theme.accent),
-                    ),
-                )
-                .child(
-                    text(format!("{}%", (fraction * 100.0).round()))
-                        .key("export-progress")
-                        .font(ui::TIME)
-                        .color(theme.text_muted),
-                )
-                .child(
-                    ui::ghost_button("Cancel", theme)
-                        .key("cancel-export")
-                        .on_press(|app: &mut App| app.cancel_export()),
-                );
-        }
-        Some(ExportState::Finished) => {
-            footer = footer.child(
-                text("Exported")
-                    .key("export-tray-status")
-                    .font(ui::LABEL)
+    if let Some(ExportState::Running { fraction }) = &state {
+        footer = footer
+            .child(
+                el().w(160.0).h(4.0).radius(2.0).fill(theme.track).child(
+                    el().w((160.0 * fraction.clamp(0.0, 1.0)).max(2.0))
+                        .h(4.0)
+                        .radius(2.0)
+                        .fill(theme.accent),
+                ),
+            )
+            .child(
+                text(export_percent(*fraction))
+                    .key("export-progress")
+                    .font(ui::TIME)
                     .color(theme.text_muted),
+            )
+            .child(
+                ui::ghost_button("Cancel", theme)
+                    .key("cancel-export")
+                    .on_press(|app: &mut App| app.cancel_export()),
             );
-        }
-        Some(ExportState::Cancelled) => {
-            footer = footer.child(
-                text("Cancelled")
-                    .key("export-tray-status")
-                    .font(ui::LABEL)
-                    .color(theme.text_muted),
-            );
-        }
-        Some(ExportState::Failed(error)) => {
-            footer = footer.child(
-                text(error.clone())
-                    .key("export-tray-status")
-                    .font(ui::LABEL)
-                    .color(theme.danger)
-                    .truncate(),
-            );
-        }
-        None => {}
     }
     if !running {
         footer = footer.child(
@@ -1750,6 +1838,55 @@ mod tests {
         })
     }
 
+    fn notices(session: &mut PlaybackSession) -> Vec<String> {
+        session
+            .take_notices()
+            .into_iter()
+            .map(|notice| match notice.detail {
+                Some(detail) => format!("{}: {detail}", notice.title),
+                None => notice.title,
+            })
+            .collect()
+    }
+
+    fn only_notice(session: &mut PlaybackSession) -> String {
+        let mut notices = notices(session);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        notices.remove(0)
+    }
+
+    fn toast_texts(app: &App) -> Vec<String> {
+        app.toasts
+            .entries()
+            .iter()
+            .map(|toast| match &toast.detail {
+                Some(detail) => format!("{}: {detail}", toast.title),
+                None => toast.title.clone(),
+            })
+            .collect()
+    }
+
+    fn toast_cards(runtime: &Runtime<App>) -> Vec<String> {
+        let mut cards: Vec<String> = runtime
+            .elements()
+            .into_iter()
+            .filter_map(|element| element.key)
+            .filter(|key| key.starts_with("toast-") && !key.starts_with("toast-close"))
+            .filter(|key| key != "toast-stack")
+            .collect();
+        cards.sort();
+        cards
+    }
+
+    fn toast_fill(runtime: &Runtime<App>, key: &str) -> Color {
+        runtime
+            .elements()
+            .into_iter()
+            .find(|element| element.key.as_deref() == Some(key))
+            .unwrap_or_else(|| panic!("{key}"))
+            .fill
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kachito-app-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2065,12 +2202,12 @@ mod tests {
         );
         assert_eq!(session.timeline().position(), 2.0);
         assert!(!format!("{tx:?}").contains("16ms"), "{tx:?}");
-        let notice = session.error().expect("one notice");
-        assert!(notice.contains("seek"), "{notice}");
+        let notice = only_notice(session);
+        assert!(notice.contains("Seek took too long"), "{notice}");
 
         let mut tx = Tx::default();
         session.poll(&mut tx, true);
-        assert_eq!(session.error().as_deref(), Some(notice.as_str()));
+        assert!(notices(session).is_empty(), "the notice was raised twice");
     }
 
     #[test]
@@ -2110,12 +2247,12 @@ mod tests {
         );
         assert_eq!(session.timeline().position(), 2.0);
         assert!(!format!("{tx:?}").contains("16ms"), "{tx:?}");
-        let notice = session.error().expect("one notice");
-        assert!(notice.contains("seek"), "{notice}");
+        let notice = only_notice(session);
+        assert!(notice.contains("Seek took too long"), "{notice}");
 
         let mut tx = Tx::default();
         session.poll(&mut tx, true);
-        assert_eq!(session.error().as_deref(), Some(notice.as_str()));
+        assert!(notices(session).is_empty(), "the notice was raised twice");
     }
 
     #[test]
@@ -2149,8 +2286,13 @@ mod tests {
             "the failed engine kept the seek pending"
         );
         assert_eq!(session.timeline().position(), 2.0);
-        let notice = session.error().expect("one notice");
-        assert!(notice.contains("did not finish in time"), "{notice}");
+        let notices = notices(session);
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("Seek took too long")),
+            "{notices:?}"
+        );
     }
 
     #[test]
@@ -2184,8 +2326,8 @@ mod tests {
         session.poll(&mut tx, true);
         assert!(!session.is_scrubbing());
         assert_eq!(session.timeline().position(), 0.0);
-        let notice = session.error().expect("one notice");
-        assert!(notice.contains("did not finish in time"), "{notice}");
+        let notice = only_notice(session);
+        assert!(notice.contains("Seek took too long"), "{notice}");
     }
 
     #[test]
@@ -2205,15 +2347,20 @@ mod tests {
         clock.advance(Duration::from_secs(5));
         let mut tx = Tx::default();
         session.poll(&mut tx, true);
-        let notice = session.error().expect("one notice");
-        assert!(notice.contains("did not finish in time"), "{notice}");
+        let raised = notices(session);
+        assert!(
+            raised
+                .iter()
+                .any(|notice| notice.contains("Seek took too long")),
+            "{raised:?}"
+        );
 
         log.lock().unwrap().command_failure = Some("set speed 2: rejected".into());
         session.poll(&mut tx, true);
-        let notice = session.error().expect("one notice");
+        let raised = notices(session);
         assert!(
-            notice.contains("set speed 2"),
-            "the deadline consumed the command notice: {notice}"
+            raised.iter().any(|notice| notice.contains("set speed 2")),
+            "the deadline consumed the command notice: {raised:?}"
         );
     }
 
@@ -2332,7 +2479,7 @@ mod tests {
         std::fs::write(&source, b"not a video").unwrap();
         let (mut app, log) = app_with_fake();
         app.open(source.clone());
-        assert_eq!(app.error_text(), None);
+        assert!(app.toasts.is_empty());
         assert!(session(&app).is_awaiting_source());
         assert_eq!(
             log.lock().unwrap().opened.as_deref(),
@@ -2630,7 +2777,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_rejected_command_raises_one_notice_per_file() {
+    fn a_rejected_command_raises_a_toast() {
         let (app, log) = app_with_fake();
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.poll = Some(poll);
@@ -2641,54 +2788,60 @@ mod tests {
         runtime.frame(1.0 / 60.0);
         assert!(
             shows_text(&runtime, "set volume 40"),
-            "the first rejection raises the notice"
+            "the first rejection raises the toast"
         );
 
         log.lock().unwrap().command_failure =
             Some("seek 5.000 absolute+exact: invalid parameter".into());
         runtime.frame(1.0 / 60.0);
+        assert!(shows_text(&runtime, "set volume 40"));
         assert!(
-            shows_text(&runtime, "set volume 40"),
-            "the first notice stays on screen"
-        );
-        assert!(
-            !shows_text(&runtime, "seek 5.000"),
-            "a second rejection is quiet"
+            shows_text(&runtime, "seek 5.000"),
+            "the second rejection is its own toast"
         );
     }
 
     #[test]
-    fn the_newest_notice_wins() {
-        let (app, log) = app_with_fake();
+    fn notices_from_different_sources_stack_and_the_cap_drops_the_oldest() {
+        let (mut app, log) = app_with_fake();
+        app.notify_error("Export failed", "The export failed.");
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.poll = Some(poll);
         runtime.frame(0.0);
+        assert!(shows_text(&runtime, "Export failed"));
+        assert!(shows_text(&runtime, "The export failed."));
 
         log.lock().unwrap().command_failure = Some("set volume 40: rejected".into());
         runtime.frame(1.0 / 60.0);
+        assert!(shows_text(&runtime, "Command not applied"));
         assert!(shows_text(&runtime, "set volume 40"));
-
-        runtime.state.set_export_error("the export failed".into());
-        runtime.frame(1.0 / 60.0);
-        assert!(shows_text(&runtime, "the export failed"));
-        assert!(!shows_text(&runtime, "set volume 40"));
+        assert!(
+            shows_text(&runtime, "The export failed."),
+            "a distinct notice stacks beside the older toast"
+        );
 
         log.lock().unwrap().state = PlaybackState::Failed("the engine failed".into());
         runtime.frame(1.0 / 60.0);
-        assert!(shows_text(&runtime, "the engine failed"));
-        assert!(!shows_text(&runtime, "the export failed"));
+        assert!(shows_text(&runtime, "Playback failed"));
+        assert!(shows_text(&runtime, "The engine failed."));
+        assert!(shows_text(&runtime, "The export failed."));
+        assert!(shows_text(&runtime, "set volume 40"));
 
         log.lock().unwrap().state = PlaybackState::Paused;
-        runtime
-            .state
-            .set_export_error("the newer export failed".into());
+        session_mut(&mut runtime.state).set_export_error("the newer export failed".into());
         runtime.frame(1.0 / 60.0);
-        assert!(shows_text(&runtime, "the newer export failed"));
-        assert!(!shows_text(&runtime, "the engine failed"));
+        runtime.frame(0.3);
+        assert!(shows_text(&runtime, "The newer export failed."));
+        assert!(
+            !shows_text(&runtime, "The export failed."),
+            "the oldest toast left"
+        );
+        assert!(shows_text(&runtime, "The engine failed."));
+        assert!(shows_text(&runtime, "set volume 40"));
     }
 
     #[test]
-    fn a_rejected_load_does_not_consume_the_command_notice() {
+    fn a_failed_load_and_a_rejected_command_each_raise_a_toast() {
         let dir = temp_dir("rejected-load-notice");
         let corrupt = dir.join("corrupt.mkv");
         std::fs::write(&corrupt, b"not a video").unwrap();
@@ -2705,20 +2858,21 @@ mod tests {
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.poll = Some(poll);
         runtime.frame(0.0);
-        assert!(shows_text(&runtime, "loadfile rejected"));
+        assert!(shows_text(&runtime, "Loadfile rejected."));
         assert!(!shows_text(&runtime, "The player could not apply"));
 
         log.lock().unwrap().command_failure = Some("set volume 40: rejected".into());
         runtime.frame(1.0 / 60.0);
         assert!(
             shows_text(&runtime, "set volume 40"),
-            "the later rejection gets the one notice"
+            "the later rejection gets its own toast"
         );
+        assert!(shows_text(&runtime, "Loadfile rejected."));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_successful_open_clears_the_command_notice() {
+    fn a_successful_open_clears_the_toasts() {
         let dir = temp_dir("clear-command-notice");
         let next = dir.join("next.mkv");
         std::fs::write(&next, b"not a video").unwrap();
@@ -2728,23 +2882,199 @@ mod tests {
         runtime.frame(0.0);
         log.lock().unwrap().command_failure = Some("set pause yes: rejected".into());
         runtime.frame(1.0 / 60.0);
-        assert!(runtime.find("error-banner-card").is_some());
+        assert!(runtime.find("toast-stack").is_some());
 
         runtime.state.open(next);
         runtime.frame(1.0 / 60.0);
-        assert_eq!(runtime.state.error_text(), None);
+        assert!(runtime.state.toasts.is_empty());
         assert!(
-            runtime.find("error-banner-card").is_none(),
-            "the successful open clears the notice"
+            runtime.find("toast-stack").is_none(),
+            "the successful open clears the stack"
         );
 
         log.lock().unwrap().command_failure = Some("seek 1.000 absolute+exact: rejected".into());
         runtime.frame(1.0 / 60.0);
         assert!(
-            runtime.find("error-banner-card").is_some(),
-            "the next file gets its own one notice"
+            runtime.find("toast-stack").is_some(),
+            "the next file gets its own toast"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_seek_deadline_toast_dismisses_itself() {
+        let (mut app, log, clock) = app_with_fake_and_clock();
+        session_mut(&mut app)
+            .timeline_mut()
+            .set_duration(10.0, 1.0 / 60.0);
+        session_mut(&mut app).timeline_mut().set_position(5.0);
+        {
+            let mut log = log.lock().unwrap();
+            log.seeking = true;
+            log.position = 2.0;
+        }
+        session_mut(&mut app).seek(5.0);
+
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+
+        clock.advance(Duration::from_secs(5));
+        runtime.frame(0.1);
+        assert!(shows_text(&runtime, "Seek took too long"));
+
+        runtime.frame(crate::toast::TRANSIENT_SECONDS);
+        runtime.frame(0.3);
+        assert!(
+            !shows_text(&runtime, "Seek took too long"),
+            "the transient toast outlived its timer"
+        );
+    }
+
+    #[test]
+    fn a_persistent_toast_stays_past_the_timeout_until_closed() {
+        let (mut app, _) = app_with_fake();
+        app.notify_error("Playback failed", "The engine failed.");
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        runtime.frame(crate::toast::TRANSIENT_SECONDS + 1.0);
+        assert!(shows_text(&runtime, "The engine failed."));
+        let close = rect(&runtime, "toast-close-1");
+        assert!(
+            close[2] >= 40.0 && close[3] >= 40.0,
+            "the close control is under the desktop hit floor: {close:?}"
+        );
+
+        click(&mut runtime, "toast-close-1");
+        runtime.frame(0.3);
+        assert!(!shows_text(&runtime, "The engine failed."));
+    }
+
+    #[test]
+    fn a_toast_renders_without_a_session() {
+        let mut app = App::with_session(None);
+        app.notify_error(
+            "Playback engine unavailable",
+            "The playback engine is not available.",
+        );
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.frame(0.5);
+        assert!(runtime.find("empty").is_some());
+        assert!(shows_text(
+            &runtime,
+            "The playback engine is not available."
+        ));
+        assert!(runtime.find("toast-close-1").is_some());
+    }
+
+    #[test]
+    fn an_identical_toast_refreshes_instead_of_stacking() {
+        let (mut app, _) = app_with_fake();
+        app.notify_error("Export failed", "The export failed.");
+        app.notify_error("Export failed", "The export failed.");
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.frame(0.5);
+        assert_eq!(toast_cards(&runtime), vec!["toast-1".to_string()]);
+    }
+
+    #[test]
+    fn the_toast_stack_sits_above_the_transport() {
+        let (mut app, _) = app_with_fake();
+        app.notify_error("Export failed", "The export failed.");
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.frame(0.5);
+        let toast = rect(&runtime, "toast-1");
+        let transport = rect(&runtime, "transport");
+        assert!(
+            toast[1] + toast[3] <= transport[1] - 8.0,
+            "the toast overlaps the transport: {toast:?} {transport:?}"
+        );
+    }
+
+    #[test]
+    fn the_toast_stack_sits_above_the_export_tray() {
+        let (mut app, _) = app_with_fake();
+        app.notify_error("Export failed", "The export failed.");
+        app.export_open = true;
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.frame(0.5);
+        let toast = rect(&runtime, "toast-1");
+        let tray = rect(&runtime, "export-tray");
+        assert!(
+            toast[1] + toast[3] <= tray[1] - 8.0,
+            "the toast overlaps the export tray: {toast:?} {tray:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_export_toasts_its_reason_and_leaves_the_tray_clean() {
+        let (mut app, _) = app_with_fake();
+        session_mut(&mut app).set_export(Some(ExportJob::with_state(ExportState::Failed(
+            "the export process exited".into(),
+        ))));
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        assert!(shows_text(&runtime, "The export process exited."));
+        assert!(runtime.find("toast-close-1").is_some());
+        assert_eq!(
+            toast_fill(&runtime, "toast-1"),
+            ui::palette().danger_surface,
+            "an export failure is not the danger surface"
+        );
+
+        click(&mut runtime, "export-toggle");
+        runtime.frame(0.2);
+        assert!(runtime.find("export-tray").is_some());
+        assert!(runtime.find("export-tray-status").is_none());
+    }
+
+    #[test]
+    fn a_finished_export_toasts_and_carries_no_close() {
+        let (mut app, _) = app_with_fake();
+        session_mut(&mut app).set_export(Some(ExportJob::with_state(ExportState::Finished)));
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        assert!(shows_text(&runtime, "Clip exported"));
+        assert!(runtime.find("toast-close-1").is_none());
+        assert_eq!(
+            toast_fill(&runtime, "toast-1"),
+            ui::palette().surface_raised,
+            "a finished export used the error surface"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_export_toasts() {
+        let (mut app, _) = app_with_fake();
+        session_mut(&mut app).set_export(Some(ExportJob::with_state(ExportState::Cancelled)));
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        assert!(shows_text(&runtime, "Export cancelled"));
+        assert_eq!(
+            toast_fill(&runtime, "toast-1"),
+            ui::palette().surface_raised,
+            "a cancelled export used the error surface"
+        );
+    }
+
+    #[test]
+    fn a_track_list_failure_raises_a_toast_and_a_neutral_menu() {
+        let (mut app, log) = app_with_fake();
+        session_mut(&mut app).set_tracks(TracksState::Unloaded);
+        log.lock().unwrap().tracks_result = Some(Err("track list unavailable".into()));
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        assert!(shows_text(&runtime, "Tracks unavailable"));
+        assert!(shows_text(&runtime, "Track list unavailable."));
+        click(&mut runtime, "audio-menu");
+        runtime.frame(0.2);
+        assert!(runtime.find("track-unavailable").is_some());
+        assert!(runtime.find("track-error").is_none());
     }
 
     #[test]
@@ -2768,11 +3098,18 @@ mod tests {
         runtime.frame(0.0);
         fake.lock().unwrap().command_failure = Some("set speed 0: invalid parameter".into());
         runtime.frame(1.0 / 60.0);
+        fake.lock().unwrap().command_failure = Some("seek 2.000 absolute+exact: invalid".into());
+        runtime.frame(1.0 / 60.0);
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.contains("notice: rejected command: set speed 0: invalid parameter"),
             "{text}"
+        );
+        assert_eq!(
+            text.matches("notice: rejected command").count(),
+            1,
+            "the notice line was logged more than once: {text}"
         );
         assert_eq!(sink.lines(), text.lines().collect::<Vec<_>>());
         let _ = std::fs::remove_file(path);
@@ -2834,7 +3171,13 @@ mod tests {
     fn a_non_video_file_is_rejected() {
         let (mut app, log) = app_with_fake();
         app.open(PathBuf::from("notes.txt"));
-        assert!(app.error.is_some());
+        assert!(
+            toast_texts(&app)
+                .iter()
+                .any(|text| text.contains("is not a supported video file")),
+            "{:?}",
+            toast_texts(&app)
+        );
         assert!(
             session(&app).source().is_some(),
             "the previous file stays open"
@@ -2846,7 +3189,10 @@ mod tests {
     fn a_remote_url_is_rejected() {
         let (mut app, log) = app_with_fake();
         app.open(PathBuf::from("https://example.test/movie.mp4"));
-        assert!(app.error.is_some());
+        assert_eq!(
+            toast_texts(&app),
+            vec!["Couldn't open the video: Remote URLs are not supported yet."]
+        );
         assert_eq!(log.lock().unwrap().opened, None);
     }
 
@@ -2867,7 +3213,13 @@ mod tests {
         assert_eq!(session(&app).tracks(), &old_tracks);
         assert_eq!(session(&app).timeline(), &old_timeline);
         assert!(!session(&app).is_awaiting_source());
-        assert!(app.error_text().is_some());
+        assert!(
+            toast_texts(&app)
+                .iter()
+                .any(|text| text.contains("is not a readable video file")),
+            "{:?}",
+            toast_texts(&app)
+        );
         assert_eq!(log.lock().unwrap().opened, None);
     }
 
@@ -2901,7 +3253,7 @@ mod tests {
         assert_eq!(session(&app).tracks(), &old_tracks);
         assert_eq!(session(&app).timeline(), &old_timeline);
         assert!(!session(&app).is_awaiting_source());
-        assert_eq!(app.error_text().as_deref(), Some("corrupt"));
+        assert!(only_notice(session_mut(&mut app)).contains("Corrupt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2939,13 +3291,13 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_source_swap_clears_the_old_export() {
+    fn a_successful_source_swap_clears_the_old_export_and_toasts() {
         let dir = temp_dir("swap");
         let next = dir.join("next.mkv");
         std::fs::write(&next, b"not a video").unwrap();
         let (mut app, log) = app_with_fake();
         session_mut(&mut app).set_export(Some(ExportJob::with_state(ExportState::Finished)));
-        session_mut(&mut app).set_export_error("old export error".into());
+        app.notify_error("Export failed", "The old export error.");
         log.lock().unwrap().state = PlaybackState::Loading;
 
         app.open(next);
@@ -2954,25 +3306,26 @@ mod tests {
         let state = session(&app).state();
         assert!(session_mut(&mut app).confirm_open(&state));
         assert_eq!(session(&app).export_state(), None);
-        assert_eq!(session(&app).export_error(), None);
+        assert!(app.toasts.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_failed_open_error_wins_over_a_stale_export_error() {
+    fn a_failed_load_raises_its_own_notice_after_the_open_cleared_the_stack() {
         let dir = temp_dir("stale-export-error");
         let corrupt = dir.join("corrupt.mkv");
         std::fs::write(&corrupt, b"not a video").unwrap();
         let (mut app, log) = app_with_fake();
-        session_mut(&mut app).set_export_error("old export error".into());
+        app.notify_error("Export failed", "The old export error.");
         log.lock().unwrap().state = PlaybackState::Loading;
 
         app.open(corrupt);
+        assert!(app.toasts.is_empty(), "the accepted open cleared the stack");
         log.lock().unwrap().state = PlaybackState::Failed("corrupt".into());
         session_mut(&mut app).refresh_snapshot();
         let state = session(&app).state();
         assert!(session_mut(&mut app).confirm_open(&state));
-        assert_eq!(app.error_text().as_deref(), Some("corrupt"));
+        assert!(only_notice(session_mut(&mut app)).contains("Corrupt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3026,7 +3379,7 @@ mod tests {
         assert_eq!(session(&runtime.state).source(), old_path.as_deref());
         assert_eq!(session(&runtime.state).timeline(), &old_timeline);
         assert!(!session(&runtime.state).is_awaiting_source());
-        assert_eq!(runtime.state.error_text().as_deref(), Some("corrupt"));
+        assert!(shows_text(&runtime, "Corrupt."));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3076,7 +3429,7 @@ mod tests {
             (TracksState::Loaded(Vec::new()), "no-audio"),
             (
                 TracksState::Failed("track list unavailable".into()),
-                "track-error",
+                "track-unavailable",
             ),
         ] {
             let (mut app, _) = app_with_fake();
@@ -3095,7 +3448,7 @@ mod tests {
             (TracksState::Loaded(Vec::new()), "no-subtitles"),
             (
                 TracksState::Failed("track list unavailable".into()),
-                "track-error",
+                "track-unavailable",
             ),
         ] {
             let (mut app, _) = app_with_fake();
@@ -3170,11 +3523,20 @@ mod tests {
             let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
             runtime.frame(0.0);
             assert!(runtime.find("export-tray").is_none(), "{state:?}");
-            assert!(runtime.find("export-status").is_some(), "{state:?}");
+            let running = matches!(state, ExportState::Running { .. });
+            assert_eq!(
+                runtime.find("export-status").is_some(),
+                running,
+                "{state:?}"
+            );
             click(&mut runtime, "export-toggle");
             runtime.frame(0.2);
             assert!(runtime.find("export-tray").is_some(), "{state:?}");
-            if matches!(state, ExportState::Running { .. }) {
+            assert!(
+                runtime.find("export-tray-status").is_none(),
+                "a terminal state stayed inline: {state:?}"
+            );
+            if running {
                 assert!(runtime.find("cancel-export").is_some(), "{state:?}");
                 assert!(runtime.find("export").is_none(), "{state:?}");
             } else {
@@ -3606,16 +3968,18 @@ mod tests {
     }
 
     #[test]
-    fn a_long_error_banner_wraps_instead_of_truncating() {
+    fn a_long_toast_detail_clamps_to_three_lines() {
         let (mut app, _) = app_with_fake();
-        app.error = Some(
+        app.notify_error(
+            "Couldn't open the video",
             "The playback engine could not open this file because the container is damaged.              Choose a different file or re-download the clip."
                 .repeat(4),
         );
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.frame(0.0);
-        let card = rect(&runtime, "error-banner-card");
-        assert!(card[3] > 38.0, "{card:?}");
+        let card = rect(&runtime, "toast-1");
+        assert!(card[3] > 38.0, "the detail stayed on one line: {card:?}");
+        assert!(card[3] < 120.0, "the detail was not clamped: {card:?}");
     }
 
     #[test]

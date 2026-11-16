@@ -4,6 +4,7 @@ use crate::engine::{PlaybackSnapshot, PlaybackState, PlayerEngine, Track, TrackK
 use crate::export::{AudioSelection, ExportJob, ExportMode, ExportRequest, ExportState};
 use crate::log::RunLog;
 use crate::timeline::Timeline;
+use crate::toast::{Tone, sentence_case};
 use rune::Tx;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,57 +50,88 @@ pub enum TracksState {
     Failed(String),
 }
 
-#[derive(Clone, Debug)]
-struct Notice {
-    message: String,
-    at: u64,
+/// One message the session raises for the screen to present.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Notice {
+    pub title: String,
+    pub detail: Option<String>,
+    pub tone: Tone,
+    pub persistent: bool,
 }
 
 #[derive(Debug, Default)]
 struct Notices {
-    command: Option<Notice>,
-    export: Option<Notice>,
-    engine: Option<Notice>,
-    seek: Option<Notice>,
-    command_shown: bool,
-    clock: u64,
-    changed: bool,
+    pending: Vec<Notice>,
+    /// The last engine failure reported, so an unchanged state raises one notice.
+    engine: Option<String>,
+    /// The rejected-command notice line is written once per file, as before.
+    command_logged: bool,
 }
 
 impl Notices {
-    fn current(&self) -> Option<String> {
-        [
-            self.command.as_ref(),
-            self.export.as_ref(),
-            self.engine.as_ref(),
-            self.seek.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .max_by_key(|notice| notice.at)
-        .map(|notice| notice.message.clone())
+    fn take(&mut self) -> Vec<Notice> {
+        std::mem::take(&mut self.pending)
     }
 
-    fn take_changed(&mut self) -> bool {
-        std::mem::take(&mut self.changed)
+    fn record(&mut self, notice: Notice) {
+        self.pending.push(notice);
     }
 
-    fn record_export(&mut self, message: String) {
-        self.export = Some(self.new(message));
-        self.changed = true;
+    fn record_export_failure(&mut self, message: String) {
+        self.record(Notice {
+            title: "Export failed".into(),
+            detail: Some(sentence_case(&message)),
+            tone: Tone::Danger,
+            persistent: true,
+        });
     }
 
-    fn record_seek(&mut self, message: String) {
-        self.seek = Some(self.new(message));
-    }
-
-    fn record_command(&mut self, failure: &str) -> bool {
-        if self.command_shown {
-            return false;
+    fn record_export_outcome(&mut self, state: &ExportState) {
+        match state {
+            ExportState::Running { .. } => {}
+            ExportState::Finished => self.record(Notice {
+                title: "Clip exported".into(),
+                detail: None,
+                tone: Tone::Success,
+                persistent: false,
+            }),
+            ExportState::Cancelled => self.record(Notice {
+                title: "Export cancelled".into(),
+                detail: None,
+                tone: Tone::Neutral,
+                persistent: false,
+            }),
+            ExportState::Failed(error) => self.record_export_failure(error.clone()),
         }
-        let message = format!("The player could not apply that command: {failure}");
-        self.command = Some(self.new(message));
-        true
+    }
+
+    fn record_seek(&mut self) {
+        self.record(Notice {
+            title: "Seek took too long".into(),
+            detail: Some("Playback continues from the current position.".into()),
+            tone: Tone::Danger,
+            persistent: false,
+        });
+    }
+
+    fn record_command(&mut self, failure: &str) {
+        self.record(Notice {
+            title: "Command not applied".into(),
+            detail: Some(sentence_case(&format!(
+                "the player could not apply that command: {failure}"
+            ))),
+            tone: Tone::Danger,
+            persistent: false,
+        });
+    }
+
+    fn record_tracks(&mut self, message: String) {
+        self.record(Notice {
+            title: "Tracks unavailable".into(),
+            detail: Some(sentence_case(&message)),
+            tone: Tone::Danger,
+            persistent: true,
+        });
     }
 
     fn observe_engine(&mut self, state: &PlaybackState) -> bool {
@@ -107,54 +139,34 @@ impl Notices {
             self.engine = None;
             return false;
         };
-        if self
-            .engine
-            .as_ref()
-            .is_some_and(|notice| notice.message == *message)
-        {
+        if self.engine.as_deref() == Some(message.as_str()) {
             return false;
         }
-        let message = message.clone();
-        self.engine = Some(self.new(message));
+        self.engine = Some(message.clone());
+        self.record(Notice {
+            title: "Playback failed".into(),
+            detail: Some(sentence_case(message)),
+            tone: Tone::Danger,
+            persistent: true,
+        });
         true
-    }
-
-    /// The command notice is raised only once it is the one on screen.
-    fn resolve(&mut self) {
-        if self.command_shown {
-            return;
-        }
-        let Some(command) = self.command.as_ref() else {
-            return;
-        };
-        let command_at = command.at;
-        let other = self
-            .export
-            .as_ref()
-            .map(|notice| notice.at)
-            .max(self.engine.as_ref().map(|notice| notice.at))
-            .max(self.seek.as_ref().map(|notice| notice.at));
-        if other.is_none_or(|other| command_at > other) {
-            self.command_shown = true;
-        }
-    }
-
-    fn reset_command(&mut self) {
-        self.command = None;
-        self.command_shown = false;
-        self.changed = true;
     }
 
     fn reset_engine(&mut self) {
         self.engine = None;
     }
 
-    fn new(&mut self, message: String) -> Notice {
-        self.clock += 1;
-        Notice {
-            message,
-            at: self.clock,
+    /// True for the first rejected command of a file, so the notice line is logged once.
+    fn command_log_due(&mut self) -> bool {
+        if self.command_logged {
+            return false;
         }
+        self.command_logged = true;
+        true
+    }
+
+    fn reset_command_log(&mut self) {
+        self.command_logged = false;
     }
 }
 
@@ -269,8 +281,9 @@ impl PlaybackSession {
         self.startup_pause = paused;
         self.startup_resume_attempts = 0;
         self.snapshot = self.engine.snapshot();
-        self.notices.reset_command();
+        self.notices.take();
         self.notices.reset_engine();
+        self.notices.reset_command_log();
         self.awaiting_source = Some(awaiting);
         Ok(())
     }
@@ -332,16 +345,9 @@ impl PlaybackSession {
         self.export.as_ref().map(ExportJob::state)
     }
 
-    #[cfg(test)]
-    pub(crate) fn export_error(&self) -> Option<&str> {
-        self.notices
-            .export
-            .as_ref()
-            .map(|notice| notice.message.as_str())
-    }
-
-    pub fn error(&self) -> Option<String> {
-        self.notices.current()
+    /// Drains the notices raised since the last drain.
+    pub(crate) fn take_notices(&mut self) -> Vec<Notice> {
+        self.notices.take()
     }
 
     pub fn set_waker(&self, waker: rune::Waker) {
@@ -513,7 +519,6 @@ impl PlaybackSession {
             TracksState::Unloaded | TracksState::Failed(_) => 0,
         };
         self.export = None;
-        self.notices.export = None;
         let request = match ExportRequest::new(
             source,
             start,
@@ -545,19 +550,18 @@ impl PlaybackSession {
     }
 
     pub fn set_export_error(&mut self, error: String) {
-        self.notices.record_export(error);
+        self.notices.record_export_failure(error);
     }
 
     /// Runs one UI poll against the engine snapshot. `timeline_visible` is true
     /// while the transport or the export tray is on screen, so a hidden
     /// timeline updates without rebuilding the view.
     pub fn poll(&mut self, tx: &mut Tx, timeline_visible: bool) -> bool {
-        let previous_notice = self.error();
+        let pending_before = self.notices.pending.len();
         let snapshot = self.engine.snapshot();
         let state = snapshot.state.clone();
 
         let mut changed = self.clear_startup_pause();
-        changed |= self.notices.take_changed();
         changed |= self.notices.observe_engine(&state);
         changed |= self.observe_command_failure();
         changed |= self.confirm_open(&state);
@@ -587,8 +591,7 @@ impl PlaybackSession {
         }
         changed |= self.resolve_pending_seek(&snapshot, playback_ready);
         changed |= self.resolve_pending_preview(&snapshot, playback_ready);
-        self.notices.resolve();
-        changed |= self.error() != previous_notice;
+        changed |= self.notices.pending.len() != pending_before;
         if playback_ready {
             if self.scrubbing {
                 if !snapshot.seeking {
@@ -612,6 +615,9 @@ impl PlaybackSession {
         if let Some(job) = &self.export {
             let export = job.state();
             let export_changed = self.reported_export.as_ref() != Some(&export);
+            if export_changed {
+                self.notices.record_export_outcome(&export);
+            }
             if matches!(export, ExportState::Running { .. }) {
                 tx.wake_after(Duration::from_millis(100));
             }
@@ -734,9 +740,7 @@ impl PlaybackSession {
         self.pending_preview = None;
         self.scrubbing = false;
         self.timeline.set_position(position);
-        self.notices.record_seek(
-            "The seek did not finish in time. Playback continues from the current position.".into(),
-        );
+        self.notices.record_seek();
         self.log.warn(format!(
             "notice: seek deadline: target {:.3}s, position {:.3}s",
             target, position
@@ -748,11 +752,11 @@ impl PlaybackSession {
         let Some(failure) = self.engine.take_command_failure() else {
             return false;
         };
-        if !self.notices.record_command(&failure) {
-            return false;
+        self.notices.record_command(&failure);
+        if self.notices.command_log_due() {
+            self.log
+                .info(format!("notice: rejected command: {failure}"));
         }
-        self.log
-            .info(format!("notice: rejected command: {failure}"));
         true
     }
 
@@ -815,8 +819,6 @@ impl PlaybackSession {
             self.pending_seek = None;
             self.pending_preview = None;
             self.export = None;
-            self.notices.export = None;
-            self.notices.seek = None;
         }
     }
 
@@ -828,7 +830,10 @@ impl PlaybackSession {
     fn store_tracks(&mut self, result: Result<Vec<Track>, String>) {
         self.tracks = match result {
             Ok(tracks) => TracksState::Loaded(tracks),
-            Err(error) => TracksState::Failed(error),
+            Err(error) => {
+                self.notices.record_tracks(error.clone());
+                TracksState::Failed(error)
+            }
         };
     }
 
