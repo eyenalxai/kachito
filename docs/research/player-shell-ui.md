@@ -2,6 +2,8 @@
 
 Date: 2026-11-12
 Status: answered
+Updated: 2026-11-17. The app now pins `b5f8c8f` for the NativeSurface resize
+panic fix (rune#345). The line references below describe `f18ead8`.
 
 ## Answer
 
@@ -66,9 +68,8 @@ The video frame is fixed at 1280x720 in this revision, so the fitted aspect is
   284-288, commit `f18ead8`.
 - Window bounds: `crates/rune/src/tooling.rs`, `AppSpec::min_size`, line 21,
   commit `f18ead8`.
-- The app pins Rune to `f18ead891aba2437674cd8c54e238287cceb8b3a` in
-  `Cargo.toml` and renders a fixed 1280x720 frame in `src/engine.rs` lines
-  15-16 and 700-708.
+- The app renders a fixed 1280x720 frame in `src/engine.rs` (`VIDEO_WIDTH` and
+  `VIDEO_HEIGHT`, lines 15-16).
 
 ## Visual reference
 
