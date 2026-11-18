@@ -1,33 +1,33 @@
 //! The Kachito screen: one file, one fitted stage, one floating transport.
 
 use crate::engine::{MpvEngine, PlaybackState, Track, TrackKind, VIDEO_HEIGHT, VIDEO_WIDTH};
-use crate::export::{ExportMode, ExportState};
+use crate::export::ExportState;
 use crate::log::{RunLog, StderrSink};
 use crate::session::{PlaybackSession, SUPPORTED, TracksState, tracks_of};
 use crate::toast::{Toast, Toasts, Tone};
 use crate::ui::{self, Palette, icons};
 use rune::{
-    AppSpec, Color, Cx, Drag, El, FileDialogOptions, Key, KeyEvent, LiveRegion, Phase, ScrollSpec,
-    SurfaceFit, Transition, Tx, Waker, col, el, icon, row, text,
+    AppSpec, Color, Cx, Drag, El, FileDialogOptions, Key, KeyEvent, LiveRegion, Phase, SurfaceFit,
+    Transition, Tx, Waker, col, el, icon, row, text,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
 
 const SPEEDS: &[f32] = &[0.5, 1.0, 1.25, 1.5, 2.0];
-const HIDE_AFTER: f64 = 2.5;
+const HIDE_AFTER: f64 = 3.0;
 const SKIP: f64 = 10.0;
 const SCRUB_THRESHOLD: f32 = 2.0;
 /// The toast stack's inset from the window's right and bottom edges.
 const TOAST_INSET: f32 = 16.0;
 /// The bottom clearance above the transport and the export tray.
-const TOAST_TRANSPORT_CLEARANCE: f32 = 128.0;
+const TOAST_TRANSPORT_CLEARANCE: f32 = 118.0;
 const TOAST_EXPORT_CLEARANCE: f32 = 216.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Menu {
     Audio,
     Subtitles,
-    More,
+    Speed,
 }
 
 struct App {
@@ -39,11 +39,13 @@ struct App {
     last_volume: f32,
     speed: f32,
     last_dir: Option<PathBuf>,
-    export_mode: ExportMode,
     menu: Option<Menu>,
     export_open: bool,
+    top_visible: bool,
+    top_hovered: bool,
     transport_visible: bool,
     transport_hovered: bool,
+    viewport_h: f32,
     activity: bool,
     last_activity: f64,
     drop_hover: bool,
@@ -76,11 +78,13 @@ impl App {
             last_volume: 1.0,
             speed: 1.0,
             last_dir: None,
-            export_mode: ExportMode::Precise,
             menu: None,
             export_open: false,
+            top_visible: true,
+            top_hovered: false,
             transport_visible: true,
             transport_hovered: false,
+            viewport_h: 800.0,
             activity: false,
             last_activity: 0.0,
             drop_hover: false,
@@ -122,6 +126,7 @@ impl App {
                 self.last_dir = parent;
                 self.toasts.clear();
                 self.menu = None;
+                self.top_visible = true;
                 self.touch();
             }
             Err(error) => {
@@ -139,6 +144,42 @@ impl App {
     fn touch(&mut self) {
         self.activity = true;
         self.transport_visible = true;
+    }
+
+    fn pointer_moved(&mut self, y: f32) {
+        let in_top = y <= ui::TOP_REVEAL;
+        let in_bottom = self.viewport_h > 0.0 && y >= self.viewport_h - ui::BOTTOM_REVEAL;
+        self.top_visible = in_top;
+        self.top_hovered = in_top;
+        self.transport_visible = in_bottom;
+        self.transport_hovered = in_bottom;
+        self.activity = true;
+    }
+
+    fn pointer_left(&mut self) {
+        self.top_visible = false;
+        self.top_hovered = false;
+        self.transport_visible = false;
+        self.transport_hovered = false;
+        self.activity = true;
+    }
+
+    fn set_viewport(&mut self, height: f32) {
+        self.viewport_h = height;
+    }
+
+    fn is_seeking(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.is_seeking())
+    }
+
+    fn transport_forced(&self) -> bool {
+        !self.playing() || self.menu.is_some() || self.is_seeking()
+    }
+
+    fn transport_shown(&self) -> bool {
+        !self.export_open && (self.transport_visible || self.transport_forced())
     }
 
     fn toggle(&mut self) {
@@ -318,7 +359,7 @@ impl App {
 
     fn start_export(&mut self, output: PathBuf) {
         if let Some(session) = &mut self.session {
-            session.start_export(output, self.export_mode);
+            session.start_export(output);
         }
     }
 
@@ -326,12 +367,6 @@ impl App {
         if let Some(session) = &self.session {
             session.cancel_export();
         }
-    }
-
-    fn export_state(&self) -> Option<ExportState> {
-        self.session
-            .as_ref()
-            .and_then(|session| session.export_state())
     }
 
     fn has_source(&self) -> bool {
@@ -383,7 +418,7 @@ fn setup(app: &mut App, waker: Waker) {
 fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
     app.now = t;
     let mut changed = false;
-    let timeline_visible = app.transport_visible || app.export_open;
+    let timeline_visible = app.transport_shown() || app.export_open;
     let notices = if let Some(session) = &mut app.session {
         changed |= session.poll(tx, timeline_visible);
         let source = session.source().map(|path| path.to_path_buf());
@@ -411,17 +446,25 @@ fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
         app.last_activity = t;
         changed = true;
     }
-    if app.playing() && app.menu.is_none() && !app.export_open && !app.transport_hovered {
-        if app.transport_visible && t - app.last_activity > HIDE_AFTER {
-            app.transport_visible = false;
-            changed = true;
-        }
-    } else {
-        app.last_activity = t;
+    let transport_held = app.transport_forced() || app.export_open;
+    if transport_held {
         if !app.transport_visible {
             app.transport_visible = true;
             changed = true;
         }
+    } else if app.transport_visible && !app.transport_hovered && t - app.last_activity > HIDE_AFTER
+    {
+        app.transport_visible = false;
+        changed = true;
+    }
+    if app.top_visible
+        && !app.top_hovered
+        && app.menu.is_none()
+        && !app.export_open
+        && t - app.last_activity > HIDE_AFTER
+    {
+        app.top_visible = false;
+        changed = true;
     }
     if app.toasts.prune(t) {
         changed = true;
@@ -454,7 +497,7 @@ fn on_key(app: &mut App, key: &KeyEvent, tx: &mut Tx) -> bool {
             Key::Text(value)
                 if value.eq_ignore_ascii_case("f") && !key.mods.cmd && !key.mods.ctrl =>
             {
-                tx.toggle_full_screen();
+                request_fullscreen(app, tx);
                 true
             }
             Key::Text(value)
@@ -535,12 +578,18 @@ fn export_dialog(app: &mut App, tx: &mut Tx) {
 
 fn view(app: &App, _: &mut Cx<App>) -> El {
     let theme = ui::palette();
-    let mut root = col()
+    let mut root = el()
         .key("root")
         .w_full()
         .h_full()
         .fill(theme.bg)
-        .on_pointer_move(|app: &mut App, _| app.touch())
+        .on_layout(|app: &mut App, [_, _, _, height]| app.set_viewport(height))
+        .on_pointer_move(|app: &mut App, pointer| app.pointer_moved(pointer.y))
+        .on_hover_change(|app: &mut App, inside: bool, _: &mut Tx| {
+            if !inside {
+                app.pointer_left();
+            }
+        })
         .on_drop_files(|app: &mut App, files, _| app.open_first(files))
         .accepts_extensions(SUPPORTED)
         .on_drop_hover(|app: &mut App, over, _| {
@@ -552,15 +601,16 @@ fn view(app: &App, _: &mut Cx<App>) -> El {
     {
         let mut stage = video_stage(session, &theme);
         if app.export_open {
-            stage = stage.child(export_tray(app, session, &theme));
-        } else if app.transport_visible {
+            stage = stage.child(export_tray(session, &theme));
+        } else if app.transport_shown() {
             stage = stage.child(transport(app, session, &theme));
         }
-        root = root.child(top_bar(app, &theme)).child(stage);
+        if app.top_visible {
+            stage = stage.child(top_floats(app, &theme));
+        }
+        root = root.child(stage);
     } else {
-        root = root
-            .child(top_bar(app, &theme))
-            .child(empty_screen(app, &theme));
+        root = root.child(empty_screen(app, &theme));
     }
     if let Some(menu) = menu_overlay(app, &theme) {
         root = root.child(menu);
@@ -578,48 +628,60 @@ fn file_title(source: Option<&std::path::Path>) -> String {
         .unwrap_or_else(|| "Kachito".into())
 }
 
-fn top_bar(app: &App, theme: &Palette) -> El {
+fn top_floats(app: &App, theme: &Palette) -> El {
     let title = file_title(app.session.as_ref().and_then(|session| session.source()));
-    let mut bar = row()
-        .key("top-bar")
+    row()
+        .key("top")
+        .pin(Some(0.0), Some(0.0), Some(0.0), None)
         .w_full()
-        .h(ui::TOP_BAR_H)
-        .px(12.0)
-        .gap(8.0)
+        .px(24.0)
+        .pt(16.0)
+        .gap(12.0)
         .center_y()
-        .fill(theme.surface)
-        .border_sides([0.0, 0.0, 1.0, 0.0], theme.border)
-        .child(el().size(6.0, 6.0).radius(3.0).fill(theme.accent))
+        .transition(ui::top_transition())
         .child(
-            text(title)
-                .font(ui::BODY_STRONG)
-                .color(theme.text)
-                .truncate()
-                .grow(1.0),
-        );
-    bar = bar
-        .child(export_status(app, theme))
-        .child(open_button(theme))
-        .child(audio_button(app, theme))
-        .child(subtitle_button(app, theme))
-        .child(export_button(app, theme));
-    bar
-}
-
-fn open_button(theme: &Palette) -> El {
-    ui::label_button(Some(&icons::OPEN), "Open", false, theme)
-        .key("open")
-        .on_press_tx(|app: &mut App, tx: &mut Tx| open_dialog(app, tx))
+            row()
+                .key("title-capsule")
+                .max_w(360.0)
+                .h(ui::TOP_CAPSULE_H)
+                .px(12.0)
+                .gap(8.0)
+                .center_y()
+                .radius(ui::RADIUS_TOP)
+                .fill(theme.surface)
+                .border(ui::SURFACE_BORDER, theme.border)
+                .shadow(ui::SURFACE_SHADOW_Y, ui::SURFACE_SHADOW_BLUR, theme.shadow)
+                .child(
+                    icon(&icons::FILM, 15.0)
+                        .color(theme.text_muted)
+                        .a11y_hidden(),
+                )
+                .child(
+                    text(title)
+                        .font(ui::BODY_STRONG)
+                        .color(theme.text)
+                        // The 360 pt capsule less its 24 pt padding, 15 pt icon and
+                        // 8 pt gap.
+                        .max_w(313.0)
+                        .truncate(),
+                ),
+        )
+        .child(el().grow(1.0))
+        .child(
+            ui::soft_button(Some(&icons::OPEN), "Open", theme)
+                .key("open")
+                .on_press_tx(|app: &mut App, tx: &mut Tx| open_dialog(app, tx)),
+        )
 }
 
 fn audio_button(app: &App, theme: &Palette) -> El {
     if !app.has_source() {
-        return ui::label_button(Some(&icons::AUDIO), "Audio", false, theme)
+        return ui::icon_button(&icons::AUDIO, "Audio track", theme)
             .key("audio-menu")
             .disabled(true)
             .dim(0.35);
     }
-    let button = ui::label_button(Some(&icons::AUDIO), "Audio", false, theme)
+    let button = ui::icon_button(&icons::AUDIO, "Audio track", theme)
         .key("audio-menu")
         .expanded(app.menu == Some(Menu::Audio))
         .on_press(|app: &mut App| app.toggle_menu(Menu::Audio));
@@ -632,17 +694,22 @@ fn audio_button(app: &App, theme: &Palette) -> El {
 
 fn subtitle_button(app: &App, theme: &Palette) -> El {
     if !app.has_source() {
-        return ui::label_button(Some(&icons::SUBTITLES), "Subtitles", false, theme)
+        return ui::icon_button(&icons::SUBTITLES, "Subtitles", theme)
             .key("subs-menu")
             .disabled(true)
             .dim(0.35);
     }
-    let mut button = ui::label_button(Some(&icons::SUBTITLES), "Subtitles", false, theme)
+    let mut button = ui::icon_button(&icons::SUBTITLES, "Subtitles", theme)
         .key("subs-menu")
         .expanded(app.menu == Some(Menu::Subtitles))
         .on_press(|app: &mut App| app.toggle_menu(Menu::Subtitles));
     if app.subtitles_on() {
-        button = button.child(el().size(5.0, 5.0).radius(3.0).fill(theme.accent));
+        button = button.child(
+            el().pin(None, Some(6.0), Some(6.0), None)
+                .size(5.0, 5.0)
+                .radius(3.0)
+                .fill(theme.accent),
+        );
     }
     if app.has_subtitles() {
         button
@@ -652,31 +719,45 @@ fn subtitle_button(app: &App, theme: &Palette) -> El {
 }
 
 fn export_button(app: &App, theme: &Palette) -> El {
-    if !app.export_ready() {
-        return ui::label_button(Some(&icons::EXPORT), "Export", false, theme)
-            .key("export-toggle")
-            .disabled(true)
-            .dim(0.35);
-    }
-    ui::label_button(Some(&icons::EXPORT), "Export", app.export_open, theme)
+    let mut button = row()
         .key("export-toggle")
+        .h(32.0)
+        .px(8.0)
+        .gap(6.0)
+        .center_y()
+        .radius(8.0)
+        .hover(theme.hover)
+        .press(theme.press)
+        .press_scale(0.96)
+        .focusable(true)
+        .focus_ring(2.0, 2.0, theme.focus)
+        .role("button")
+        .label("Export a clip")
         .expanded(app.export_open)
-        .checked(app.export_open)
-        .on_press(|app: &mut App| app.toggle_export())
-}
-
-fn export_status(app: &App, theme: &Palette) -> El {
-    let mut slot = row().w(64.0).justify_end();
-    if let Some(ExportState::Running { fraction }) = app.export_state() {
-        slot = slot.child(
-            text(export_percent(fraction))
-                .key("export-status")
-                .font(ui::TIME)
-                .color(theme.text_muted)
-                .truncate(),
-        );
+        .checked(app.export_open);
+    if app.export_open {
+        button = button.fill(theme.hover);
     }
-    slot
+    button = button
+        .child(
+            icon(&icons::EXPORT, 15.0)
+                .color(if app.export_open {
+                    theme.text
+                } else {
+                    theme.text_muted
+                })
+                .a11y_hidden(),
+        )
+        .child(text("Export").font(ui::META).color(if app.export_open {
+            theme.text
+        } else {
+            theme.text_muted
+        }));
+    if app.export_ready() {
+        button.on_press(|app: &mut App| app.toggle_export())
+    } else {
+        button.disabled(true).dim(0.35)
+    }
 }
 
 fn export_percent(fraction: f32) -> String {
@@ -687,18 +768,14 @@ fn video_stage(session: &PlaybackSession, theme: &Palette) -> El {
     let surface = session.surface();
     el().key("stage")
         .w_full()
-        .grow(1.0)
-        .min_h(0.0)
+        .h_full()
         .fill(theme.stage)
         .center()
         .child(
             el().key("video")
                 .aspect_fit(VIDEO_WIDTH as f32 / VIDEO_HEIGHT as f32)
                 .native_surface(&surface, SurfaceFit::Fit)
-                .on_double_press_tx(|app: &mut App, tx: &mut Tx| {
-                    app.touch();
-                    tx.toggle_full_screen();
-                }),
+                .on_double_press_tx(request_fullscreen),
         )
 }
 
@@ -742,8 +819,7 @@ fn empty_screen(app: &App, theme: &Palette) -> El {
         );
     el().key("empty")
         .w_full()
-        .grow(1.0)
-        .min_h(0.0)
+        .h_full()
         .fill(theme.stage)
         .center()
         .child(zone)
@@ -756,8 +832,10 @@ fn toast_bottom_inset(app: &App) -> f32 {
         TOAST_INSET
     } else if app.export_open {
         TOAST_EXPORT_CLEARANCE
-    } else {
+    } else if app.transport_shown() {
         TOAST_TRANSPORT_CLEARANCE
+    } else {
+        TOAST_INSET
     }
 }
 
@@ -842,7 +920,7 @@ fn toast_card(toast: &Toast, theme: &Palette) -> El {
         .child(body);
     if toast.persistent {
         card = card.child(
-            ui::icon_button(&icons::CLOSE, "Dismiss notification", theme)
+            ui::large_icon_button(&icons::CLOSE, "Dismiss notification", theme)
                 .key(format!("toast-close-{id}"))
                 .on_press(move |app: &mut App| app.dismiss_toast(id)),
         );
@@ -858,32 +936,50 @@ fn transport(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
     } else {
         0.0
     };
-    let card = col()
+    let capsule = col()
         .key("transport")
         .w_full()
         .max_w(ui::TRANSPORT_MAX_W)
-        .padding(12.0)
-        .gap(8.0)
-        .radius(ui::RADIUS_LG)
+        .h(ui::TRANSPORT_H)
+        .px(14.0)
+        .py(10.0)
+        .gap(6.0)
+        .radius(ui::RADIUS_TRANSPORT)
         .fill(theme.surface)
-        .border(1.0, theme.border_strong)
-        .shadow(14.0, 30.0, theme.shadow)
-        .transition(
-            Transition::offset(0.0, 8.0)
-                .combined(Transition::opacity())
-                .springs(ui::TRAY_MOTION),
-        )
-        .on_hover_change(|app: &mut App, inside: bool, _: &mut Tx| {
-            app.transport_hovered = inside;
-            if inside {
-                app.touch();
-            }
-        })
-        .child(seek_bar(app, fraction, duration, theme))
+        .border(ui::SURFACE_BORDER, theme.border)
+        .shadow(ui::SURFACE_SHADOW_Y, ui::SURFACE_SHADOW_BLUR, theme.shadow)
         .child(
             row()
                 .w_full()
-                .gap(8.0)
+                .h(16.0)
+                .gap(12.0)
+                .center_y()
+                .child(
+                    row().key("time-current").w(44.0).center_y().child(
+                        text(format_clock(position))
+                            .font(ui::TIME_SMALL)
+                            .color(theme.text),
+                    ),
+                )
+                .child(seek_bar(app, fraction, duration, theme).grow(1.0))
+                .child(
+                    row()
+                        .key("time-duration")
+                        .w(44.0)
+                        .justify_end()
+                        .center_y()
+                        .child(
+                            text(format_clock(duration))
+                                .font(ui::TIME_SMALL)
+                                .color(theme.text_faint),
+                        ),
+                ),
+        )
+        .child(
+            row()
+                .w_full()
+                .h(44.0)
+                .gap(6.0)
                 .center_y()
                 .child(play_button(session, theme))
                 .child(
@@ -896,36 +992,30 @@ fn transport(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
                         .key("forward-10")
                         .on_press(|app: &mut App| app.skip(SKIP)),
                 )
-                .child(
-                    text(format_time(position, duration))
-                        .font(ui::TIME)
-                        .color(theme.text_muted),
-                )
                 .child(el().grow(1.0))
                 .child(volume_control(app, theme))
-                .child(
-                    ui::icon_button(&icons::MORE, "More playback controls", theme)
-                        .key("more")
-                        .expanded(app.menu == Some(Menu::More))
-                        .on_press(|app: &mut App| app.toggle_menu(Menu::More)),
-                ),
+                .child(audio_button(app, theme))
+                .child(subtitle_button(app, theme))
+                .child(speed_button(app, theme))
+                .child(fullscreen_button(theme))
+                .child(el().w(1.0).h(16.0).mx(4.0).fill(theme.border))
+                .child(export_button(app, theme)),
         );
     row()
         .key("transport-wrap")
-        .pin(Some(0.0), None, Some(0.0), Some(16.0))
+        .pin(Some(0.0), None, Some(0.0), Some(ui::TRANSPORT_INSET))
         .w_full()
+        .px(16.0)
         .justify_center()
-        .child(card)
+        .transition(ui::bottom_transition())
+        .child(capsule)
 }
 
 fn seek_bar(app: &App, fraction: f32, duration: f64, theme: &Palette) -> El {
-    let seeking = app
-        .session
-        .as_ref()
-        .is_some_and(|session| session.is_seeking());
+    let seeking = app.is_seeking();
     el().key("seek")
         .w_full()
-        .h(20.0)
+        .h(16.0)
         .on_drag(|app: &mut App, drag: &mut Drag, _: &mut Tx| {
             if drag.w <= 0.0 {
                 return;
@@ -949,8 +1039,8 @@ fn seek_bar(app: &App, fraction: f32, duration: f64, theme: &Palette) -> El {
                 .center_y()
                 .child(
                     el().grow(fraction.max(0.001))
-                        .h(4.0)
-                        .radius(2.0)
+                        .h(3.0)
+                        .radius(1.5)
                         .fill(theme.accent),
                 )
                 .child(
@@ -959,15 +1049,15 @@ fn seek_bar(app: &App, fraction: f32, duration: f64, theme: &Palette) -> El {
                         .h(10.0)
                         .radius(5.0)
                         .fill(if seeking {
-                            theme.accent.alpha(0.55)
+                            theme.text.alpha(0.55)
                         } else {
-                            theme.accent
+                            theme.text
                         }),
                 )
                 .child(
                     el().grow((1.0 - fraction).max(0.001))
-                        .h(4.0)
-                        .radius(2.0)
+                        .h(3.0)
+                        .radius(1.5)
                         .fill(theme.track),
                 ),
         )
@@ -995,16 +1085,12 @@ fn play_button(session: &PlaybackSession, theme: &Palette) -> El {
         .focus_ring(2.0, 2.0, theme.focus)
         .role("button")
         .label(play_label(&state))
-        .child(icon(glyph, 20.0).color(if loaded {
-            theme.accent_ink
-        } else {
-            theme.text_faint
-        }));
+        .child(icon(glyph, 20.0).color(if loaded { theme.text } else { theme.text_faint }));
     if loaded {
         button = button
-            .fill(theme.accent)
-            .hover(theme.accent)
-            .press(theme.accent)
+            .fill(theme.play)
+            .hover(theme.play_hover)
+            .press(theme.play_press)
             .on_press(|app: &mut App| app.toggle());
     } else {
         button = button.fill(theme.surface_raised).dim(0.7);
@@ -1028,8 +1114,8 @@ fn volume_control(app: &App, theme: &Palette) -> El {
         )
         .child(
             el().key("volume")
-                .w(80.0)
-                .h(18.0)
+                .w(72.0)
+                .h(16.0)
                 .on_drag(|app: &mut App, drag: &mut Drag, _: &mut Tx| {
                     if drag.w > 0.0 {
                         app.set_volume(drag.x / drag.w);
@@ -1041,23 +1127,62 @@ fn volume_control(app: &App, theme: &Palette) -> El {
                 .child(
                     row()
                         .w_full()
-                        .h(8.0)
+                        .h(10.0)
                         .center_y()
                         .child(
                             el().grow(app.volume.max(0.001))
                                 .h(3.0)
-                                .radius(2.0)
+                                .radius(1.5)
                                 .fill(theme.accent),
                         )
-                        .child(el().w(8.0).h(8.0).radius(4.0).fill(theme.accent))
+                        .child(el().w(7.0).h(7.0).radius(3.5).fill(theme.text))
                         .child(
                             el().grow((1.0 - app.volume).max(0.001))
                                 .h(3.0)
-                                .radius(2.0)
+                                .radius(1.5)
                                 .fill(theme.track),
                         ),
                 ),
         )
+}
+
+fn speed_button(app: &App, theme: &Palette) -> El {
+    let selected = app.menu == Some(Menu::Speed);
+    row()
+        .key("speed")
+        .w(44.0)
+        .h(32.0)
+        .center()
+        .radius(8.0)
+        .hover(theme.hover)
+        .press(theme.press)
+        .press_scale(0.96)
+        .focusable(true)
+        .focus_ring(2.0, 2.0, theme.focus)
+        .role("button")
+        .label("Playback speed")
+        .expanded(selected)
+        .on_press(|app: &mut App| app.toggle_menu(Menu::Speed))
+        .child(
+            text(format_speed(app.speed))
+                .font(ui::TIME_SMALL)
+                .color(if selected {
+                    theme.text
+                } else {
+                    theme.text_muted
+                }),
+        )
+}
+
+fn fullscreen_button(theme: &Palette) -> El {
+    ui::icon_button(&icons::FULLSCREEN, "Fullscreen", theme)
+        .key("fullscreen")
+        .on_press_tx(request_fullscreen)
+}
+
+fn request_fullscreen(app: &mut App, tx: &mut Tx) {
+    app.touch();
+    tx.toggle_full_screen();
 }
 
 fn menu_overlay(app: &App, theme: &Palette) -> Option<El> {
@@ -1079,32 +1204,26 @@ fn menu_overlay(app: &App, theme: &Palette) -> Option<El> {
             280.0,
             theme,
         ),
-        Menu::More => menu_panel(
-            "more-menu-panel",
-            "Player",
-            "more",
-            more_rows(app, theme),
-            300.0,
+        Menu::Speed => menu_panel(
+            "speed-menu-panel",
+            "Speed",
+            "speed",
+            speed_rows(app, theme),
+            280.0,
             theme,
         ),
     };
-    Some(if menu == Menu::More {
-        col()
-            .key("menu-scrim")
-            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-            .w_full()
-            .h_full()
-            .justify_end()
-            .center_y()
-            .pb(110.0)
-            .fill(theme.scrim)
-            .child(panel)
-    } else {
+    Some(
         el().key("menu-scrim")
             .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
             .fill(theme.scrim)
-            .child(panel.pin(None, Some(ui::TOP_BAR_H + 8.0), Some(16.0), None))
-    })
+            .child(panel.pin(
+                None,
+                None,
+                Some(16.0),
+                Some(ui::TRANSPORT_INSET + ui::TRANSPORT_H + 8.0),
+            )),
+    )
 }
 
 fn menu_panel(key: &str, title: &str, trigger: &str, body: El, width: f32, theme: &Palette) -> El {
@@ -1114,9 +1233,9 @@ fn menu_panel(key: &str, title: &str, trigger: &str, body: El, width: f32, theme
         .padding(6.0)
         .gap(2.0)
         .radius(ui::RADIUS_LG)
-        .fill(theme.surface_raised)
-        .border(1.0, theme.border_strong)
-        .shadow(16.0, 40.0, theme.shadow)
+        .fill(theme.surface)
+        .border(ui::SURFACE_BORDER, theme.border)
+        .shadow(ui::SURFACE_SHADOW_Y, ui::SURFACE_SHADOW_BLUR, theme.shadow)
         .modal(true, |app: &mut App| app.menu = None)
         .focus_return(trigger)
         .role("dialog")
@@ -1228,78 +1347,25 @@ fn subtitle_rows(app: &App, theme: &Palette) -> El {
     list
 }
 
-fn more_rows(app: &App, theme: &Palette) -> El {
-    let speeds = row().w_full().gap(2.0).children(SPEEDS.iter().map(|speed| {
-        let value = *speed;
-        ui::segment(format_speed(value), (app.speed - value).abs() < 0.01, theme)
-            .key(format!("speed-{value}"))
-            .on_press(move |app: &mut App| app.set_speed(value))
-    }));
-    let content = col()
-        .w_full()
-        .role("menu")
-        .focus_group()
-        .gap(2.0)
-        .child(ui::menu_heading("Speed", theme))
-        .child(el().w_full().px(4.0).child(speeds))
-        .child(ui::menu_separator(theme))
-        .child(ui::menu_heading("Audio", theme))
-        .child(audio_rows(app, theme))
-        .child(ui::menu_separator(theme))
-        .child(ui::menu_heading("Subtitles", theme))
-        .child(subtitle_rows(app, theme))
-        .child(ui::menu_separator(theme))
-        .child(
-            ui::menu_action("Fullscreen", theme)
-                .key("fullscreen")
-                .on_press_tx(|app: &mut App, tx: &mut Tx| {
+fn speed_rows(app: &App, theme: &Palette) -> El {
+    el().w_full()
+        .px(4.0)
+        .child(row().w_full().gap(2.0).children(SPEEDS.iter().map(|speed| {
+            let value = *speed;
+            ui::segment(format_speed(value), (app.speed - value).abs() < 0.01, theme)
+                .key(format!("speed-{value}"))
+                .grow(1.0)
+                .on_press(move |app: &mut App| {
+                    app.set_speed(value);
                     app.menu = None;
-                    tx.toggle_full_screen();
-                }),
-        );
-    col()
-        .w_full()
-        .max_h(360.0)
-        .min_h(0.0)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .child(content)
+                })
+        })))
 }
 
-fn export_tray(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
+fn export_tray(session: &PlaybackSession, theme: &Palette) -> El {
     let timeline = session.timeline();
     let state = session.export_state();
-    let running = matches!(&state, Some(ExportState::Running { .. }));
-    let mut precise = ui::segment(
-        ExportMode::Precise.label(),
-        app.export_mode == ExportMode::Precise,
-        theme,
-    )
-    .key("mode-precise");
-    let mut fast = ui::segment(
-        ExportMode::Fast.label(),
-        app.export_mode == ExportMode::Fast,
-        theme,
-    )
-    .key("mode-fast");
-    if running {
-        precise = precise.disabled(true).dim(0.5);
-        fast = fast.disabled(true).dim(0.5);
-    } else {
-        precise = precise.on_press(|app: &mut App| app.export_mode = ExportMode::Precise);
-        fast = fast.on_press(|app: &mut App| app.export_mode = ExportMode::Fast);
-    }
-    let mut footer = row().w_full().gap(8.0).center_y().child(
-        row()
-            .gap(2.0)
-            .padding(2.0)
-            .radius(8.0)
-            .fill(theme.stage)
-            .child(precise)
-            .child(fast),
-    );
-    footer = footer.child(el().grow(1.0));
+    let mut footer = row().w_full().gap(8.0).center_y().child(el().grow(1.0));
     if let Some(ExportState::Running { fraction }) = &state {
         footer = footer
             .child(
@@ -1321,8 +1387,7 @@ fn export_tray(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
                     .key("cancel-export")
                     .on_press(|app: &mut App| app.cancel_export()),
             );
-    }
-    if !running {
+    } else {
         footer = footer.child(
             ui::primary_button("Export clip", theme)
                 .key("export")
@@ -1333,17 +1398,13 @@ fn export_tray(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
         .key("export-tray")
         .w_full()
         .max_w(ui::EXPORT_MAX_W)
-        .padding(14.0)
+        .padding(16.0)
         .gap(10.0)
-        .radius(ui::RADIUS_LG)
+        .radius(ui::RADIUS_EXPORT)
         .fill(theme.surface)
-        .border(1.0, theme.border_strong)
-        .shadow(16.0, 36.0, theme.shadow)
-        .transition(
-            Transition::offset(0.0, 8.0)
-                .combined(Transition::opacity())
-                .springs(ui::TRAY_MOTION),
-        )
+        .border(ui::SURFACE_BORDER, theme.border)
+        .shadow(ui::SURFACE_SHADOW_Y, ui::SURFACE_SHADOW_BLUR, theme.shadow)
+        .transition(ui::bottom_transition())
         .child(
             row()
                 .w_full()
@@ -1370,12 +1431,13 @@ fn export_tray(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
                         .on_press(|app: &mut App| app.toggle_export()),
                 ),
         )
-        .child(range_bar(&timeline, theme))
+        .child(range_bar(timeline, theme))
         .child(footer);
     row()
         .key("export-wrap")
         .pin(Some(0.0), None, Some(0.0), Some(16.0))
         .w_full()
+        .px(16.0)
         .justify_center()
         .child(card)
 }
@@ -1518,10 +1580,6 @@ fn play_label(state: &PlaybackState) -> &'static str {
         PlaybackState::Failed(_) => "Failed",
         _ => "Play",
     }
-}
-
-fn format_time(position: f64, duration: f64) -> String {
-    format!("{} / {}", format_clock(position), format_clock(duration))
 }
 
 fn format_clock(seconds: f64) -> String {
@@ -2097,7 +2155,7 @@ mod tests {
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.poll = Some(poll);
         runtime.frame(0.0);
-        runtime.frame(3.0);
+        runtime.frame(3.1);
         assert!(
             runtime.find("transport").is_none(),
             "the transport stayed visible"
@@ -2147,6 +2205,7 @@ mod tests {
         let (app, log) = app_with_fake();
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.poll = Some(poll);
+        runtime.frame(0.0);
         runtime.frame(0.0);
         let reads = log.lock().unwrap().property_reads;
         let commits = runtime.stats.commits;
@@ -3524,19 +3583,15 @@ mod tests {
             runtime.frame(0.0);
             assert!(runtime.find("export-tray").is_none(), "{state:?}");
             let running = matches!(state, ExportState::Running { .. });
-            assert_eq!(
-                runtime.find("export-status").is_some(),
-                running,
-                "{state:?}"
+            assert!(
+                runtime.find("export-toggle").is_some(),
+                "the transport lost its Export control: {state:?}"
             );
             click(&mut runtime, "export-toggle");
             runtime.frame(0.2);
             assert!(runtime.find("export-tray").is_some(), "{state:?}");
-            assert!(
-                runtime.find("export-tray-status").is_none(),
-                "a terminal state stayed inline: {state:?}"
-            );
             if running {
+                assert!(runtime.find("export-progress").is_some(), "{state:?}");
                 assert!(runtime.find("cancel-export").is_some(), "{state:?}");
                 assert!(runtime.find("export").is_none(), "{state:?}");
             } else {
@@ -3556,7 +3611,7 @@ mod tests {
             let video = rect(&runtime, "video");
             let transport = rect(&runtime, "transport");
             assert!(video[0] >= 0.0, "{size:?} {video:?}");
-            assert!(video[1] >= 48.0, "{size:?} {video:?}");
+            assert!(video[1] >= 0.0, "{size:?} {video:?}");
             assert!(video[0] + video[2] <= size.0 + 0.1, "{size:?} {video:?}");
             assert!(video[1] + video[3] <= size.1 + 0.1, "{size:?} {video:?}");
             assert!(
@@ -3566,12 +3621,14 @@ mod tests {
             let centre_x = video[0] + video[2] / 2.0;
             let centre_y = video[1] + video[3] / 2.0;
             assert!((centre_x - size.0 / 2.0).abs() < 0.5, "{size:?}");
+            assert!((centre_y - size.1 / 2.0).abs() < 0.5, "{size:?} {centre_y}");
+            assert!((transport[2] - 720.0).abs() < 0.5, "{size:?} {transport:?}");
             assert!(
-                (centre_y - (48.0 + size.1) / 2.0).abs() < 0.5,
-                "{size:?} {centre_y}"
+                (transport[3] - ui::TRANSPORT_H).abs() < 0.5,
+                "{size:?} {transport:?}"
             );
             assert!(
-                transport[1] + transport[3] <= size.1,
+                (size.1 - (transport[1] + transport[3]) - ui::TRANSPORT_INSET).abs() < 0.5,
                 "{size:?} {transport:?}"
             );
 
@@ -3584,39 +3641,138 @@ mod tests {
     }
 
     #[test]
-    fn the_overflow_changes_speed_and_fullscreen_closes_it() {
-        let (app, log) = app_with_fake();
+    fn the_float_capsules_keep_their_edges_and_speed_slot() {
+        let (app, _) = app_with_fake();
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.frame(0.0);
-        click(&mut runtime, "more");
-        click(&mut runtime, "speed-1.5");
-        assert_eq!(log.lock().unwrap().speed, Some(1.5));
-        assert!(runtime.find("more-menu-panel").is_some());
-        click(&mut runtime, "fullscreen");
-        assert!(runtime.find("more-menu-panel").is_none());
+
+        let title = rect(&runtime, "title-capsule");
+        let open = rect(&runtime, "open");
+        assert!((title[0] - 24.0).abs() < 0.5, "{title:?}");
+        assert!((title[1] - 16.0).abs() < 0.5, "{title:?}");
+        assert!(title[2] > 0.0 && title[2] < 360.0, "{title:?}");
+        assert!((title[3] - ui::TOP_CAPSULE_H).abs() < 0.5, "{title:?}");
+        assert!((open[1] - 16.0).abs() < 0.5, "{open:?}");
+        assert!((open[3] - ui::TOP_CAPSULE_H).abs() < 0.5, "{open:?}");
+        assert!(
+            (open[0] + open[2] - (1280.0 - 24.0)).abs() < 0.5,
+            "{open:?}"
+        );
+
+        let transport = rect(&runtime, "transport");
+        for key in [
+            "play",
+            "back-10",
+            "forward-10",
+            "mute",
+            "volume",
+            "audio-menu",
+            "subs-menu",
+            "speed",
+            "fullscreen",
+            "export-toggle",
+        ] {
+            let control = rect(&runtime, key);
+            assert!(
+                control[0] >= transport[0]
+                    && control[0] + control[2] <= transport[0] + transport[2],
+                "{key} left the transport: {control:?} {transport:?}"
+            );
+        }
+        let current = rect(&runtime, "time-current");
+        let duration = rect(&runtime, "time-duration");
+        let play = rect(&runtime, "play");
+        let export = rect(&runtime, "export-toggle");
+        assert!((current[0] - play[0]).abs() < 0.5, "{current:?} {play:?}");
+        assert!((current[2] - 44.0).abs() < 0.5, "{current:?}");
+        assert!((duration[2] - 44.0).abs() < 0.5, "{duration:?}");
+        assert!(
+            (duration[0] + duration[2] - (export[0] + export[2])).abs() < 0.5,
+            "{duration:?} {export:?}"
+        );
+        assert!(
+            (transport[0] + 14.0 - current[0]).abs() < 0.5,
+            "{transport:?} {current:?}"
+        );
+
+        let speed = rect(&runtime, "speed");
+        let fullscreen = rect(&runtime, "fullscreen");
+        assert!((speed[2] - 44.0).abs() < 0.5, "{speed:?}");
+        click(&mut runtime, "speed");
+        click(&mut runtime, "speed-1.25");
+        runtime.frame(0.1);
+        let speed_after = rect(&runtime, "speed");
+        assert!((speed_after[2] - 44.0).abs() < 0.5, "{speed_after:?}");
+        assert!(
+            (speed_after[0] - speed[0]).abs() < 0.5,
+            "{speed:?} {speed_after:?}"
+        );
+        assert!(
+            (rect(&runtime, "fullscreen")[0] - fullscreen[0]).abs() < 0.5,
+            "fullscreen moved after the speed change"
+        );
+        assert!(
+            (rect(&runtime, "export-toggle")[0] - export[0]).abs() < 0.5,
+            "Export moved after the speed change"
+        );
     }
 
     #[test]
-    fn the_transport_hides_while_playing_and_returns_on_pointer_move() {
+    fn a_long_title_caps_the_capsule_at_360() {
+        let dir = temp_dir("title");
+        let source = dir.join("The Long Take (Director's Cut) [1080p] [HDR].mkv");
+        std::fs::write(&source, b"not decoded by the fake").unwrap();
+
+        let (mut app, _) = app_with_fake();
+        app.open(source);
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        let title = rect(&runtime, "title-capsule");
+        assert!((title[2] - 360.0).abs() < 0.5, "{title:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_speed_menu_changes_speed_and_fullscreen_is_direct() {
+        let (app, log) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.frame(0.0);
+        click(&mut runtime, "speed");
+        assert!(runtime.find("speed-menu-panel").is_some());
+        click(&mut runtime, "speed-1.5");
+        assert_eq!(log.lock().unwrap().speed, Some(1.5));
+        assert!(runtime.find("speed-menu-panel").is_none());
+
+        assert!(runtime.find("fullscreen").is_some());
+        click(&mut runtime, "fullscreen");
+        runtime.frame(0.1);
+        assert!(runtime.find("speed-menu-panel").is_none());
+    }
+
+    #[test]
+    fn the_chrome_follows_the_pointer_edges_while_playing() {
         let (app, log) = app_with_fake();
         log.lock().unwrap().state = PlaybackState::Playing;
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.poll = Some(poll);
         runtime.frame(0.0);
-        let (x, y) = runtime.find("play").expect("the play button");
         assert!(runtime.find("play").is_some());
-        runtime.frame(3.0);
-        assert!(runtime.find("play").is_none());
+        assert!(runtime.find("open").is_some());
 
-        runtime.pointer_down(x, y);
-        runtime.pointer_up(x, y);
         runtime.frame(3.1);
-        assert_eq!(log.lock().unwrap().state, PlaybackState::Playing);
-        assert!(runtime.find("play").is_some());
+        assert!(runtime.find("play").is_none());
+        assert!(runtime.find("open").is_none());
 
-        runtime.pointer_move(10.0, 100.0);
-        runtime.frame(3.2);
+        runtime.pointer_move(640.0, 760.0);
+        runtime.frame(0.1);
         assert!(runtime.find("play").is_some());
+        assert!(runtime.find("open").is_none());
+
+        runtime.pointer_move(640.0, 20.0);
+        runtime.frame(0.1);
+        assert!(runtime.find("open").is_some());
+        assert!(runtime.find("play").is_none());
     }
 
     #[test]
@@ -3627,18 +3783,17 @@ mod tests {
         runtime.poll = Some(poll);
         runtime.on_key = Some(on_key);
         runtime.frame(0.0);
-        runtime.frame(3.0);
+        runtime.frame(3.1);
         assert!(runtime.find("play").is_none());
 
         runtime.key(KeyEvent {
-            key: Key::Tab,
+            key: Key::Text("m".into()),
             mods: Default::default(),
         });
-        runtime.frame(3.1);
-        assert!(runtime.find("play").is_some());
-        // The visible clock resumes its poll after the key frame.
         runtime.frame(0.1);
-        runtime.frame(3.0);
+        assert!(runtime.find("play").is_some());
+        runtime.frame(0.1);
+        runtime.frame(3.1);
         assert!(runtime.find("play").is_none());
     }
 
@@ -3749,7 +3904,7 @@ mod tests {
                 .fill
         };
         let palette = ui::palette();
-        assert_eq!(fill(&runtime), palette.accent.alpha(0.55));
+        assert_eq!(fill(&runtime), palette.text.alpha(0.55));
 
         log.lock().unwrap().seeking = false;
         runtime.pointer_move(10.0, 10.0);
@@ -3955,16 +4110,35 @@ mod tests {
     }
 
     #[test]
-    fn the_empty_screen_keeps_the_permanent_bar() {
+    fn opening_a_file_reveals_both_capsules() {
+        let dir = temp_dir("open-reveal");
+        let source = dir.join("reveal.mkv");
+        std::fs::write(&source, b"not decoded by the fake").unwrap();
+
+        let (mut app, _) = app_with_fake();
+        app.top_visible = false;
+        app.transport_visible = false;
+        app.open(source);
+        assert!(app.top_visible, "the title capsule stayed hidden");
+        assert!(app.transport_visible, "the transport stayed hidden");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_empty_screen_has_one_open_action_and_no_player_chrome() {
         let app = App::with_session(None);
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.frame(0.0);
-        for key in ["open", "audio-menu", "subs-menu", "export-toggle"] {
-            assert!(runtime.find(key).is_some(), "{key}");
-        }
         assert!(runtime.find("open-empty").is_some());
-        click(&mut runtime, "audio-menu");
-        assert!(runtime.find("audio-menu-panel").is_none());
+        for key in [
+            "open",
+            "audio-menu",
+            "subs-menu",
+            "export-toggle",
+            "transport",
+        ] {
+            assert!(runtime.find(key).is_none(), "{key}");
+        }
     }
 
     #[test]
@@ -4039,6 +4213,19 @@ mod tests {
         assert_eq!(focused.as_deref(), Some("audio-menu"));
     }
     #[test]
+    fn the_fullscreen_control_requests_fullscreen() {
+        let (mut app, _) = app_with_fake();
+        app.transport_visible = false;
+        let mut tx = Tx::default();
+        request_fullscreen(&mut app, &mut tx);
+        assert!(
+            format!("{tx:?}").contains("toggle_full_screen: true"),
+            "{tx:?}"
+        );
+        assert!(app.transport_visible);
+    }
+
+    #[test]
     fn fullscreen_and_open_shortcuts_do_not_disturb_playback() {
         let (app, log) = app_with_fake();
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
@@ -4062,16 +4249,15 @@ mod tests {
         assert_eq!(log.lock().unwrap().state, PlaybackState::Paused);
     }
     #[test]
-    fn the_export_mode_can_change_before_a_run() {
+    fn the_export_tray_has_no_export_mode_choice() {
         let (app, _) = app_with_fake();
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
         runtime.frame(0.0);
         click(&mut runtime, "export-toggle");
         runtime.frame(0.2);
-        assert_eq!(runtime.state.export_mode, ExportMode::Precise);
-        click(&mut runtime, "mode-fast");
-        runtime.frame(0.1);
-        assert_eq!(runtime.state.export_mode, ExportMode::Fast);
+        assert!(runtime.find("mode-precise").is_none());
+        assert!(runtime.find("mode-fast").is_none());
+        assert!(runtime.find("export").is_some());
     }
 
     #[test]

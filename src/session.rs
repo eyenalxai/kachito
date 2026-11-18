@@ -1,7 +1,7 @@
 //! One open video and everything that belongs to it.
 
 use crate::engine::{PlaybackSnapshot, PlaybackState, PlayerEngine, Track, TrackKind};
-use crate::export::{AudioSelection, ExportJob, ExportMode, ExportRequest, ExportState};
+use crate::export::{AudioSelection, ExportJob, ExportRequest, ExportState};
 use crate::log::RunLog;
 use crate::timeline::Timeline;
 use crate::toast::{Tone, sentence_case};
@@ -507,7 +507,7 @@ impl PlaybackSession {
         }
     }
 
-    pub fn start_export(&mut self, output: PathBuf, mode: ExportMode) {
+    pub fn start_export(&mut self, output: PathBuf) {
         let Some(source) = self.source.clone() else {
             return;
         };
@@ -528,7 +528,6 @@ impl PlaybackSession {
                 count: audio_count,
             },
             self.timeline.frame_duration(),
-            mode,
             output,
         ) {
             Ok(request) => request,

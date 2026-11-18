@@ -1,0 +1,1234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kachito: player chrome</title>
+<!--
+  Throwaway prototype. The bottom transport is the chrome: a 720 pt capsule with
+  a timeline above a single control row. Not production code.
+
+  Hover the top or bottom edge. G toggles guides. Space pauses.
+-->
+<style>
+  :root {
+    --bg: #050607;
+    --text: oklch(0.97 0.002 255);
+    --muted: oklch(0.73 0.008 255);
+    --faint: oklch(0.55 0.008 255);
+    --accent: oklch(0.79 0.135 68);
+    --accent-hover: oklch(0.85 0.13 68);
+    --accent-soft: oklch(0.79 0.135 68 / .16);
+    --accent-ink: oklch(0.17 0.02 68);
+    --hover: oklch(1 0 0 / .07);
+    --press: oklch(1 0 0 / .12);
+    --track: oklch(1 0 0 / .18);
+    --hairline: oklch(1 0 0 / .10);
+    --surface: oklch(0.09 0.005 255 / .94);
+    --border: oklch(1 0 0 / .12);
+    --shadow: 0 18px 50px oklch(0 0 0 / .45), 0 2px 8px oklch(0 0 0 / .3);
+    --ease-out: cubic-bezier(.22, 1, .36, 1);
+    --ease-in: cubic-bezier(.4, 0, 1, 1);
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body { height: 100%; }
+
+  body {
+    margin: 0;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, "Cantarell", "Adwaita Sans", Inter, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  button { font: inherit; }
+
+  button:focus-visible,
+  [role="slider"]:focus-visible {
+    outline: 2px solid oklch(0.95 0 0 / .8);
+    outline-offset: 2px;
+  }
+
+  .sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+  .icon { display: block; width: 19px; height: 19px; flex: none; }
+
+  /* ---------- the picture ---------- */
+
+  .stage {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+    background: #000;
+  }
+
+  .frame {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: min(100vw, 177.7778vh);
+    height: min(100vh, 56.25vw);
+    transform: translate(-50%, -50%);
+    overflow: hidden;
+    background: #000;
+  }
+
+  .scene {
+    position: absolute;
+    inset: -8%;
+    background:
+      radial-gradient(55% 70% at 20% 25%, oklch(0.45 0.13 220 / .85), transparent 65%),
+      radial-gradient(50% 65% at 80% 30%, oklch(0.58 0.16 35 / .70), transparent 68%),
+      radial-gradient(65% 80% at 55% 90%, oklch(0.34 0.12 305 / .75), transparent 70%),
+      linear-gradient(135deg, oklch(0.13 0.02 250), oklch(0.20 0.04 30));
+    filter: saturate(1.05) contrast(1.05);
+    animation: drift 42s var(--ease-out) infinite alternate;
+    will-change: transform;
+  }
+
+  .scene::after {
+    content: "";
+    position: absolute;
+    inset: -20%;
+    background: linear-gradient(115deg, transparent 34%, oklch(0.92 0.05 80 / .13) 47%, transparent 61%);
+    transform: rotate(-8deg);
+  }
+
+  .stage.is-paused .scene { animation-play-state: paused; }
+
+  .grain {
+    position: absolute;
+    inset: 0;
+    opacity: .13;
+    mix-blend-mode: overlay;
+    pointer-events: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.55'/%3E%3C/svg%3E");
+  }
+
+  .vignette {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: radial-gradient(120% 100% at 50% 45%, transparent 48%, oklch(0 0 0 / .62) 100%);
+  }
+
+  @keyframes drift {
+    from { transform: scale(1.02) translate3d(-1.2%, -1%, 0); }
+    to   { transform: scale(1.08) translate3d(1.5%, 1.2%, 0); }
+  }
+
+  /* ---------- chrome ---------- */
+
+  .chrome {
+    position: fixed;
+    z-index: 20;
+    opacity: 1;
+    pointer-events: none;
+    transition:
+      opacity 260ms var(--ease-out),
+      transform 260ms var(--ease-out);
+    will-change: opacity, transform;
+  }
+
+  .chrome.is-hidden {
+    opacity: 0;
+    pointer-events: none;
+    transition-duration: 180ms;
+    transition-timing-function: var(--ease-in);
+  }
+
+  .chrome.is-hidden * { pointer-events: none !important; }
+
+  /* ---------- top floats ---------- */
+
+  .top {
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 60px;
+    padding: 16px 24px 0;
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .top.is-hidden { transform: translateY(-8px); }
+
+  .title-capsule {
+    height: 40px;
+    max-width: 360px;
+    min-width: 0;
+    padding: 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-radius: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+    pointer-events: auto;
+  }
+
+  .title-capsule .icon { width: 15px; height: 15px; color: var(--muted); }
+
+  .title {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: -.01em;
+  }
+
+  .open-btn {
+    height: 40px;
+    padding: 0 14px;
+    border-radius: 12px;
+    font-size: 12px;
+    pointer-events: auto;
+  }
+
+  .open-btn .icon { width: 16px; height: 16px; }
+
+  .text-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 32px;
+    padding: 0 8px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: oklch(0.86 0.003 255);
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 140ms ease, color 140ms ease;
+  }
+
+  .text-btn .icon { width: 15px; height: 15px; }
+  .text-btn:hover { background: var(--hover); color: var(--text); }
+  .text-btn:active { background: var(--press); }
+  .text-btn.is-active { background: var(--hover); color: var(--text); }
+
+  .action-btn {
+    border: 1px solid oklch(1 0 0 / .10);
+    background: oklch(1 0 0 / .08);
+    color: var(--text);
+  }
+
+  .action-btn:hover { background: oklch(1 0 0 / .14); }
+  .action-btn:active { background: oklch(1 0 0 / .16); }
+
+  .export-quiet {
+    height: 32px;
+    padding: 0 8px;
+    color: var(--muted);
+  }
+
+  .export-quiet:hover { background: var(--hover); color: var(--text); }
+  .export-quiet.is-active { background: var(--hover); color: var(--text); }
+
+  .speed-btn {
+    width: 44px;
+    height: 32px;
+    padding: 0;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .speed-btn:hover { background: var(--hover); color: var(--text); }
+  .speed-btn.is-active { background: var(--hover); color: var(--text); }
+
+  .control-divider {
+    width: 1px;
+    height: 16px;
+    flex: none;
+    margin: 0 4px;
+    background: var(--hairline);
+  }
+
+  /* ---------- bottom float ---------- */
+
+  .bottom-wrap {
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 0 16px 16px;
+    display: flex;
+    justify-content: center;
+  }
+
+  .bottom-wrap.is-hidden { transform: translateY(12px); }
+
+  .bottom-capsule {
+    width: min(720px, 100%);
+    height: 86px;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    border-radius: 18px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+    pointer-events: auto;
+  }
+
+  .timeline-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    height: 16px;
+  }
+
+  .time {
+    flex: none;
+    width: 44px;
+    line-height: 16px;
+    font-size: 11px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: .01em;
+  }
+
+  .time.current { color: var(--text); text-align: left; }
+  .time.duration { color: var(--faint); text-align: right; }
+
+  .seek {
+    flex: 1;
+    height: 16px;
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    touch-action: none;
+  }
+
+  .seek-track {
+    position: relative;
+    width: 100%;
+    height: 3px;
+    border-radius: 999px;
+    background: var(--track);
+  }
+
+  .seek-fill {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 45%;
+    border-radius: 999px;
+    background: var(--accent);
+  }
+
+  .seek-handle {
+    position: absolute;
+    top: 50%;
+    left: 45%;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--text);
+    transform: translate(-50%, -50%);
+    box-shadow: 0 1px 3px oklch(0 0 0 / .5);
+    transition: width 120ms ease, height 120ms ease;
+  }
+
+  .seek:hover .seek-handle { width: 12px; height: 12px; }
+
+  .controls-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 44px;
+  }
+
+  .spacer { flex: 1; }
+
+  .play {
+    width: 44px;
+    height: 44px;
+    border: 0;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    background: oklch(1 0 0 / .12);
+    color: var(--text);
+    cursor: pointer;
+    transition: background 140ms ease, transform 120ms ease;
+  }
+
+  .play:hover { background: oklch(1 0 0 / .18); }
+  .play:active { transform: scale(.96); }
+  .play .icon { width: 20px; height: 20px; }
+
+  .icon-btn {
+    position: relative;
+    width: 32px;
+    height: 32px;
+    border: 0;
+    border-radius: 8px;
+    display: grid;
+    place-items: center;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    transition: background 140ms ease, color 140ms ease;
+  }
+
+  .icon-btn .icon { width: 17px; height: 17px; }
+  .icon-btn:hover { background: var(--hover); color: var(--text); }
+  .icon-btn:active { background: var(--press); }
+
+  .icon-btn.has-dot::after {
+    content: "";
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 2px oklch(0 0 0 / .35);
+  }
+
+  .volume { display: flex; align-items: center; gap: 4px; }
+
+  .volume-slider {
+    width: 72px;
+    height: 16px;
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    touch-action: none;
+  }
+
+  .volume-track {
+    position: relative;
+    width: 100%;
+    height: 3px;
+    border-radius: 999px;
+    background: var(--track);
+  }
+
+  .volume-fill {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 80%;
+    border-radius: 999px;
+    background: var(--accent);
+  }
+
+  .volume-handle {
+    position: absolute;
+    top: 50%;
+    left: 80%;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text);
+    transform: translate(-50%, -50%);
+  }
+
+  /* ---------- guides ---------- */
+
+  body.guides .title-capsule,
+  body.guides .open-btn,
+  body.guides .bottom-capsule {
+    outline: 1px dashed oklch(0.79 0.135 68 / .8);
+    outline-offset: 4px;
+  }
+
+  body.guides .timeline-row,
+  body.guides .controls-row {
+    outline: 1px dashed oklch(0.70 0.12 220 / .55);
+    outline-offset: 2px;
+  }
+
+  body.guides .play {
+    outline: 1px dashed oklch(1 0 0 / .5);
+    outline-offset: 2px;
+  }
+
+  body.guides .stage::after {
+    content: "";
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 1px;
+    z-index: 15;
+    pointer-events: none;
+    background: repeating-linear-gradient(to bottom, oklch(0.79 0.135 68 / .45) 0 4px, transparent 4px 8px);
+  }
+
+  /* ---------- menus ---------- */
+
+  .menu-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    background: oklch(0 0 0 / .28);
+  }
+
+  .popover {
+    position: fixed;
+    z-index: 41;
+    width: 280px;
+    max-height: min(60vh, 420px);
+    overflow: auto;
+    padding: 6px;
+    border-radius: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+  }
+
+  .popover-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 40px;
+    padding: 0 6px 0 10px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .popover-head .icon-btn { width: 28px; height: 28px; }
+  .popover-head .icon-btn .icon { width: 17px; height: 17px; }
+
+  .menu-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    height: 34px;
+    padding: 0 8px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 500;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .menu-row:hover { background: var(--hover); color: var(--text); }
+  .menu-row.is-selected { background: var(--accent-soft); color: var(--text); }
+
+  .check {
+    width: 16px;
+    height: 16px;
+    display: grid;
+    place-items: center;
+    color: var(--accent);
+    flex: none;
+  }
+
+  .check .icon { width: 15px; height: 15px; }
+  .check.is-empty { visibility: hidden; }
+  .grow { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+  .segments { display: flex; gap: 2px; padding: 0 4px 4px; }
+
+  .segment {
+    flex: 1;
+    height: 28px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .segment:hover { background: var(--hover); color: var(--text); }
+  .segment.is-active { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+
+  /* ---------- export ---------- */
+
+  .export-panel {
+    position: fixed;
+    z-index: 30;
+    left: 50%;
+    bottom: 16px;
+    width: min(720px, calc(100vw - 48px));
+    padding: 16px;
+    border-radius: 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+    transform: translateX(-50%);
+    animation: rise 260ms var(--ease-out);
+  }
+
+  @keyframes rise {
+    from { opacity: 0; transform: translate(-50%, 12px); }
+    to   { opacity: 1; transform: translate(-50%, 0); }
+  }
+
+  .export-head { display: flex; align-items: center; gap: 10px; }
+  .export-title { font-size: 13px; font-weight: 600; }
+  .export-head .icon-btn { margin-left: auto; }
+
+  .range { position: relative; height: 40px; margin: 14px 0 8px; }
+
+  .range-track {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    height: 10px;
+    transform: translateY(-50%);
+    border-radius: 5px;
+    background: var(--track);
+  }
+
+  .range-selection {
+    position: absolute;
+    left: 12%;
+    width: 38%;
+    top: 50%;
+    height: 10px;
+    transform: translateY(-50%);
+    background: var(--accent-soft);
+    border-left: 3px solid var(--accent);
+    border-right: 3px solid var(--accent);
+  }
+
+  .range-playhead {
+    position: absolute;
+    left: 31%;
+    top: 5px;
+    bottom: 5px;
+    width: 2px;
+    background: var(--text);
+  }
+
+  .range-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .export-foot { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+
+  .primary {
+    height: 40px;
+    padding: 0 16px;
+    border: 0;
+    border-radius: 9px;
+    background: var(--accent);
+    color: var(--accent-ink);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .primary:hover { background: var(--accent-hover); }
+  .primary:disabled { opacity: .7; cursor: default; }
+
+  @media (max-width: 760px) {
+    .top { padding: 12px 16px 0; }
+    .volume-slider { width: 56px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chrome, .play, .icon-btn, .text-btn, .seek-handle { transition-duration: 1ms !important; }
+    .scene { animation: none; }
+    .export-panel { animation: none; }
+  }
+</style>
+</head>
+<body>
+  <svg class="sprite" aria-hidden="true">
+    <symbol id="i-film" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="4" width="18" height="16" rx="2"/>
+        <path d="M7 4v16M17 4v16M3 8h4M3 16h4M17 8h4M17 16h4"/>
+      </g>
+    </symbol>
+    <symbol id="i-open" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+      </g>
+    </symbol>
+    <symbol id="i-export" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3v10"/><path d="m8 9 4 4 4-4"/><path d="M5 15v4h14v-4"/>
+      </g>
+    </symbol>
+    <symbol id="i-play" viewBox="0 0 24 24">
+      <g fill="currentColor" stroke="none"><path d="M8 5.5v13l10.5-6.5z"/></g>
+    </symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24">
+      <g fill="currentColor" stroke="none">
+        <rect x="7" y="5" width="3.5" height="14" rx="1"/>
+        <rect x="13.5" y="5" width="3.5" height="14" rx="1"/>
+      </g>
+    </symbol>
+    <symbol id="i-back10" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 7v5h5"/><path d="M5.5 12a7 7 0 1 1 2 5"/>
+        <path d="M10.5 8.5l1.5-1v6"/><path d="M17 8.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5z"/>
+      </g>
+    </symbol>
+    <symbol id="i-forward10" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M20 7v5h-5"/><path d="M18.5 12a7 7 0 1 0-2 5"/>
+        <path d="M10.5 8.5l1.5-1v6"/><path d="M17 8.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5z"/>
+      </g>
+    </symbol>
+    <symbol id="i-volume" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/>
+      </g>
+    </symbol>
+    <symbol id="i-mute" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M11 5 6 9H3v6h3l5 4z"/><path d="m16 9 5 6M21 9l-5 6"/>
+      </g>
+    </symbol>
+    <symbol id="i-audio-track" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+        <path d="M4 10v4M8 7v10M12 5v14M16 8v8M20 11v2"/>
+      </g>
+    </symbol>
+    <symbol id="i-subtitles" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="5" width="18" height="14" rx="2"/>
+        <path d="M7 12h3M14 12h3M7 15h2M12 15h5"/>
+      </g>
+    </symbol>
+    <symbol id="i-close" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M6 6l12 12M18 6 6 18"/>
+      </g>
+    </symbol>
+    <symbol id="i-check" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="m5 12 4 4L19 6"/>
+      </g>
+    </symbol>
+    <symbol id="i-fullscreen" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M8 3H3v5"/><path d="M16 3h5v5"/><path d="M21 16v5h-5"/><path d="M3 16v5h5"/>
+      </g>
+    </symbol>
+  </svg>
+
+  <main class="stage" id="stage">
+    <div class="frame" aria-hidden="true">
+      <div class="scene"></div>
+      <div class="grain"></div>
+      <div class="vignette"></div>
+    </div>
+
+    <header class="chrome top" id="topChrome">
+      <div class="title-capsule">
+        <svg class="icon"><use href="#i-film"/></svg>
+        <span class="title" title="The Long Take (Director's Cut) [1080p] [HDR].mkv">The Long Take (Director's Cut) [1080p] [HDR].mkv</span>
+      </div>
+      <button class="text-btn action-btn open-btn" aria-label="Open a video" title="Open">
+        <svg class="icon"><use href="#i-open"/></svg>Open
+      </button>
+    </header>
+
+    <div class="chrome bottom-wrap" id="bottomChrome">
+      <footer class="bottom-capsule">
+        <div class="timeline-row">
+          <span class="time current" data-current>0:42</span>
+          <div class="seek" data-seek role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="92" aria-valuenow="42">
+            <div class="seek-track">
+              <div class="seek-fill" data-seek-fill></div>
+              <div class="seek-handle" data-seek-handle></div>
+            </div>
+          </div>
+          <span class="time duration" data-duration>1:32</span>
+        </div>
+        <div class="controls-row">
+          <button class="play" data-play aria-label="Pause">
+            <svg class="icon"><use data-play-use href="#i-pause"/></svg>
+          </button>
+          <button class="icon-btn" data-skip="-10" aria-label="Back 10 seconds">
+            <svg class="icon"><use href="#i-back10"/></svg>
+          </button>
+          <button class="icon-btn" data-skip="10" aria-label="Forward 10 seconds">
+            <svg class="icon"><use href="#i-forward10"/></svg>
+          </button>
+          <div class="spacer"></div>
+          <div class="volume">
+            <button class="icon-btn" data-mute aria-label="Mute">
+              <svg class="icon"><use data-volume-use href="#i-volume"/></svg>
+            </button>
+            <div class="volume-slider" data-volume role="slider" tabindex="0" aria-label="Volume" aria-valuemin="0" aria-valuemax="1" aria-valuenow="0.8">
+              <div class="volume-track">
+                <div class="volume-fill" data-volume-fill></div>
+                <div class="volume-handle" data-volume-handle></div>
+              </div>
+            </div>
+          </div>
+          <button class="icon-btn" data-menu="audio" aria-label="Audio track" aria-haspopup="menu" aria-expanded="false">
+            <svg class="icon"><use href="#i-audio-track"/></svg>
+          </button>
+          <button class="icon-btn" data-menu="subtitles" aria-label="Subtitles" aria-haspopup="menu" aria-expanded="false">
+            <svg class="icon"><use href="#i-subtitles"/></svg>
+          </button>
+          <button class="text-btn speed-btn" data-menu="speed" aria-label="Playback speed" aria-haspopup="menu" aria-expanded="false">1×</button>
+          <button class="icon-btn" data-fullscreen aria-label="Fullscreen">
+            <svg class="icon"><use href="#i-fullscreen"/></svg>
+          </button>
+          <span class="control-divider" aria-hidden="true"></span>
+          <button class="text-btn export-quiet" id="exportBtn" aria-label="Export a clip" aria-expanded="false">
+            <svg class="icon"><use href="#i-export"/></svg>Export
+          </button>
+        </div>
+      </footer>
+    </div>
+
+    <section class="export-panel" id="exportPanel" hidden aria-label="Export clip">
+      <div class="export-head">
+        <span class="export-title">Export clip</span>
+        <button class="icon-btn" data-export-close aria-label="Close export">
+          <svg class="icon"><use href="#i-close"/></svg>
+        </button>
+      </div>
+      <div class="range" aria-hidden="true">
+        <div class="range-track"></div>
+        <div class="range-selection"></div>
+        <div class="range-playhead"></div>
+      </div>
+      <div class="range-labels"><span>0:42</span><span>0:38 selected</span><span>1:20</span></div>
+      <div class="export-foot">
+        <div class="spacer"></div>
+        <button class="primary" data-export-start>Export clip</button>
+      </div>
+    </section>
+
+    <div class="menu-scrim" id="menuScrim" hidden></div>
+    <div class="popover" id="popover" hidden></div>
+  </main>
+
+  <script>
+    const body = document.body;
+    const stage = document.getElementById('stage');
+    const topChrome = document.getElementById('topChrome');
+    const bottomChrome = document.getElementById('bottomChrome');
+    const menuScrim = document.getElementById('menuScrim');
+    const popover = document.getElementById('popover');
+    const exportBtn = document.getElementById('exportBtn');
+    const exportPanel = document.getElementById('exportPanel');
+    const exportStart = exportPanel.querySelector('[data-export-start]');
+
+    const DURATION = 92;
+    let position = 42;
+    let playing = true;
+    let volumeValue = 0.8;
+    let lastVolume = 0.8;
+    let muted = false;
+    let speed = 1.0;
+    let pointerInTop = false;
+    let pointerInBottom = false;
+    let menuOpen = false;
+    let menuTrigger = null;
+    let exportOpen = false;
+    let draggingSeek = false;
+    let draggingVolume = false;
+    let hideTimer = 0;
+    let lastShownSecond = -1;
+
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+    function formatTime(seconds) {
+      seconds = clamp(seconds, 0, DURATION);
+      const m = Math.floor(seconds / 60);
+      const s = Math.floor(seconds % 60);
+      return `${m}:${String(s).padStart(2, '0')}`;
+    }
+
+    function formatSpeed(value) {
+      return `${value}×`;
+    }
+
+    function updateTime(force = false) {
+      const second = Math.floor(position);
+      if (force || second !== lastShownSecond) {
+        lastShownSecond = second;
+        document.querySelectorAll('[data-current]').forEach(el => el.textContent = formatTime(position));
+        document.querySelectorAll('[data-duration]').forEach(el => el.textContent = formatTime(DURATION));
+        const seek = document.querySelector('[data-seek]');
+        seek.setAttribute('aria-valuenow', String(second));
+        seek.setAttribute('aria-valuetext', `${formatTime(position)} of ${formatTime(DURATION)}`);
+      }
+      const pct = (position / DURATION) * 100;
+      document.querySelectorAll('[data-seek-fill]').forEach(el => el.style.width = `${pct}%`);
+      document.querySelectorAll('[data-seek-handle]').forEach(el => el.style.left = `${pct}%`);
+    }
+
+    function updateVolume() {
+      const pct = (muted ? 0 : volumeValue) * 100;
+      document.querySelectorAll('[data-volume-fill]').forEach(el => el.style.width = `${pct}%`);
+      document.querySelectorAll('[data-volume-handle]').forEach(el => el.style.left = `${pct}%`);
+      document.querySelectorAll('[data-volume]').forEach(el => el.setAttribute('aria-valuenow', String(muted ? 0 : volumeValue)));
+      document.querySelectorAll('[data-volume-use]').forEach(el => el.setAttribute('href', muted || volumeValue === 0 ? '#i-mute' : '#i-volume'));
+      document.querySelectorAll('[data-mute]').forEach(el => el.setAttribute('aria-label', muted || volumeValue === 0 ? 'Unmute' : 'Mute'));
+    }
+
+    function pinned() {
+      return !playing || menuOpen || exportOpen || draggingSeek || draggingVolume;
+    }
+
+    function revealTop() {
+      topChrome.classList.remove('is-hidden');
+    }
+
+    function hideTop() {
+      topChrome.classList.add('is-hidden');
+    }
+
+    function revealBottom() {
+      if (exportOpen) return;
+      bottomChrome.classList.remove('is-hidden');
+    }
+
+    function hideBottom(force = false) {
+      if (!force && pinned()) return;
+      bottomChrome.classList.add('is-hidden');
+    }
+
+    function showChrome() {
+      if (menuOpen) {
+        hideTop();
+        revealBottom();
+        return;
+      }
+      if (exportOpen) {
+        revealTop();
+        hideBottom(true);
+        return;
+      }
+      if (pointerInTop) {
+        revealTop();
+        if (!pinned()) hideBottom();
+        return;
+      }
+      if (pointerInBottom) {
+        hideTop();
+        revealBottom();
+        return;
+      }
+      hideTop();
+      if (pinned()) revealBottom();
+      else hideBottom();
+    }
+
+    function touch() {
+      revealBottom();
+      clearTimeout(hideTimer);
+      if (!playing) return;
+      hideTimer = setTimeout(() => {
+        if (!pinned() && !pointerInTop && !pointerInBottom) {
+          hideTop();
+          hideBottom();
+        }
+      }, 2500);
+    }
+
+    function setPlaying(next) {
+      playing = next;
+      stage.classList.toggle('is-paused', !playing);
+      document.querySelectorAll('[data-play-use]').forEach(el => el.setAttribute('href', playing ? '#i-pause' : '#i-play'));
+      document.querySelectorAll('[data-play]').forEach(el => el.setAttribute('aria-label', playing ? 'Pause' : 'Play'));
+      if (!playing) {
+        clearTimeout(hideTimer);
+        revealBottom();
+      } else {
+        touch();
+      }
+    }
+
+    function seekAt(clientX) {
+      const seek = document.querySelector('[data-seek]');
+      const r = seek.getBoundingClientRect();
+      if (r.width <= 0) return;
+      position = clamp((clientX - r.left) / r.width, 0, 1) * DURATION;
+      updateTime(true);
+    }
+
+    function volumeAt(clientX) {
+      const volume = document.querySelector('[data-volume]');
+      const r = volume.getBoundingClientRect();
+      if (r.width <= 0) return;
+      volumeValue = clamp((clientX - r.left) / r.width, 0, 1);
+      if (volumeValue > 0) {
+        muted = false;
+        lastVolume = volumeValue;
+      }
+      updateVolume();
+    }
+
+    function closeMenu() {
+      if (!menuOpen) return;
+      menuOpen = false;
+      popover.hidden = true;
+      menuScrim.hidden = true;
+      if (menuTrigger) {
+        menuTrigger.setAttribute('aria-expanded', 'false');
+        menuTrigger = null;
+      }
+      showChrome();
+    }
+
+    function row(id, label, selected) {
+      return `<button class="menu-row${selected ? ' is-selected' : ''}" role="menuitemradio" aria-checked="${selected}" data-menu-pick="${id}">
+        <span class="check${selected ? '' : ' is-empty'}"><svg class="icon"><use href="#i-check"/></svg></span>
+        <span class="grow">${label}</span>
+      </button>`;
+    }
+
+    function menuMarkup(kind) {
+      const head = title => `<div class="popover-head"><span>${title}</span><button class="icon-btn" data-close aria-label="Close menu"><svg class="icon"><use href="#i-close"/></svg></button></div>`;
+      if (kind === 'audio') {
+        return head('Audio') + `<div role="menu">${row('main', 'Main · English', true)}${row('commentary', 'Commentary', false)}</div>`;
+      }
+      if (kind === 'subtitles') {
+        return head('Subtitles') + `<div role="menu">${row('off', 'Off', true)}${row('english', 'English', false)}${row('signs', 'Signs', false)}</div>`;
+      }
+      const speeds = [0.5, 1, 1.25, 1.5, 2];
+      return head('Speed') + `
+        <div class="segments" style="padding-top:6px">${speeds.map(s => `<button class="segment${s === speed ? ' is-active' : ''}" data-speed="${s}">${formatSpeed(s)}</button>`).join('')}</div>`;
+    }
+
+    function openMenu(kind, trigger) {
+      if (menuOpen && menuTrigger === trigger) {
+        closeMenu();
+        return;
+      }
+      if (menuOpen) closeMenu();
+      menuOpen = true;
+      menuTrigger = trigger;
+      trigger.setAttribute('aria-expanded', 'true');
+      clearTimeout(hideTimer);
+      revealBottom();
+      hideTop();
+      popover.innerHTML = menuMarkup(kind);
+      popover.hidden = false;
+      menuScrim.hidden = false;
+
+      const ar = document.querySelector('.bottom-capsule').getBoundingClientRect();
+      const tr = trigger.getBoundingClientRect();
+      popover.style.bottom = `${Math.max(16, innerHeight - ar.top + 10)}px`;
+      popover.style.right = `${Math.max(16, innerWidth - tr.right)}px`;
+      popover.style.top = 'auto';
+
+      popover.querySelectorAll('[data-close]').forEach(btn => btn.addEventListener('click', closeMenu));
+      popover.querySelectorAll('[data-menu-pick]').forEach(btn => btn.addEventListener('click', () => {
+        popover.querySelectorAll('[data-menu-pick]').forEach(other => {
+          other.classList.remove('is-selected');
+          other.setAttribute('aria-checked', 'false');
+          other.querySelector('.check').classList.add('is-empty');
+        });
+        btn.classList.add('is-selected');
+        btn.setAttribute('aria-checked', 'true');
+        btn.querySelector('.check').classList.remove('is-empty');
+        if (kind === 'subtitles') {
+          document.querySelectorAll('[data-menu="subtitles"]').forEach(el => el.classList.toggle('has-dot', btn.dataset.menuPick !== 'off'));
+        }
+        closeMenu();
+      }));
+      popover.querySelectorAll('[data-speed]').forEach(btn => btn.addEventListener('click', () => {
+        speed = Number(btn.dataset.speed);
+        document.querySelectorAll('.speed-btn').forEach(el => el.textContent = formatSpeed(speed));
+        closeMenu();
+      }));
+    }
+
+    function openExport() {
+      exportOpen = true;
+      clearTimeout(hideTimer);
+      revealTop();
+      hideBottom(true);
+      exportPanel.hidden = false;
+      exportBtn.classList.add('is-active');
+      exportBtn.setAttribute('aria-expanded', 'true');
+    }
+
+    function closeExport() {
+      if (!exportOpen) return;
+      exportOpen = false;
+      exportPanel.hidden = true;
+      exportStart.textContent = 'Export clip';
+      exportStart.disabled = false;
+      exportBtn.classList.remove('is-active');
+      exportBtn.setAttribute('aria-expanded', 'false');
+      if (pointerInTop) revealTop();
+      else hideTop();
+      showChrome();
+    }
+
+    function toggleGuides() {
+      body.classList.toggle('guides');
+    }
+
+    let last = performance.now();
+    function tick(now) {
+      const dt = Math.min(0.25, (now - last) / 1000);
+      last = now;
+      if (playing && !draggingSeek) {
+        position += dt;
+        if (position >= DURATION) position = 0;
+        updateTime();
+      }
+      requestAnimationFrame(tick);
+    }
+
+    document.querySelectorAll('[data-play]').forEach(btn => btn.addEventListener('click', () => setPlaying(!playing)));
+
+    document.querySelectorAll('[data-skip]').forEach(btn => btn.addEventListener('click', () => {
+      position = clamp(position + Number(btn.dataset.skip), 0, DURATION);
+      updateTime(true);
+      touch();
+    }));
+
+    document.querySelectorAll('[data-mute]').forEach(btn => btn.addEventListener('click', () => {
+      if (muted || volumeValue === 0) {
+        muted = false;
+        volumeValue = lastVolume || 0.8;
+      } else {
+        lastVolume = volumeValue;
+        muted = true;
+      }
+      updateVolume();
+    }));
+
+    const seek = document.querySelector('[data-seek]');
+    seek.addEventListener('pointerdown', event => {
+      draggingSeek = true;
+      seek.setPointerCapture(event.pointerId);
+      seekAt(event.clientX);
+      clearTimeout(hideTimer);
+      revealBottom();
+      event.preventDefault();
+    });
+    seek.addEventListener('pointermove', event => { if (draggingSeek) seekAt(event.clientX); });
+    seek.addEventListener('pointerup', event => {
+      if (!draggingSeek) return;
+      draggingSeek = false;
+      try { seek.releasePointerCapture(event.pointerId); } catch {}
+      touch();
+    });
+    seek.addEventListener('pointercancel', () => { draggingSeek = false; });
+    seek.addEventListener('keydown', event => {
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        event.preventDefault();
+        position = clamp(position + (event.key === 'ArrowRight' ? 5 : -5), 0, DURATION);
+        updateTime(true);
+      }
+    });
+
+    const volume = document.querySelector('[data-volume]');
+    volume.addEventListener('pointerdown', event => {
+      draggingVolume = true;
+      volume.setPointerCapture(event.pointerId);
+      volumeAt(event.clientX);
+      clearTimeout(hideTimer);
+      revealBottom();
+      event.preventDefault();
+    });
+    volume.addEventListener('pointermove', event => { if (draggingVolume) volumeAt(event.clientX); });
+    volume.addEventListener('pointerup', event => {
+      if (!draggingVolume) return;
+      draggingVolume = false;
+      try { volume.releasePointerCapture(event.pointerId); } catch {}
+      touch();
+    });
+    volume.addEventListener('pointercancel', () => { draggingVolume = false; });
+    volume.addEventListener('keydown', event => {
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        event.preventDefault();
+        volumeValue = clamp(volumeValue + (event.key === 'ArrowRight' ? 0.05 : -0.05), 0, 1);
+        if (volumeValue > 0) { muted = false; lastVolume = volumeValue; }
+        updateVolume();
+      }
+    });
+
+    document.querySelectorAll('[data-menu]').forEach(btn => btn.addEventListener('click', event => {
+      event.stopPropagation();
+      openMenu(btn.dataset.menu, btn);
+    }));
+
+    menuScrim.addEventListener('click', closeMenu);
+    popover.addEventListener('click', event => event.stopPropagation());
+
+    document.querySelector('[data-fullscreen]').addEventListener('click', async () => {
+      try {
+        if (document.fullscreenElement) await document.exitFullscreen();
+        else await document.documentElement.requestFullscreen();
+      } catch {}
+    });
+
+    exportBtn.addEventListener('click', () => { exportOpen ? closeExport() : openExport(); });
+    exportPanel.querySelector('[data-export-close]').addEventListener('click', closeExport);
+    exportStart.addEventListener('click', () => {
+      exportStart.textContent = 'Exporting… 42%';
+      exportStart.disabled = true;
+    });
+
+    document.addEventListener('mousemove', event => {
+      clearTimeout(hideTimer);
+      pointerInTop = event.clientY <= 84;
+      pointerInBottom = event.clientY >= innerHeight - 168;
+      showChrome();
+    });
+
+    document.addEventListener('mouseleave', () => {
+      hideTop();
+      if (!pinned()) hideBottom();
+    });
+
+    document.addEventListener('keydown', event => {
+      if (event.target.closest('button') && event.key === ' ') return;
+      if (event.key === ' ') {
+        event.preventDefault();
+        setPlaying(!playing);
+        return;
+      }
+      if (event.key === 'g' || event.key === 'G') toggleGuides();
+      if (event.key === 'Escape') closeMenu();
+      if (event.key === 'ArrowLeft' && !event.target.matches('[role="slider"]')) {
+        position = clamp(position - 5, 0, DURATION);
+        updateTime(true);
+        touch();
+      }
+      if (event.key === 'ArrowRight' && !event.target.matches('[role="slider"]')) {
+        position = clamp(position + 5, 0, DURATION);
+        updateTime(true);
+        touch();
+      }
+    });
+
+    updateTime(true);
+    updateVolume();
+    revealTop();
+    revealBottom();
+    hideTimer = setTimeout(() => {
+      if (playing && !pointerInTop && !pointerInBottom) {
+        hideTop();
+        hideBottom();
+      }
+    }, 3000);
+    requestAnimationFrame(tick);
+  </script>
+</body>
+</html>
