@@ -12,10 +12,11 @@ The capsules:
   right. It is a standalone soft-filled text button. There is no action capsule around it; a
   container holding one control adds a layer with no meaning.
 - **Transport capsule**: bottom-center, 720 pt maximum width, 86 pt high, 18 pt corners, 16 pt
-  from the bottom. The timeline row sits above the control row: 11 pt timecodes at the ends, a
-  3 pt seek line, then a 44 pt play, 32 pt skip and utility buttons, a 72 pt volume slider, and
-  Export at the far right of the row, separated from the utilities by a 1 pt divider. Export is
-  a quiet 32 pt text button; it belongs with the controls, not beside Open.
+  from the bottom, with 16 pt of horizontal inner padding. The timeline row sits above the
+  control row: 11 pt timecodes at the ends, a 3 pt seek line, then a 44 pt play, 32 pt skip and
+  utility buttons, a 72 pt volume slider, and Export at the far right of the row, separated from
+  the utilities by a 1 pt divider. Export is a quiet 32 pt text button; it belongs with the
+  controls, not beside Open.
 
 The right side of the transport row is volume, audio, subtitles, speed and fullscreen. Volume is
 a speaker. Audio is a waveform. Subtitles is the caption rectangle. Speed is a direct 1× button

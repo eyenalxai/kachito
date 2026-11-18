@@ -1,7 +1,8 @@
 //! Design tokens, icons, font detection and the shared controls of the player shell.
 
 use rune::{
-    Color, El, Icon, Spring, SpringPair, TextStyle, Transition, el, icon, oklch, oklcha, row, text,
+    Color, El, Icon, Spring, SpringPair, TextStyle, Transition, Vec2, el, icon, oklch, oklcha, row,
+    text,
 };
 use std::process::Command;
 use std::sync::OnceLock;
@@ -10,7 +11,23 @@ pub const TOP_REVEAL: f32 = 84.0;
 pub const BOTTOM_REVEAL: f32 = 168.0;
 pub const TOP_CAPSULE_H: f32 = 40.0;
 pub const TRANSPORT_H: f32 = 86.0;
-pub const TRANSPORT_INSET: f32 = 16.0;
+pub const OUTER_INSET: f32 = 16.0;
+pub const TOP_INSET: f32 = 24.0;
+pub const TOP_PAD: f32 = 16.0;
+pub const TOP_GAP: f32 = 12.0;
+pub const CARD_PAD: f32 = 16.0;
+pub const CARD_GAP: f32 = 10.0;
+pub const CONTROL_GAP: f32 = 6.0;
+pub const TIME_GAP: f32 = 12.0;
+pub const TRANSPORT_PAD_Y: f32 = 10.0;
+pub const TIME_BOX: f32 = 44.0;
+pub const PLAY_SIZE: f32 = 44.0;
+pub const VOLUME_W: f32 = 72.0;
+pub const SPEED_W: f32 = 44.0;
+pub const TITLE_MAX_W: f32 = 360.0;
+pub const TITLE_PAD: f32 = 12.0;
+pub const TITLE_ICON: f32 = 15.0;
+pub const TITLE_GAP: f32 = 8.0;
 pub const TRANSPORT_MAX_W: f32 = 720.0;
 pub const EXPORT_MAX_W: f32 = 720.0;
 pub const RADIUS_LG: f32 = 12.0;
@@ -23,6 +40,11 @@ pub const SURFACE_SHADOW_BLUR: f32 = 50.0;
 pub const TRAY_MOTION: SpringPair = SpringPair::new(Spring::new(0.20, 0.0), Spring::new(0.15, 0.0));
 pub const CHROME_MOTION: SpringPair =
     SpringPair::new(Spring::new(0.28, 0.0), Spring::new(0.20, 0.0));
+pub const TRANSPORT_MOTION: SpringPair =
+    SpringPair::new(Spring::new(0.24, 0.0), Spring::new(0.17, 0.0));
+pub const TRAY_SWAP_MOTION: SpringPair =
+    SpringPair::new(Spring::new(0.26, 0.0), Spring::new(0.18, 0.0));
+pub const MENU_MOTION: SpringPair = SpringPair::new(Spring::new(0.18, 0.0), Spring::new(0.14, 0.0));
 
 pub const TITLE: TextStyle = TextStyle::new(22.0, 600.0).tracking(-0.2);
 pub const BODY: TextStyle = TextStyle::new(13.0, 400.0);
@@ -234,9 +256,9 @@ pub fn large_icon_button(glyph: &'static Icon, label: &str, theme: &Palette) -> 
 pub fn soft_button(glyph: Option<&'static Icon>, label: impl Into<String>, theme: &Palette) -> El {
     let label = label.into();
     let mut button = row()
-        .h(40.0)
-        .px(14.0)
-        .gap(6.0)
+        .h(TOP_CAPSULE_H)
+        .px(CARD_PAD)
+        .gap(CONTROL_GAP)
         .center_y()
         .radius(RADIUS_TOP)
         .fill(theme.soft)
@@ -260,10 +282,29 @@ pub fn top_transition() -> Transition {
         .springs(CHROME_MOTION)
 }
 
-pub fn bottom_transition() -> Transition {
-    Transition::offset(0.0, 12.0)
-        .combined(Transition::opacity())
-        .springs(CHROME_MOTION)
+pub fn transport_transition() -> Transition {
+    Transition::asymmetric(
+        Transition::offset(0.0, 12.0).combined(Transition::opacity()),
+        Transition::offset(0.0, 24.0).combined(Transition::opacity()),
+    )
+    .springs(TRANSPORT_MOTION)
+}
+
+pub fn tray_transition() -> Transition {
+    let origin = Vec2::new(0.5, 1.0);
+    Transition::asymmetric(
+        Transition::scale_anchor(0.95, origin).combined(Transition::offset(0.0, 32.0)),
+        Transition::scale_anchor(0.98, origin).combined(Transition::offset(0.0, 20.0)),
+    )
+    .springs(TRAY_SWAP_MOTION)
+}
+
+pub fn menu_transition() -> Transition {
+    Transition::asymmetric(
+        Transition::scale_anchor(0.97, Vec2::new(1.0, 1.0)),
+        Transition::scale_anchor(0.99, Vec2::new(1.0, 1.0)),
+    )
+    .springs(MENU_MOTION)
 }
 
 pub fn primary_button(label: impl Into<String>, theme: &Palette) -> El {

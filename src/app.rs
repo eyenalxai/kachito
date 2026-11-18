@@ -14,11 +14,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 const SPEEDS: &[f32] = &[0.5, 1.0, 1.25, 1.5, 2.0];
+const EXPORT_CLOSE_SECONDS: f64 = 0.18;
 const HIDE_AFTER: f64 = 3.0;
 const SKIP: f64 = 10.0;
 const SCRUB_THRESHOLD: f32 = 2.0;
-/// The toast stack's inset from the window's right and bottom edges.
-const TOAST_INSET: f32 = 16.0;
 /// The bottom clearance above the transport and the export tray.
 const TOAST_TRANSPORT_CLEARANCE: f32 = 118.0;
 const TOAST_EXPORT_CLEARANCE: f32 = 216.0;
@@ -41,6 +40,10 @@ struct App {
     last_dir: Option<PathBuf>,
     menu: Option<Menu>,
     export_open: bool,
+    export_enter: bool,
+    export_enter_pending: bool,
+    export_closing: bool,
+    export_close_at: f64,
     top_visible: bool,
     top_hovered: bool,
     transport_visible: bool,
@@ -80,6 +83,10 @@ impl App {
             last_dir: None,
             menu: None,
             export_open: false,
+            export_enter: false,
+            export_enter_pending: false,
+            export_closing: false,
+            export_close_at: 0.0,
             top_visible: true,
             top_hovered: false,
             transport_visible: true,
@@ -321,14 +328,20 @@ impl App {
 
     fn toggle_export(&mut self) {
         if self.export_open {
-            self.export_open = false;
-            self.touch();
+            if !self.export_closing {
+                self.export_closing = true;
+                self.export_close_at = self.now + EXPORT_CLOSE_SECONDS;
+                self.touch();
+            }
             return;
         }
         if !self.export_ready() {
             return;
         }
         self.export_open = true;
+        self.export_enter = true;
+        self.export_enter_pending = false;
+        self.export_closing = false;
         self.menu = None;
         self.touch();
     }
@@ -426,6 +439,9 @@ fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
             tx.set_title(format!("{} — Kachito", file_title(source.as_deref())));
             app.title_source = source;
             app.export_open = false;
+            app.export_enter = false;
+            app.export_enter_pending = false;
+            app.export_closing = false;
             changed = true;
         }
         session.take_notices()
@@ -445,6 +461,27 @@ fn poll(app: &mut App, t: f64, tx: &mut Tx) -> bool {
         app.activity = false;
         app.last_activity = t;
         changed = true;
+    }
+    if app.export_open {
+        if app.export_closing {
+            if t >= app.export_close_at {
+                app.export_open = false;
+                app.export_closing = false;
+                app.export_enter = false;
+                app.export_enter_pending = false;
+                changed = true;
+            } else {
+                tx.wake_at(app.export_close_at);
+            }
+        } else if app.export_enter {
+            if app.export_enter_pending {
+                app.export_enter = false;
+                app.export_enter_pending = false;
+                changed = true;
+            } else {
+                app.export_enter_pending = true;
+            }
+        }
     }
     let transport_held = app.transport_forced() || app.export_open;
     if transport_held {
@@ -601,7 +638,11 @@ fn view(app: &App, _: &mut Cx<App>) -> El {
     {
         let mut stage = video_stage(session, &theme);
         if app.export_open {
-            stage = stage.child(export_tray(session, &theme));
+            // The transport is replaced by the tray. Let it leave at once so the
+            // tray's rise is the only motion, not a crossfade under the old capsule.
+            stage = stage
+                .child_exit(Transition::none())
+                .child(export_tray(app, session, &theme));
         } else if app.transport_shown() {
             stage = stage.child(transport(app, session, &theme));
         }
@@ -634,25 +675,25 @@ fn top_floats(app: &App, theme: &Palette) -> El {
         .key("top")
         .pin(Some(0.0), Some(0.0), Some(0.0), None)
         .w_full()
-        .px(24.0)
-        .pt(16.0)
-        .gap(12.0)
+        .px(ui::TOP_INSET)
+        .pt(ui::TOP_PAD)
+        .gap(ui::TOP_GAP)
         .center_y()
         .transition(ui::top_transition())
         .child(
             row()
                 .key("title-capsule")
-                .max_w(360.0)
+                .max_w(ui::TITLE_MAX_W)
                 .h(ui::TOP_CAPSULE_H)
-                .px(12.0)
-                .gap(8.0)
+                .px(ui::TITLE_PAD)
+                .gap(ui::TITLE_GAP)
                 .center_y()
                 .radius(ui::RADIUS_TOP)
                 .fill(theme.surface)
                 .border(ui::SURFACE_BORDER, theme.border)
                 .shadow(ui::SURFACE_SHADOW_Y, ui::SURFACE_SHADOW_BLUR, theme.shadow)
                 .child(
-                    icon(&icons::FILM, 15.0)
+                    icon(&icons::FILM, ui::TITLE_ICON)
                         .color(theme.text_muted)
                         .a11y_hidden(),
                 )
@@ -660,9 +701,9 @@ fn top_floats(app: &App, theme: &Palette) -> El {
                     text(title)
                         .font(ui::BODY_STRONG)
                         .color(theme.text)
-                        // The 360 pt capsule less its 24 pt padding, 15 pt icon and
-                        // 8 pt gap.
-                        .max_w(313.0)
+                        .max_w(
+                            ui::TITLE_MAX_W - 2.0 * ui::TITLE_PAD - ui::TITLE_ICON - ui::TITLE_GAP,
+                        )
                         .truncate(),
                 ),
         )
@@ -829,13 +870,13 @@ fn empty_screen(app: &App, theme: &Palette) -> El {
 /// tray when one is on screen.
 fn toast_bottom_inset(app: &App) -> f32 {
     if !app.has_source() {
-        TOAST_INSET
+        ui::OUTER_INSET
     } else if app.export_open {
         TOAST_EXPORT_CLEARANCE
     } else if app.transport_shown() {
         TOAST_TRANSPORT_CLEARANCE
     } else {
-        TOAST_INSET
+        ui::OUTER_INSET
     }
 }
 
@@ -845,7 +886,12 @@ fn toast_stack(app: &App, theme: &Palette) -> Option<El> {
     }
     let mut stack = col()
         .key("toast-stack")
-        .pin(None, None, Some(TOAST_INSET), Some(toast_bottom_inset(app)))
+        .pin(
+            None,
+            None,
+            Some(ui::OUTER_INSET),
+            Some(toast_bottom_inset(app)),
+        )
         .items_end()
         .gap(8.0)
         .role("region")
@@ -941,9 +987,9 @@ fn transport(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
         .w_full()
         .max_w(ui::TRANSPORT_MAX_W)
         .h(ui::TRANSPORT_H)
-        .px(14.0)
-        .py(10.0)
-        .gap(6.0)
+        .px(ui::CARD_PAD)
+        .py(ui::TRANSPORT_PAD_Y)
+        .gap(ui::CONTROL_GAP)
         .radius(ui::RADIUS_TRANSPORT)
         .fill(theme.surface)
         .border(ui::SURFACE_BORDER, theme.border)
@@ -952,10 +998,10 @@ fn transport(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
             row()
                 .w_full()
                 .h(16.0)
-                .gap(12.0)
+                .gap(ui::TIME_GAP)
                 .center_y()
                 .child(
-                    row().key("time-current").w(44.0).center_y().child(
+                    row().key("time-current").w(ui::TIME_BOX).center_y().child(
                         text(format_clock(position))
                             .font(ui::TIME_SMALL)
                             .color(theme.text),
@@ -965,7 +1011,7 @@ fn transport(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
                 .child(
                     row()
                         .key("time-duration")
-                        .w(44.0)
+                        .w(ui::TIME_BOX)
                         .justify_end()
                         .center_y()
                         .child(
@@ -978,8 +1024,8 @@ fn transport(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
         .child(
             row()
                 .w_full()
-                .h(44.0)
-                .gap(6.0)
+                .h(ui::PLAY_SIZE)
+                .gap(ui::CONTROL_GAP)
                 .center_y()
                 .child(play_button(session, theme))
                 .child(
@@ -1003,11 +1049,11 @@ fn transport(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
         );
     row()
         .key("transport-wrap")
-        .pin(Some(0.0), None, Some(0.0), Some(ui::TRANSPORT_INSET))
+        .pin(Some(0.0), None, Some(0.0), Some(ui::OUTER_INSET))
         .w_full()
-        .px(16.0)
+        .px(ui::OUTER_INSET)
         .justify_center()
-        .transition(ui::bottom_transition())
+        .transition(ui::transport_transition())
         .child(capsule)
 }
 
@@ -1077,8 +1123,8 @@ fn play_button(session: &PlaybackSession, theme: &Palette) -> El {
     let glyph = if playing { &icons::PAUSE } else { &icons::PLAY };
     let mut button = el()
         .key("play")
-        .size(44.0, 44.0)
-        .radius(22.0)
+        .size(ui::PLAY_SIZE, ui::PLAY_SIZE)
+        .radius(ui::PLAY_SIZE / 2.0)
         .center()
         .press_scale(0.96)
         .focusable(loaded)
@@ -1114,7 +1160,7 @@ fn volume_control(app: &App, theme: &Palette) -> El {
         )
         .child(
             el().key("volume")
-                .w(72.0)
+                .w(ui::VOLUME_W)
                 .h(16.0)
                 .on_drag(|app: &mut App, drag: &mut Drag, _: &mut Tx| {
                     if drag.w > 0.0 {
@@ -1150,7 +1196,7 @@ fn speed_button(app: &App, theme: &Palette) -> El {
     let selected = app.menu == Some(Menu::Speed);
     row()
         .key("speed")
-        .w(44.0)
+        .w(ui::SPEED_W)
         .h(32.0)
         .center()
         .radius(8.0)
@@ -1220,8 +1266,8 @@ fn menu_overlay(app: &App, theme: &Palette) -> Option<El> {
             .child(panel.pin(
                 None,
                 None,
-                Some(16.0),
-                Some(ui::TRANSPORT_INSET + ui::TRANSPORT_H + 8.0),
+                Some(ui::OUTER_INSET),
+                Some(ui::OUTER_INSET + ui::TRANSPORT_H + 8.0),
             )),
     )
 }
@@ -1236,6 +1282,7 @@ fn menu_panel(key: &str, title: &str, trigger: &str, body: El, width: f32, theme
         .fill(theme.surface)
         .border(ui::SURFACE_BORDER, theme.border)
         .shadow(ui::SURFACE_SHADOW_Y, ui::SURFACE_SHADOW_BLUR, theme.shadow)
+        .transition(ui::menu_transition())
         .modal(true, |app: &mut App| app.menu = None)
         .focus_return(trigger)
         .role("dialog")
@@ -1362,9 +1409,21 @@ fn speed_rows(app: &App, theme: &Palette) -> El {
         })))
 }
 
-fn export_tray(session: &PlaybackSession, theme: &Palette) -> El {
+fn export_tray(app: &App, session: &PlaybackSession, theme: &Palette) -> El {
     let timeline = session.timeline();
     let state = session.export_state();
+    let (enter_scale, enter_offset, enter_opacity) = if app.export_closing {
+        (0.98, 12.0, 0.0)
+    } else if app.export_enter {
+        (0.95, 12.0, 1.0)
+    } else {
+        (1.0, 0.0, 1.0)
+    };
+    let motion = if app.export_closing {
+        ui::TRAY_SWAP_MOTION.exit
+    } else {
+        ui::TRAY_SWAP_MOTION.enter
+    };
     let mut footer = row().w_full().gap(8.0).center_y().child(el().grow(1.0));
     if let Some(ExportState::Running { fraction }) = &state {
         footer = footer
@@ -1398,13 +1457,19 @@ fn export_tray(session: &PlaybackSession, theme: &Palette) -> El {
         .key("export-tray")
         .w_full()
         .max_w(ui::EXPORT_MAX_W)
-        .padding(16.0)
-        .gap(10.0)
+        .padding(ui::CARD_PAD)
+        .gap(ui::CARD_GAP)
         .radius(ui::RADIUS_EXPORT)
         .fill(theme.surface)
         .border(ui::SURFACE_BORDER, theme.border)
         .shadow(ui::SURFACE_SHADOW_Y, ui::SURFACE_SHADOW_BLUR, theme.shadow)
-        .transition(ui::bottom_transition())
+        .transition(ui::tray_transition())
+        .scale(enter_scale)
+        .offset(0.0, enter_offset)
+        .opacity(enter_opacity)
+        .scale_motion(motion)
+        .offset_motion(motion)
+        .opacity_motion(motion)
         .child(
             row()
                 .w_full()
@@ -1435,9 +1500,9 @@ fn export_tray(session: &PlaybackSession, theme: &Palette) -> El {
         .child(footer);
     row()
         .key("export-wrap")
-        .pin(Some(0.0), None, Some(0.0), Some(16.0))
+        .pin(Some(0.0), None, Some(0.0), Some(ui::OUTER_INSET))
         .w_full()
-        .px(16.0)
+        .px(ui::OUTER_INSET)
         .justify_center()
         .child(card)
 }
@@ -3628,7 +3693,7 @@ mod tests {
                 "{size:?} {transport:?}"
             );
             assert!(
-                (size.1 - (transport[1] + transport[3]) - ui::TRANSPORT_INSET).abs() < 0.5,
+                (size.1 - (transport[1] + transport[3]) - ui::OUTER_INSET).abs() < 0.5,
                 "{size:?} {transport:?}"
             );
 
@@ -3648,14 +3713,14 @@ mod tests {
 
         let title = rect(&runtime, "title-capsule");
         let open = rect(&runtime, "open");
-        assert!((title[0] - 24.0).abs() < 0.5, "{title:?}");
-        assert!((title[1] - 16.0).abs() < 0.5, "{title:?}");
-        assert!(title[2] > 0.0 && title[2] < 360.0, "{title:?}");
+        assert!((title[0] - ui::TOP_INSET).abs() < 0.5, "{title:?}");
+        assert!((title[1] - ui::TOP_PAD).abs() < 0.5, "{title:?}");
+        assert!(title[2] > 0.0 && title[2] < ui::TITLE_MAX_W, "{title:?}");
         assert!((title[3] - ui::TOP_CAPSULE_H).abs() < 0.5, "{title:?}");
-        assert!((open[1] - 16.0).abs() < 0.5, "{open:?}");
+        assert!((open[1] - ui::TOP_PAD).abs() < 0.5, "{open:?}");
         assert!((open[3] - ui::TOP_CAPSULE_H).abs() < 0.5, "{open:?}");
         assert!(
-            (open[0] + open[2] - (1280.0 - 24.0)).abs() < 0.5,
+            (open[0] + open[2] - (1280.0 - ui::TOP_INSET)).abs() < 0.5,
             "{open:?}"
         );
 
@@ -3684,25 +3749,28 @@ mod tests {
         let play = rect(&runtime, "play");
         let export = rect(&runtime, "export-toggle");
         assert!((current[0] - play[0]).abs() < 0.5, "{current:?} {play:?}");
-        assert!((current[2] - 44.0).abs() < 0.5, "{current:?}");
-        assert!((duration[2] - 44.0).abs() < 0.5, "{duration:?}");
+        assert!((current[2] - ui::TIME_BOX).abs() < 0.5, "{current:?}");
+        assert!((duration[2] - ui::TIME_BOX).abs() < 0.5, "{duration:?}");
         assert!(
             (duration[0] + duration[2] - (export[0] + export[2])).abs() < 0.5,
             "{duration:?} {export:?}"
         );
         assert!(
-            (transport[0] + 14.0 - current[0]).abs() < 0.5,
+            (transport[0] + ui::CARD_PAD - current[0]).abs() < 0.5,
             "{transport:?} {current:?}"
         );
 
         let speed = rect(&runtime, "speed");
         let fullscreen = rect(&runtime, "fullscreen");
-        assert!((speed[2] - 44.0).abs() < 0.5, "{speed:?}");
+        assert!((speed[2] - ui::SPEED_W).abs() < 0.5, "{speed:?}");
         click(&mut runtime, "speed");
         click(&mut runtime, "speed-1.25");
         runtime.frame(0.1);
         let speed_after = rect(&runtime, "speed");
-        assert!((speed_after[2] - 44.0).abs() < 0.5, "{speed_after:?}");
+        assert!(
+            (speed_after[2] - ui::SPEED_W).abs() < 0.5,
+            "{speed_after:?}"
+        );
         assert!(
             (speed_after[0] - speed[0]).abs() < 0.5,
             "{speed:?} {speed_after:?}"
@@ -3714,6 +3782,73 @@ mod tests {
         assert!(
             (rect(&runtime, "export-toggle")[0] - export[0]).abs() < 0.5,
             "Export moved after the speed change"
+        );
+    }
+
+    #[test]
+    fn the_export_tray_enters_alone_and_settles() {
+        let (app, _) = app_with_fake();
+        let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
+        runtime.frame(0.0);
+        click(&mut runtime, "export-toggle");
+        let mut saw_fade = false;
+        let mut saw_scale = false;
+        for _ in 0..10 {
+            runtime.frame(1.0 / 60.0);
+            if let Some(tray) = runtime
+                .elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some("export-tray"))
+            {
+                saw_fade |= tray.opacity < 0.9;
+                saw_scale |= tray.scale < 0.99;
+            }
+        }
+        assert!(saw_fade, "the tray appeared without a fade");
+        assert!(saw_scale, "the tray appeared without a scale transform");
+        assert!(
+            runtime.find("transport").is_none(),
+            "the transport overlapped the export tray"
+        );
+
+        for _ in 0..40 {
+            runtime.frame(1.0 / 60.0);
+        }
+        let tray = runtime
+            .elements()
+            .into_iter()
+            .find(|element| element.key.as_deref() == Some("export-tray"))
+            .expect("the settled export tray");
+        assert!(
+            (tray.scale - 1.0).abs() < 0.001,
+            "the tray did not land: scale={}",
+            tray.scale
+        );
+        assert!(tray.opacity > 0.99, "the tray stayed faded: {tray:?}");
+
+        click(&mut runtime, "export-close");
+        runtime.frame(1.0 / 60.0);
+        let tray = runtime
+            .elements()
+            .into_iter()
+            .find(|element| element.key.as_deref() == Some("export-tray"))
+            .expect("the closing export tray");
+        assert!(
+            tray.scale < 0.999,
+            "the tray closed without a scale transform: scale={}",
+            tray.scale
+        );
+        for _ in 0..30 {
+            runtime.frame(1.0 / 60.0);
+        }
+        assert!(
+            runtime.find("export-tray").is_none(),
+            "the tray stayed after its close"
+        );
+        assert!(
+            runtime.find("transport").is_some(),
+            "the transport did not return after the close"
         );
     }
 
@@ -3801,6 +3936,7 @@ mod tests {
     fn escape_closes_the_export_tray() {
         let (app, _) = app_with_fake();
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
         runtime.on_key = Some(on_key);
         runtime.frame(0.0);
         click(&mut runtime, "export-toggle");
@@ -3809,6 +3945,7 @@ mod tests {
             key: Key::Escape,
             mods: Default::default(),
         });
+        runtime.frame(0.1);
         runtime.frame(0.5);
         assert!(runtime.find("export-tray").is_none());
         assert!(runtime.find("transport").is_some());
@@ -3818,6 +3955,7 @@ mod tests {
     fn keyboard_controls_playback_and_volume() {
         let (app, log) = app_with_fake();
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
         runtime.on_key = Some(on_key);
         runtime.frame(0.0);
         runtime.key(KeyEvent {
@@ -3861,6 +3999,7 @@ mod tests {
             key: Key::Escape,
             mods: Default::default(),
         });
+        runtime.frame(0.1);
         runtime.frame(0.5);
         assert!(runtime.find("export-tray").is_none());
     }
@@ -4073,9 +4212,14 @@ mod tests {
             .timeline_mut()
             .set_duration(10.0, 1.0 / 60.0);
         let mut runtime = Runtime::new(app, view, window(), Env::new(true, 1.0));
+        runtime.poll = Some(poll);
         runtime.frame(0.0);
         click(&mut runtime, "export-toggle");
         runtime.frame(0.2);
+        runtime.frame(0.1);
+        for _ in 0..30 {
+            runtime.frame(1.0 / 60.0);
+        }
 
         click(&mut runtime, "range");
 
