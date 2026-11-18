@@ -10,28 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExportMode {
-    Fast,
-    Precise,
-}
-
-impl ExportMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Fast => "Fast",
-            Self::Precise => "Precise",
-        }
-    }
-
-    pub fn next(self) -> Self {
-        match self {
-            Self::Fast => Self::Precise,
-            Self::Precise => Self::Fast,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExportError {
     InvalidRange,
@@ -81,7 +59,6 @@ pub struct ExportRequest {
     start: f64,
     end: f64,
     audio_index: Option<usize>,
-    mode: ExportMode,
     output: PathBuf,
 }
 
@@ -92,7 +69,6 @@ impl ExportRequest {
         end: f64,
         audio: AudioSelection,
         frame_duration: f64,
-        mode: ExportMode,
         output: PathBuf,
     ) -> Result<Self, ExportError> {
         if source.as_os_str().is_empty() || output.as_os_str().is_empty() {
@@ -126,7 +102,6 @@ impl ExportRequest {
             start,
             end,
             audio_index: audio.index,
-            mode,
             output,
         })
     }
@@ -156,19 +131,11 @@ impl ExportRequest {
             args.push("-map".into());
             args.push(format!("0:a:{index}").into());
         }
-        match self.mode {
-            ExportMode::Fast => {
-                args.extend(["-c".into(), "copy".into()]);
-                args.extend(["-avoid_negative_ts".into(), "make_zero".into()]);
-            }
-            ExportMode::Precise => {
-                args.extend(["-c:v".into(), "libx264".into()]);
-                args.extend(["-preset".into(), "veryfast".into()]);
-                args.extend(["-crf".into(), "20".into()]);
-                args.extend(["-c:a".into(), "aac".into()]);
-                args.extend(["-b:a".into(), "160k".into()]);
-            }
-        }
+        args.extend(["-c:v".into(), "libx264".into()]);
+        args.extend(["-preset".into(), "veryfast".into()]);
+        args.extend(["-crf".into(), "20".into()]);
+        args.extend(["-c:a".into(), "aac".into()]);
+        args.extend(["-b:a".into(), "160k".into()]);
         args.push("-y".into());
         args.push(output.as_os_str().to_os_string());
         args
@@ -444,7 +411,6 @@ mod tests {
                 count: 2,
             },
             1.0 / 60.0,
-            ExportMode::Precise,
             PathBuf::from("out.mkv"),
         )
         .unwrap();
@@ -460,50 +426,80 @@ mod tests {
     }
 
     #[test]
-    fn both_export_modes_spawn_through_the_priority_wrapper() {
-        for (mode, codec) in [(ExportMode::Fast, "copy"), (ExportMode::Precise, "libx264")] {
-            let request = ExportRequest::new(
-                PathBuf::from("in.mkv"),
-                0.0,
-                2.0,
-                AudioSelection::default(),
-                1.0 / 60.0,
-                mode,
-                PathBuf::from("out.mkv"),
-            )
-            .unwrap();
-            let command = export_command(&request, Path::new("out.mkv"));
-            assert_eq!(command.get_program(), std::ffi::OsStr::new("nice"));
-            let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
-            assert_eq!(
-                &args[..3],
-                [
-                    OsString::from("-n"),
-                    OsString::from("10"),
-                    OsString::from("ffmpeg")
-                ],
-                "{args:?}"
-            );
-            assert!(args.iter().any(|arg| arg == codec), "{args:?}");
-        }
+    fn the_precise_command_has_the_exact_argv() {
+        let request = ExportRequest::new(
+            PathBuf::from("in.mkv"),
+            2.0,
+            5.0,
+            AudioSelection {
+                index: Some(1),
+                count: 2,
+            },
+            1.0 / 60.0,
+            PathBuf::from("out.mkv"),
+        )
+        .unwrap();
+        let command = request.command_to(Path::new("out.mkv"));
+        let expected: Vec<OsString> = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-progress",
+            "pipe:1",
+            "-ss",
+            "2.000",
+            "-t",
+            "3.000",
+            "-i",
+            "in.mkv",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-y",
+            "out.mkv",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(command, expected);
     }
 
     #[test]
-    fn fast_command_copies_packets() {
+    fn export_spawns_through_the_priority_wrapper() {
         let request = ExportRequest::new(
             PathBuf::from("in.mkv"),
             0.0,
             2.0,
             AudioSelection::default(),
             1.0 / 60.0,
-            ExportMode::Fast,
             PathBuf::from("out.mkv"),
         )
         .unwrap();
-        let command = request.command_to(Path::new("out.mkv"));
-        assert!(command.contains(&"copy".into()));
-        assert!(!command.contains(&"libx264".into()));
-        assert!(!command.contains(&"0:a:0".into()));
+        let command = export_command(&request, Path::new("out.mkv"));
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("nice"));
+        let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
+        assert_eq!(
+            &args[..3],
+            [
+                OsString::from("-n"),
+                OsString::from("10"),
+                OsString::from("ffmpeg")
+            ],
+            "{args:?}"
+        );
+        assert!(args.iter().any(|arg| arg == "libx264"), "{args:?}");
     }
 
     #[test]
@@ -514,7 +510,6 @@ mod tests {
             2.0,
             AudioSelection::default(),
             1.0 / 60.0,
-            ExportMode::Fast,
             PathBuf::from("out.mkv"),
         );
         assert_eq!(result.unwrap_err(), ExportError::InvalidRange);
@@ -529,7 +524,6 @@ mod tests {
                 end,
                 AudioSelection::default(),
                 1.0 / 60.0,
-                ExportMode::Fast,
                 PathBuf::from("out.mkv"),
             );
             assert_eq!(result.unwrap_err(), ExportError::InvalidRange);
@@ -544,7 +538,6 @@ mod tests {
             0.01,
             AudioSelection::default(),
             1.0 / 24.0,
-            ExportMode::Fast,
             PathBuf::from("out.mkv"),
         );
         assert_eq!(result.unwrap_err(), ExportError::RangeShorterThanFrame);
@@ -558,7 +551,6 @@ mod tests {
             3.0 + 1.0 / 24.0,
             AudioSelection::default(),
             1.0 / 24.0,
-            ExportMode::Fast,
             PathBuf::from("out.mkv"),
         );
         assert!(result.is_ok());
@@ -572,7 +564,6 @@ mod tests {
             1.0,
             AudioSelection::default(),
             0.0,
-            ExportMode::Fast,
             PathBuf::from("out.mkv"),
         );
         assert_eq!(result.unwrap_err(), ExportError::InvalidFrameDuration);
@@ -586,7 +577,6 @@ mod tests {
             2.0,
             AudioSelection::default(),
             1.0 / 60.0,
-            ExportMode::Fast,
             PathBuf::from("clip.mkv"),
         );
         assert_eq!(result.unwrap_err(), ExportError::SameFile);
@@ -603,7 +593,6 @@ mod tests {
                 count: 1,
             },
             1.0 / 60.0,
-            ExportMode::Fast,
             PathBuf::from("out.mkv"),
         );
         assert_eq!(result.unwrap_err(), ExportError::AudioTrackOutOfRange);
@@ -617,7 +606,6 @@ mod tests {
             2.0,
             AudioSelection::default(),
             1.0 / 60.0,
-            ExportMode::Fast,
             PathBuf::from("out.mkv"),
         );
         assert_eq!(result.unwrap_err(), ExportError::InvalidPath);
@@ -631,7 +619,6 @@ mod tests {
             2.0,
             AudioSelection::default(),
             1.0 / 60.0,
-            ExportMode::Fast,
             PathBuf::from("out.mkv"),
         );
         assert_eq!(result.unwrap_err(), ExportError::InvalidPath);
@@ -651,7 +638,6 @@ mod tests {
             2.0,
             AudioSelection::default(),
             1.0 / 60.0,
-            ExportMode::Fast,
             output.clone(),
         )
         .expect("a non-UTF-8 path is a valid path");
@@ -687,7 +673,6 @@ mod tests {
                 count: 1,
             },
             1.0 / 60.0,
-            ExportMode::Precise,
             output.clone(),
         )
         .expect("a non-UTF-8 source and output are valid paths");
@@ -714,7 +699,6 @@ mod tests {
                 count: 1,
             },
             1.0 / 60.0,
-            ExportMode::Precise,
             output.clone(),
         )
         .expect("a valid request");
@@ -780,7 +764,6 @@ mod tests {
             1.0 / 24.0,
             AudioSelection::default(),
             1.0 / 24.0,
-            ExportMode::Precise,
             output.clone(),
         )
         .expect("a one-frame request");
@@ -826,7 +809,6 @@ mod tests {
             1.0,
             AudioSelection::default(),
             1.0 / 60.0,
-            ExportMode::Fast,
             output.clone(),
         )
         .expect("a valid request");
@@ -858,7 +840,6 @@ mod tests {
                 count: 1,
             },
             1.0 / 60.0,
-            ExportMode::Precise,
             output.clone(),
         )
         .expect("a valid request");

@@ -1,22 +1,37 @@
 //! Design tokens, icons, font detection and the shared controls of the player shell.
 
-use rune::{Color, El, Icon, Spring, SpringPair, TextStyle, el, icon, oklch, oklcha, row, text};
+use rune::{
+    Color, El, Icon, Spring, SpringPair, TextStyle, Transition, el, icon, oklch, oklcha, row, text,
+};
 use std::process::Command;
 use std::sync::OnceLock;
 
-pub const TOP_BAR_H: f32 = 48.0;
+pub const TOP_REVEAL: f32 = 84.0;
+pub const BOTTOM_REVEAL: f32 = 168.0;
+pub const TOP_CAPSULE_H: f32 = 40.0;
+pub const TRANSPORT_H: f32 = 86.0;
+pub const TRANSPORT_INSET: f32 = 16.0;
 pub const TRANSPORT_MAX_W: f32 = 720.0;
-pub const EXPORT_MAX_W: f32 = 760.0;
+pub const EXPORT_MAX_W: f32 = 720.0;
 pub const RADIUS_LG: f32 = 12.0;
+pub const RADIUS_TOP: f32 = 12.0;
+pub const RADIUS_TRANSPORT: f32 = 18.0;
+pub const RADIUS_EXPORT: f32 = 16.0;
+pub const SURFACE_BORDER: f32 = 1.0;
+pub const SURFACE_SHADOW_Y: f32 = 18.0;
+pub const SURFACE_SHADOW_BLUR: f32 = 50.0;
 pub const TRAY_MOTION: SpringPair = SpringPair::new(Spring::new(0.20, 0.0), Spring::new(0.15, 0.0));
+pub const CHROME_MOTION: SpringPair =
+    SpringPair::new(Spring::new(0.28, 0.0), Spring::new(0.20, 0.0));
 
 pub const TITLE: TextStyle = TextStyle::new(22.0, 600.0).tracking(-0.2);
 pub const BODY: TextStyle = TextStyle::new(13.0, 400.0);
 pub const BODY_STRONG: TextStyle = TextStyle::new(13.0, 600.0);
 pub const LABEL: TextStyle = TextStyle::new(12.0, 500.0);
-pub const SECTION: TextStyle = TextStyle::new(11.0, 600.0).tracking(0.6);
+pub const META: TextStyle = TextStyle::new(11.0, 500.0);
 pub const TINY: TextStyle = TextStyle::new(11.0, 400.0);
 pub const TIME: TextStyle = TextStyle::new(12.0, 500.0).features("'tnum' 1");
+pub const TIME_SMALL: TextStyle = TextStyle::new(11.0, 500.0).features("'tnum' 1");
 pub const TOAST_TITLE: TextStyle = TextStyle {
     line_height: 20.0,
     ..BODY_STRONG
@@ -41,6 +56,12 @@ pub struct Palette {
     pub accent_hover: Color,
     pub accent_ink: Color,
     pub accent_soft: Color,
+    pub soft: Color,
+    pub soft_hover: Color,
+    pub soft_press: Color,
+    pub play: Color,
+    pub play_hover: Color,
+    pub play_press: Color,
     pub danger: Color,
     pub danger_surface: Color,
     pub hover: Color,
@@ -53,26 +74,32 @@ pub struct Palette {
 
 pub fn palette() -> Palette {
     Palette {
-        bg: oklch(0.155, 0.006, 255.0),
-        stage: oklch(0.105, 0.004, 255.0),
-        surface: oklch(0.205, 0.007, 255.0),
-        surface_raised: oklch(0.235, 0.008, 255.0),
-        border: oklcha(1.0, 0.0, 0.0, 0.10),
+        bg: oklch(0.055, 0.002, 255.0),
+        stage: oklch(0.0, 0.0, 0.0),
+        surface: oklcha(0.09, 0.005, 255.0, 0.94),
+        surface_raised: oklcha(0.13, 0.006, 255.0, 0.97),
+        border: oklcha(1.0, 0.0, 0.0, 0.12),
         border_strong: oklcha(1.0, 0.0, 0.0, 0.16),
-        text: oklch(0.965, 0.003, 255.0),
-        text_muted: oklch(0.72, 0.01, 255.0),
-        text_faint: oklch(0.56, 0.01, 255.0),
-        accent: oklch(0.76, 0.15, 58.0),
-        accent_hover: oklch(0.80, 0.15, 58.0),
-        accent_ink: oklch(0.18, 0.02, 58.0),
-        accent_soft: oklcha(0.76, 0.15, 58.0, 0.16),
+        text: oklch(0.97, 0.002, 255.0),
+        text_muted: oklch(0.73, 0.008, 255.0),
+        text_faint: oklch(0.55, 0.008, 255.0),
+        accent: oklch(0.79, 0.135, 68.0),
+        accent_hover: oklch(0.85, 0.13, 68.0),
+        accent_ink: oklch(0.17, 0.02, 68.0),
+        accent_soft: oklcha(0.79, 0.135, 68.0, 0.16),
+        soft: oklcha(1.0, 0.0, 0.0, 0.08),
+        soft_hover: oklcha(1.0, 0.0, 0.0, 0.14),
+        soft_press: oklcha(1.0, 0.0, 0.0, 0.16),
+        play: oklcha(1.0, 0.0, 0.0, 0.12),
+        play_hover: oklcha(1.0, 0.0, 0.0, 0.18),
+        play_press: oklcha(1.0, 0.0, 0.0, 0.16),
         danger: oklch(0.70, 0.19, 25.0),
         danger_surface: oklcha(0.50, 0.17, 25.0, 0.24),
-        hover: oklcha(1.0, 0.0, 0.0, 0.06),
-        press: oklcha(1.0, 0.0, 0.0, 0.10),
-        track: oklcha(1.0, 0.0, 0.0, 0.14),
-        scrim: oklcha(0.0, 0.0, 0.0, 0.30),
-        focus: oklcha(0.9, 0.0, 0.0, 0.75),
+        hover: oklcha(1.0, 0.0, 0.0, 0.07),
+        press: oklcha(1.0, 0.0, 0.0, 0.12),
+        track: oklcha(1.0, 0.0, 0.0, 0.18),
+        scrim: oklcha(0.0, 0.0, 0.0, 0.28),
+        focus: oklcha(0.95, 0.0, 0.0, 0.80),
         shadow: oklcha(0.0, 0.0, 0.0, 0.45),
     }
 }
@@ -102,7 +129,7 @@ pub mod icons {
     stroke_icon!(
         AUDIO,
         "audio",
-        r#"<path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/>"#
+        r#"<path d="M4 10v4M8 7v10M12 5v14M16 8v8M20 11v2"/>"#
     );
     stroke_icon!(
         SUBTITLES,
@@ -165,80 +192,78 @@ pub mod icons {
         view: 24.0,
         body: r#"<g fill="currentColor" stroke="none"><rect x="7" y="5" width="3.5" height="14" rx="1"/><rect x="13.5" y="5" width="3.5" height="14" rx="1"/></g>"#,
     };
-    pub static MORE: Icon = Icon {
-        name: "more",
-        view: 24.0,
-        body: r#"<g fill="currentColor" stroke="none"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></g>"#,
-    };
+}
+
+fn sized_icon_button(
+    glyph: &'static Icon,
+    label: &str,
+    theme: &Palette,
+    size: f32,
+    radius: f32,
+    glyph_size: f32,
+) -> El {
+    el().size(size, size)
+        .radius(radius)
+        .center()
+        .hover(theme.hover)
+        .press(theme.press)
+        .press_scale(0.96)
+        .focusable(true)
+        .focus_ring(2.0, 2.0, theme.focus)
+        .role("button")
+        .label(label)
+        .child(
+            icon(glyph, glyph_size)
+                .color(theme.text_muted)
+                .a11y_hidden(),
+        )
 }
 
 pub fn icon_button(glyph: &'static Icon, label: &str, theme: &Palette) -> El {
-    el().size(40.0, 40.0)
-        .radius(8.0)
-        .center()
-        .hover(theme.hover)
-        .press(theme.press)
-        .press_scale(0.96)
-        .focusable(true)
-        .focus_ring(2.0, 2.0, theme.focus)
-        .role("button")
-        .label(label)
-        .child(icon(glyph, 18.0).color(theme.text_muted).a11y_hidden())
+    sized_icon_button(glyph, label, theme, 32.0, 8.0, 17.0)
 }
 
 pub fn small_icon_button(glyph: &'static Icon, label: &str, theme: &Palette) -> El {
-    el().size(28.0, 28.0)
-        .radius(6.0)
-        .center()
-        .hover(theme.hover)
-        .press(theme.press)
-        .press_scale(0.96)
-        .focusable(true)
-        .focus_ring(2.0, 2.0, theme.focus)
-        .role("button")
-        .label(label)
-        .child(icon(glyph, 18.0).color(theme.text_muted).a11y_hidden())
+    sized_icon_button(glyph, label, theme, 28.0, 6.0, 17.0)
 }
 
-pub fn label_button(
-    glyph: Option<&'static Icon>,
-    label: impl Into<String>,
-    accent: bool,
-    theme: &Palette,
-) -> El {
+pub fn large_icon_button(glyph: &'static Icon, label: &str, theme: &Palette) -> El {
+    sized_icon_button(glyph, label, theme, 40.0, 8.0, 18.0)
+}
+
+pub fn soft_button(glyph: Option<&'static Icon>, label: impl Into<String>, theme: &Palette) -> El {
+    let label = label.into();
     let mut button = row()
         .h(40.0)
-        .px(10.0)
-        .gap(7.0)
+        .px(14.0)
+        .gap(6.0)
         .center_y()
-        .radius(8.0)
+        .radius(RADIUS_TOP)
+        .fill(theme.soft)
+        .border(1.0, theme.border)
+        .hover(theme.soft_hover)
+        .press(theme.soft_press)
         .press_scale(0.96)
         .focusable(true)
         .focus_ring(2.0, 2.0, theme.focus)
         .role("button")
-        .hover(if accent {
-            theme.accent_hover
-        } else {
-            theme.hover
-        })
-        .press(if accent { theme.accent } else { theme.press });
-    button = button.fill(if accent {
-        theme.accent
-    } else {
-        Color::TRANSPARENT
-    });
-    let ink = if accent {
-        theme.accent_ink
-    } else {
-        theme.text_muted
-    };
+        .label(label.clone());
     if let Some(glyph) = glyph {
-        button = button.child(icon(glyph, 18.0).color(ink).a11y_hidden());
+        button = button.child(icon(glyph, 16.0).color(theme.text).a11y_hidden());
     }
-    let label = label.into();
-    button
-        .label(label.clone())
-        .child(text(label).font(LABEL).color(ink))
+    button.child(text(label).font(LABEL).color(theme.text))
+}
+
+pub fn top_transition() -> Transition {
+    Transition::offset(0.0, -8.0)
+        .combined(Transition::opacity())
+        .springs(CHROME_MOTION)
+}
+
+pub fn bottom_transition() -> Transition {
+    Transition::offset(0.0, 12.0)
+        .combined(Transition::opacity())
+        .springs(CHROME_MOTION)
 }
 
 pub fn primary_button(label: impl Into<String>, theme: &Palette) -> El {
@@ -318,54 +343,16 @@ pub fn menu_row(label: impl Into<String>, selected: bool, theme: &Palette) -> El
     )
 }
 
-pub fn menu_action(label: impl Into<String>, theme: &Palette) -> El {
-    let label = label.into();
-    row()
-        .h(34.0)
-        .w_full()
-        .px(8.0)
-        .gap(8.0)
-        .center_y()
-        .radius(7.0)
-        .hover(theme.hover)
-        .press(theme.press)
-        .focusable(true)
-        .focus_ring(2.0, 2.0, theme.focus)
-        .role("menuitem")
-        .label(label.clone())
-        .child(el().size(16.0, 16.0))
-        .child(
-            text(label)
-                .font(LABEL)
-                .color(theme.text_muted)
-                .truncate()
-                .grow(1.0),
-        )
-}
-
 pub fn menu_empty(label: impl Into<String>, theme: &Palette) -> El {
     el().w_full()
         .padding(10.0)
         .child(text(label).font(LABEL).color(theme.text_faint).wrap())
 }
 
-pub fn menu_heading(label: impl Into<String>, theme: &Palette) -> El {
-    el().w_full().px(8.0).pt(8.0).pb(4.0).child(
-        text(label)
-            .font(SECTION)
-            .color(theme.text_faint)
-            .text_case(rune::TextCase::Uppercase),
-    )
-}
-
-pub fn menu_separator(theme: &Palette) -> El {
-    el().w_full().h(1.0).my(5.0).fill(theme.border)
-}
-
 pub fn segment(label: impl Into<String>, selected: bool, theme: &Palette) -> El {
     let label = label.into();
     row()
-        .h(30.0)
+        .h(28.0)
         .px(10.0)
         .center_y()
         .radius(7.0)
@@ -385,7 +372,7 @@ pub fn segment(label: impl Into<String>, selected: bool, theme: &Palette) -> El 
         .focus_ring(2.0, 2.0, theme.focus)
         .role("button")
         .label(label.clone())
-        .child(text(label).font(LABEL).color(if selected {
+        .child(text(label).font(META).color(if selected {
             theme.accent_ink
         } else {
             theme.text_muted
